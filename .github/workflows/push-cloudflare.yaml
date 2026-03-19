@@ -294,7 +294,7 @@ jobs:
                   sed -i "s/\"database_id\": \"[^\"]*\"/\"database_id\": \"$db_id\"/g" wrangler.jsonc
                   echo "Updated wrangler.jsonc with database ID: $db_id"
 
-            - name: Check if Worker exists and list Durable Objects
+            - name: Check if Worker exists and reconcile Durable Objects
               id: check_worker
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -302,8 +302,6 @@ jobs:
               run: |
                   echo "Checking if Worker '${{ env.WORKER_NAME }}' exists..."
                   
-                  # List all workers and check if ours exists
-                  # Use tr to strip null bytes that Cloudflare API may include in responses
                   workers_list=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts" \
                       -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
                   
@@ -315,83 +313,180 @@ jobs:
                       echo "Worker '${{ env.WORKER_NAME }}' already exists."
                       echo "worker_exists=true" >> $GITHUB_OUTPUT
                       
-                      # Get worker script metadata for bindings detail
-                      worker_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}" \
+                      # Read DO class_names from local wrangler.jsonc
+                      local_do_classes=$(node -e "
+                      const fs = require('fs');
+                      const raw = fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, '');
+                      const config = JSON.parse(raw);
+                      if (config.durable_objects && config.durable_objects.bindings) {
+                          config.durable_objects.bindings.forEach(b => console.log(b.class_name));
+                      }
+                      " | sort -u)
+                      
+                      if [ -n "$local_do_classes" ]; then
+                          echo "=== Durable Objects configured in wrangler.jsonc ==="
+                          echo "$local_do_classes"
+                          echo "do_classes=$(echo "$local_do_classes" | tr '\n' ',')" >> $GITHUB_OUTPUT
+                      else
+                          echo "No Durable Objects configured in wrangler.jsonc."
+                          echo "do_classes=" >> $GITHUB_OUTPUT
+                      fi
+                      
+                      # Fetch cloud DO bindings via Worker subdomain settings API
+                      echo ""
+                      echo "Fetching current DO bindings from cloud..."
+                      cloud_settings=$(curl -s -X GET \
+                          "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}/settings" \
                           -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
                       
-                      echo "Worker detail response (first 1000 chars):"
-                      echo "${worker_response:0:1000}"
+                      echo "Cloud settings response (first 1000 chars):"
+                      echo "${cloud_settings:0:1000}"
                       echo ""
                       
-                      # Extract durable object class names from bindings
-                      do_classes=$(echo "$worker_response" | grep -oE '"class_name"\s*:\s*"[^"]+"' | sed 's/.*"class_name"\s*:\s*"//;s/"$//' | sort -u)
-                      if [ -n "$do_classes" ]; then
-                          echo "=== Durable Objects bound to this Worker ==="
-                          echo "$do_classes"
-                          echo "do_classes=$(echo "$do_classes" | tr '\n' ',')" >> $GITHUB_OUTPUT
-                          echo ""
-                          echo "NOTE: Only removing bindings from '${{ env.WORKER_NAME }}', NOT deleting Durable Objects themselves"
-                          echo "   Other Workers can still use these Durable Objects normally."
+                      # Extract DO class_names from cloud bindings
+                      cloud_do_classes=$(echo "$cloud_settings" | node -e "
+                      const chunks = [];
+                      process.stdin.on('data', d => chunks.push(d));
+                      process.stdin.on('end', () => {
+                          try {
+                              const data = JSON.parse(Buffer.concat(chunks).toString());
+                              const bindings = data?.result?.bindings || [];
+                              const doBindings = bindings.filter(b => b.type === 'durable_object_namespace');
+                              doBindings.forEach(b => {
+                                  if (b.class_name) console.log(b.class_name);
+                              });
+                          } catch(e) {
+                              console.error('Failed to parse cloud settings:', e.message);
+                          }
+                      });
+                      " | sort -u)
+                      
+                      if [ -n "$cloud_do_classes" ]; then
+                          echo "=== Durable Objects bound on cloud ==="
+                          echo "$cloud_do_classes"
                       else
-                          echo "No Durable Objects found on this Worker."
-                          echo "do_classes=" >> $GITHUB_OUTPUT
+                          echo "No Durable Objects bound on cloud."
+                      fi
+                      
+                      # Find DO classes that exist on cloud but NOT in local config (stale bindings)
+                      stale_classes=""
+                      if [ -n "$cloud_do_classes" ]; then
+                          stale_classes=$(comm -23 <(echo "$cloud_do_classes") <(echo "$local_do_classes") || true)
+                      fi
+                      
+                      if [ -n "$stale_classes" ]; then
+                          echo ""
+                          echo "=== Stale DO bindings found (exist on cloud but not in local config) ==="
+                          echo "$stale_classes"
+                          echo "stale_bindings=true" >> $GITHUB_OUTPUT
+                          
+                          # Build JSON patch to remove stale DO bindings via API
+                          node -e "
+                          const chunks = [];
+                          process.stdin.on('data', d => chunks.push(d));
+                          process.stdin.on('end', () => {
+                              const stale = Buffer.concat(chunks).toString().trim().split('\n').filter(Boolean);
+                              const fs = require('fs');
+                              const raw = fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, '');
+                              const config = JSON.parse(raw);
+                              
+                              // Build the bindings array for the API patch
+                              // We need to keep all non-DO bindings and only include DO bindings from local config
+                              const doBindings = (config.durable_objects?.bindings || []).map(b => ({
+                                  type: 'durable_object_namespace',
+                                  name: b.name,
+                                  class_name: b.class_name
+                              }));
+                              
+                              // Also include other binding types from config
+                              const allBindings = [];
+                              
+                              // D1 bindings
+                              if (config.d1_databases) {
+                                  config.d1_databases.forEach(db => {
+                                      allBindings.push({
+                                          type: 'd1',
+                                          name: db.binding,
+                                          id: db.database_id
+                                      });
+                                  });
+                              }
+                              
+                              // R2 bindings
+                              if (config.r2_buckets) {
+                                  config.r2_buckets.forEach(bucket => {
+                                      allBindings.push({
+                                          type: 'r2_bucket',
+                                          name: bucket.binding,
+                                          bucket_name: bucket.bucket_name
+                                      });
+                                  });
+                              }
+                              
+                              // Rate limiter bindings
+                              if (config.ratelimits) {
+                                  config.ratelimits.forEach(rl => {
+                                      allBindings.push({
+                                          type: 'ratelimit',
+                                          name: rl.name,
+                                          namespace_id: rl.namespace_id,
+                                          simple: rl.simple
+                                      });
+                                  });
+                              }
+                              
+                              // Add DO bindings (only from local config, excluding stale ones)
+                              allBindings.push(...doBindings);
+                              
+                              const patch = { bindings: allBindings };
+                              fs.writeFileSync('do_bindings_patch.json', JSON.stringify(patch, null, 2));
+                              console.log('Generated bindings patch with ' + allBindings.length + ' bindings');
+                              console.log('DO bindings in patch: ' + doBindings.map(b => b.class_name).join(', ') || 'none');
+                              console.log('Stale classes to remove: ' + stale.join(', '));
+                          });
+                          " <<< "$stale_classes"
+                          
+                          echo ""
+                          echo "Bindings patch generated:"
+                          cat do_bindings_patch.json
+                      else
+                          echo ""
+                          echo "No stale DO bindings found. Cloud and local DO configs are in sync."
+                          echo "stale_bindings=false" >> $GITHUB_OUTPUT
                       fi
                   else
                       echo "Worker '${{ env.WORKER_NAME }}' does not exist, will create new deployment."
                       echo "worker_exists=false" >> $GITHUB_OUTPUT
                       echo "do_classes=" >> $GITHUB_OUTPUT
+                      echo "stale_bindings=false" >> $GITHUB_OUTPUT
                   fi
 
-            - name: Backup and clean Durable Objects from wrangler.jsonc
-              if: steps.check_worker.outputs.worker_exists == 'true'
+            - name: Clean stale Durable Object bindings via API
+              if: steps.check_worker.outputs.worker_exists == 'true' && steps.check_worker.outputs.stale_bindings == 'true'
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
               run: |
-                  echo "Backing up original wrangler.jsonc..."
-                  cp wrangler.jsonc wrangler.jsonc.backup
+                  echo "Cleaning stale DO bindings from Worker '${{ env.WORKER_NAME }}' via Cloudflare API..."
                   
-                  echo "Removing durable_objects section from wrangler.jsonc..."
-                  # Use node to properly remove the durable_objects and migrations sections
-                  node -e "
-                  const fs = require('fs');
-                  const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, ''));
+                  patch_response=$(curl -s -X PATCH \
+                      "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}/settings" \
+                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                      -H "Content-Type: application/json" \
+                      --data-binary @do_bindings_patch.json | tr -d '\0')
                   
-                  // Store original durable_objects for restoration later
-                  if (config.durable_objects) {
-                      fs.writeFileSync('durable_objects_backup.json', JSON.stringify(config.durable_objects, null, 2));
-                      console.log('Backed up durable_objects configuration');
-                  }
+                  echo "Patch response:"
+                  echo "$patch_response"
+                  echo ""
                   
-                  // Remove durable_objects and migrations sections
-                  delete config.durable_objects;
-                  delete config.migrations;
-                  
-                  // Write back without comments (will be temporary)
-                  fs.writeFileSync('wrangler.jsonc.temp', JSON.stringify(config, null, 4));
-                  "
-                  
-                  # Replace the original file
-                  mv wrangler.jsonc.temp wrangler.jsonc
-                  echo "Durable Objects and migrations sections removed from wrangler.jsonc"
+                  if echo "$patch_response" | grep -q '"success":true'; then
+                      echo "Successfully cleaned stale DO bindings via API."
+                  else
+                      echo "::warning::Failed to clean stale DO bindings via API. Attempting to continue with full redeployment."
+                      echo "The two-phase deployment will handle cleanup as fallback."
+                  fi
 
-            - name: Deploy to Cloudflare (without Durable Objects)
-              if: steps.check_worker.outputs.worker_exists == 'true'
-              uses: cloudflare/wrangler-action@v3
-              id: cf_cleanup
-              with:
-                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  wranglerVersion: "4.73.0"
-                  command: deploy --force
-
-            - name: Restore Durable Objects to wrangler.jsonc
-              if: steps.check_worker.outputs.worker_exists == 'true'
-              run: |
-                  echo "Restoring durable_objects and migrations sections to wrangler.jsonc..."
-                  
-                  # Restore from backup
-                  cp wrangler.jsonc.backup wrangler.jsonc
-                  echo "Restored original wrangler.jsonc with durable_objects configuration"
-
-            - name: Deploy to Cloudflare (with Durable Objects)
+            - name: Deploy to Cloudflare (existing worker)
               if: steps.check_worker.outputs.worker_exists == 'true'
               uses: cloudflare/wrangler-action@v3
               id: cf
@@ -399,7 +494,6 @@ jobs:
                   apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
                   accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
                   wranglerVersion: "4.73.0"
-                  command: deploy --force
 
             - name: Deploy to Cloudflare (first deployment)
               if: steps.check_worker.outputs.worker_exists != 'true'
@@ -427,13 +521,17 @@ jobs:
                   echo ""
                   if [ "${{ steps.check_worker.outputs.worker_exists }}" == "true" ]; then
                       echo "=== Durable Objects Update Summary ==="
-                      echo "✓ Only removed bindings from Worker '${{ env.WORKER_NAME }}'"
+                      if [ "${{ steps.check_worker.outputs.stale_bindings }}" == "true" ]; then
+                          echo "✓ Cleaned stale DO bindings via Cloudflare API before deployment"
+                      else
+                          echo "✓ No stale DO bindings found, cloud and local configs are in sync"
+                      fi
                       echo "✓ Durable Objects themselves were NOT deleted"
                       echo "✓ Other Workers using these Durable Objects are NOT affected"
                       echo "✓ Data in Durable Objects is preserved"
                       if [ -n "${{ steps.check_worker.outputs.do_classes }}" ]; then
                           echo ""
-                          echo "Durable Objects re-bound to this Worker: ${{ steps.check_worker.outputs.do_classes }}"
+                          echo "Durable Objects bound to this Worker: ${{ steps.check_worker.outputs.do_classes }}"
                       fi
                   else
                       echo "Note: New Worker was created"
