@@ -302,36 +302,38 @@ jobs:
               run: |
                   echo "Checking if Worker '${{ env.WORKER_NAME }}' exists..."
                   
-                  # Get worker script metadata
-                  worker_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
+                  # List all workers and check if ours exists
+                  # Use tr to strip null bytes that Cloudflare API may include in responses
+                  workers_list=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts" \
+                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
                   
-                  if echo "$worker_response" | grep -q '"success":true'; then
+                  echo "Workers list response (first 500 chars):"
+                  echo "${workers_list:0:500}"
+                  echo ""
+                  
+                  if echo "$workers_list" | grep -q "${{ env.WORKER_NAME }}"; then
                       echo "Worker '${{ env.WORKER_NAME }}' already exists."
                       echo "worker_exists=true" >> $GITHUB_OUTPUT
                       
-                      # Extract and display current bindings
+                      # Get worker script metadata for bindings detail
+                      worker_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}" \
+                          -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
+                      
+                      echo "Worker detail response (first 1000 chars):"
+                      echo "${worker_response:0:1000}"
                       echo ""
-                      echo "=== Current Worker Bindings (for ${WORKER_NAME} only) ==="
-                      bindings=$(echo "$worker_response" | grep -o '"bindings":\[[^]]*\]' | head -1 || echo "")
                       
-                      if [ -n "$bindings" ]; then
-                          echo "Current bindings for this Worker:"
-                          echo "$bindings" | grep -oE '"name":"[^"]+","class_name":"[^"]+"' || echo "No durable object bindings found"
-                      fi
-                      
-                      # Extract durable object class names
-                      do_classes=$(echo "$worker_response" | grep -oE '"class_name":"[^"]+"' | cut -d'"' -f4 | sort -u)
+                      # Extract durable object class names from bindings
+                      do_classes=$(echo "$worker_response" | grep -oE '"class_name"\s*:\s*"[^"]+"' | sed 's/.*"class_name"\s*:\s*"//;s/"$//' | sort -u)
                       if [ -n "$do_classes" ]; then
-                          echo ""
                           echo "=== Durable Objects bound to this Worker ==="
                           echo "$do_classes"
                           echo "do_classes=$(echo "$do_classes" | tr '\n' ',')" >> $GITHUB_OUTPUT
                           echo ""
-                          echo "⚠️  NOTE: Only removing bindings from '${{ env.WORKER_NAME }}', NOT deleting Durable Objects themselves"
+                          echo "NOTE: Only removing bindings from '${{ env.WORKER_NAME }}', NOT deleting Durable Objects themselves"
                           echo "   Other Workers can still use these Durable Objects normally."
                       else
-                          echo "No Durable Objects found."
+                          echo "No Durable Objects found on this Worker."
                           echo "do_classes=" >> $GITHUB_OUTPUT
                       fi
                   else
