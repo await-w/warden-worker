@@ -402,7 +402,7 @@ jobs:
             - name: Deploy to Cloudflare (first deployment)
               if: steps.check_worker.outputs.worker_exists != 'true'
               uses: cloudflare/wrangler-action@v3
-              id: cf
+              id: cf_first
               with:
                   apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
                   accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
