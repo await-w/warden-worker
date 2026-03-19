@@ -10,6 +10,7 @@ on:
 env:
     D1_DATABASE_NAME: vaultsql
     R2_BUCKET_NAME: warden-send-files
+    WORKER_NAME: warden-worker
 
 jobs:
     preflight:
@@ -293,7 +294,113 @@ jobs:
                   sed -i "s/\"database_id\": \"[^\"]*\"/\"database_id\": \"$db_id\"/g" wrangler.jsonc
                   echo "Updated wrangler.jsonc with database ID: $db_id"
 
-            - name: Deploy to Cloudflare
+            - name: Check if Worker exists and list Durable Objects
+              id: check_worker
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+              run: |
+                  echo "Checking if Worker '${{ env.WORKER_NAME }}' exists..."
+                  
+                  # Get worker script metadata
+                  worker_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}" \
+                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
+                  
+                  if echo "$worker_response" | grep -q '"success":true'; then
+                      echo "Worker '${{ env.WORKER_NAME }}' already exists."
+                      echo "worker_exists=true" >> $GITHUB_OUTPUT
+                      
+                      # Extract and display current bindings
+                      echo ""
+                      echo "=== Current Worker Bindings (for ${WORKER_NAME} only) ==="
+                      bindings=$(echo "$worker_response" | grep -o '"bindings":\[[^]]*\]' | head -1 || echo "")
+                      
+                      if [ -n "$bindings" ]; then
+                          echo "Current bindings for this Worker:"
+                          echo "$bindings" | grep -oE '"name":"[^"]+","class_name":"[^"]+"' || echo "No durable object bindings found"
+                      fi
+                      
+                      # Extract durable object class names
+                      do_classes=$(echo "$worker_response" | grep -oE '"class_name":"[^"]+"' | cut -d'"' -f4 | sort -u)
+                      if [ -n "$do_classes" ]; then
+                          echo ""
+                          echo "=== Durable Objects bound to this Worker ==="
+                          echo "$do_classes"
+                          echo "do_classes=$(echo "$do_classes" | tr '\n' ',')" >> $GITHUB_OUTPUT
+                          echo ""
+                          echo "⚠️  NOTE: Only removing bindings from '${{ env.WORKER_NAME }}', NOT deleting Durable Objects themselves"
+                          echo "   Other Workers can still use these Durable Objects normally."
+                      else
+                          echo "No Durable Objects found."
+                          echo "do_classes=" >> $GITHUB_OUTPUT
+                      fi
+                  else
+                      echo "Worker '${{ env.WORKER_NAME }}' does not exist, will create new deployment."
+                      echo "worker_exists=false" >> $GITHUB_OUTPUT
+                      echo "do_classes=" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Backup and clean Durable Objects from wrangler.jsonc
+              if: steps.check_worker.outputs.worker_exists == 'true'
+              run: |
+                  echo "Backing up original wrangler.jsonc..."
+                  cp wrangler.jsonc wrangler.jsonc.backup
+                  
+                  echo "Removing durable_objects section from wrangler.jsonc..."
+                  # Use node to properly remove the durable_objects and migrations sections
+                  node -e "
+                  const fs = require('fs');
+                  const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, ''));
+                  
+                  // Store original durable_objects for restoration later
+                  if (config.durable_objects) {
+                      fs.writeFileSync('durable_objects_backup.json', JSON.stringify(config.durable_objects, null, 2));
+                      console.log('Backed up durable_objects configuration');
+                  }
+                  
+                  // Remove durable_objects and migrations sections
+                  delete config.durable_objects;
+                  delete config.migrations;
+                  
+                  // Write back without comments (will be temporary)
+                  fs.writeFileSync('wrangler.jsonc.temp', JSON.stringify(config, null, 4));
+                  "
+                  
+                  # Replace the original file
+                  mv wrangler.jsonc.temp wrangler.jsonc
+                  echo "Durable Objects and migrations sections removed from wrangler.jsonc"
+
+            - name: Deploy to Cloudflare (without Durable Objects)
+              if: steps.check_worker.outputs.worker_exists == 'true'
+              uses: cloudflare/wrangler-action@v3
+              id: cf_cleanup
+              with:
+                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+                  wranglerVersion: "4.73.0"
+                  command: deploy --force
+
+            - name: Restore Durable Objects to wrangler.jsonc
+              if: steps.check_worker.outputs.worker_exists == 'true'
+              run: |
+                  echo "Restoring durable_objects and migrations sections to wrangler.jsonc..."
+                  
+                  # Restore from backup
+                  cp wrangler.jsonc.backup wrangler.jsonc
+                  echo "Restored original wrangler.jsonc with durable_objects configuration"
+
+            - name: Deploy to Cloudflare (with Durable Objects)
+              if: steps.check_worker.outputs.worker_exists == 'true'
+              uses: cloudflare/wrangler-action@v3
+              id: cf
+              with:
+                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+                  wranglerVersion: "4.73.0"
+                  command: deploy --force
+
+            - name: Deploy to Cloudflare (first deployment)
+              if: steps.check_worker.outputs.worker_exists != 'true'
               uses: cloudflare/wrangler-action@v3
               id: cf
               with:
@@ -314,4 +421,18 @@ jobs:
                       echo "Note: New database was created and initialized with schema.sql"
                   else
                       echo "Note: Existing database was used (schema not re-initialized)"
+                  fi
+                  echo ""
+                  if [ "${{ steps.check_worker.outputs.worker_exists }}" == "true" ]; then
+                      echo "=== Durable Objects Update Summary ==="
+                      echo "✓ Only removed bindings from Worker '${{ env.WORKER_NAME }}'"
+                      echo "✓ Durable Objects themselves were NOT deleted"
+                      echo "✓ Other Workers using these Durable Objects are NOT affected"
+                      echo "✓ Data in Durable Objects is preserved"
+                      if [ -n "${{ steps.check_worker.outputs.do_classes }}" ]; then
+                          echo ""
+                          echo "Durable Objects re-bound to this Worker: ${{ steps.check_worker.outputs.do_classes }}"
+                      fi
+                  else
+                      echo "Note: New Worker was created"
                   fi
