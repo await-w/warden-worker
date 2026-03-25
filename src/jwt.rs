@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
+use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use hmac::{Hmac, Mac};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 
@@ -90,4 +91,39 @@ pub fn decode_hs256<T: DeserializeOwned>(token: &str, secret: &str) -> Result<T,
 
     serde_json::from_value(payload_json)
         .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
+}
+
+const TWO_FACTOR_REMEMBER_VALIDITY_DAYS: i64 = 30;
+const TWO_FACTOR_REMEMBER_ISSUER: &str = "warden-worker|2faremember";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TwoFactorRememberClaims {
+    pub nbf: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub sub: String,
+    pub user_uuid: String,
+}
+
+pub fn generate_2fa_remember_claims(device_uuid: String, user_uuid: String) -> TwoFactorRememberClaims {
+    let now = Utc::now();
+    TwoFactorRememberClaims {
+        nbf: now.timestamp(),
+        exp: (now + Duration::days(TWO_FACTOR_REMEMBER_VALIDITY_DAYS)).timestamp(),
+        iss: TWO_FACTOR_REMEMBER_ISSUER.to_string(),
+        sub: device_uuid,
+        user_uuid,
+    }
+}
+
+pub fn encode_2fa_remember(claims: &TwoFactorRememberClaims, secret: &str) -> Result<String, AppError> {
+    encode_hs256(claims, secret)
+}
+
+pub fn decode_2fa_remember(token: &str, secret: &str) -> Result<TwoFactorRememberClaims, AppError> {
+    let claims: TwoFactorRememberClaims = decode_hs256(token, secret)?;
+    if claims.iss != TWO_FACTOR_REMEMBER_ISSUER {
+        return Err(AppError::Unauthorized("Invalid token issuer".to_string()));
+    }
+    Ok(claims)
 }

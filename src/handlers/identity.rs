@@ -3,8 +3,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
-use base64::{engine::general_purpose, Engine as _};
-use rand::RngCore;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -15,7 +13,7 @@ use worker::wasm_bindgen::JsValue;
 use sha2::{Digest, Sha256};
 
 use crate::background::BackgroundExecutor;
-use crate::{auth::Claims, crypto, db, error::AppError, logging::targets, models::user::User, two_factor, webauthn};
+use crate::{auth::Claims, crypto, db, error::AppError, jwt, logging::targets, models::user::User, two_factor, webauthn};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 
@@ -30,7 +28,6 @@ fn update_device_background(
     device_identifier: String,
     device_name: Option<String>,
     device_type: Option<i32>,
-    remember_token: Option<String>,
 ) {
     ctx.wait_until(async move {
         log::debug!(
@@ -64,17 +61,15 @@ fn update_device_background(
         }
 
         let now = Utc::now().to_rfc3339();
-        let remember_hash = remember_token.as_deref().map(sha256_hex);
 
         match db
             .prepare(
-                "INSERT INTO devices (id, user_id, device_identifier, device_name, device_type, remember_token_hash, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO devices (id, user_id, device_identifier, device_name, device_type, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(user_id, device_identifier) DO UPDATE SET
                    updated_at = excluded.updated_at,
                    device_name = COALESCE(excluded.device_name, devices.device_name),
-                   device_type = COALESCE(excluded.device_type, devices.device_type),
-                   remember_token_hash = COALESCE(excluded.remember_token_hash, devices.remember_token_hash)",
+                   device_type = COALESCE(excluded.device_type, devices.device_type)",
             )
             .bind(&[
                 Uuid::new_v4().to_string().into(),
@@ -82,7 +77,6 @@ fn update_device_background(
                 device_identifier.clone().into(),
                 js_opt_string(device_name.clone()),
                 js_opt_i64(device_type.map(|v| v as i64)),
-                js_opt_string(remember_hash.clone()),
                 now.clone().into(),
                 now.into(),
             ])
@@ -393,10 +387,16 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn generate_remember_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+fn generate_remember_token(device_uuid: &str, user_uuid: &str, jwt_secret: &str) -> Result<String, AppError> {
+    let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
+    jwt::encode_2fa_remember(&claims, jwt_secret)
+}
+
+fn verify_remember_token(token: &str, device_uuid: &str, user_uuid: &str, jwt_secret: &str) -> bool {
+    match jwt::decode_2fa_remember(token, jwt_secret) {
+        Ok(claims) => claims.sub == device_uuid && claims.user_uuid == user_uuid,
+        Err(_) => false,
+    }
 }
 
 fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -793,7 +793,6 @@ pub async fn token(
                         device_id,
                         device_name,
                         device_type,
-                        None,
                     );
                 }
 
@@ -863,30 +862,19 @@ pub async fn token(
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     };
 
-                    ensure_devices_table(&db).await?;
-                    let row: Option<Value> = db
-                        .prepare(
-                            "SELECT remember_token_hash FROM devices WHERE user_id = ?1 AND device_identifier = ?2",
-                        )
-                        .bind(&[user.id.clone().into(), device_identifier.into()])?
-                        .first(None)
-                        .await
-                        .map_err(|_| AppError::Database)?;
-                    let stored_hash = row
-                        .and_then(|v| v.get("remember_token_hash").cloned())
-                        .and_then(|v| v.as_str().map(|s| s.to_string()));
-                    let Some(stored_hash) = stored_hash else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
-                    };
-                    let candidate_hash = sha256_hex(cookie_token.trim());
-                    if !constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes()) {
+                    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                    if !verify_remember_token(cookie_token.trim(), device_identifier, &user.id, &jwt_secret) {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token());
+                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                        remember_token_to_return = Some(generate_remember_token(
+                            payload.device_identifier.as_deref().unwrap(),
+                            &user.id,
+                            &jwt_secret,
+                        )?);
                     }
                 } else if provider == Some(5) {
                     let Some(device_identifier) = payload.device_identifier.as_deref() else {
@@ -898,24 +886,8 @@ pub async fn token(
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     };
 
-                    ensure_devices_table(&db).await?;
-                    let row: Option<Value> = db
-                        .prepare(
-                            "SELECT remember_token_hash FROM devices WHERE user_id = ?1 AND device_identifier = ?2",
-                        )
-                        .bind(&[user.id.clone().into(), device_identifier.into()])?
-                        .first(None)
-                        .await
-                        .map_err(|_| AppError::Database)?;
-                    let stored_hash = row
-                        .and_then(|v| v.get("remember_token_hash").cloned())
-                        .and_then(|v| v.as_str().map(|s| s.to_string()));
-                    let Some(stored_hash) = stored_hash else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
-                    };
-                    let candidate_hash = sha256_hex(token.trim());
-                    if !constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes()) {
+                    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                    if !verify_remember_token(token.trim(), device_identifier, &user.id, &jwt_secret) {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     }
@@ -955,7 +927,12 @@ pub async fn token(
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token());
+                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                        remember_token_to_return = Some(generate_remember_token(
+                            payload.device_identifier.as_deref().unwrap(),
+                            &user.id,
+                            &jwt_secret,
+                        )?);
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) && email_2fa_enabled {
                     let Some(token) = token.as_deref() else {
@@ -1049,7 +1026,12 @@ pub async fn token(
                     );
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token());
+                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                        remember_token_to_return = Some(generate_remember_token(
+                            payload.device_identifier.as_deref().unwrap(),
+                            &user.id,
+                            &jwt_secret,
+                        )?);
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_RECOVERY_CODE) {
                     let Some(token) = token.as_deref() else {
@@ -1135,7 +1117,12 @@ pub async fn token(
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token());
+                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+                        remember_token_to_return = Some(generate_remember_token(
+                            payload.device_identifier.as_deref().unwrap(),
+                            &user.id,
+                            &jwt_secret,
+                        )?);
                     }
                 } else {
                     let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
@@ -1176,7 +1163,6 @@ pub async fn token(
                     device_identifier,
                     device_name.clone(),
                     device_type,
-                    remember_token_to_return.clone(),
                 );
             }
 
