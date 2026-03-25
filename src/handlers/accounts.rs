@@ -483,7 +483,7 @@ pub async fn register(
     let now = Utc::now().to_rfc3339();
     let email = payload.email.to_lowercase();
 
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     let name_from_token = if let Some(token) = payload.email_verification_token.as_ref() {
         use jsonwebtoken::{decode, DecodingKey, Validation};
         let decoding_key = DecodingKey::from_secret(jwt_keys.access_secret.as_ref());
@@ -1104,7 +1104,7 @@ pub async fn send_verification_email(
 
     log::info!("Send verification email: name={:?}, email={}", payload.name, payload.email);
 
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
 
     // Generate a token containing the name
     let now = Utc::now();

@@ -264,7 +264,7 @@ async fn generate_tokens_and_response(
         device: device_identifier.clone(),
     };
 
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     let access_token = encode(
         &Header::default(),
         &access_claims,
@@ -399,13 +399,13 @@ fn verify_remember_token(token: &str, device_uuid: &str, user_uuid: &str, jwt_se
 }
 
 async fn generate_remember_token_async(device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<String, AppError> {
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
     jwt::encode_2fa_remember(&claims, &jwt_keys.access_secret)
 }
 
 async fn verify_remember_token_async(token: &str, device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<bool, AppError> {
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     Ok(verify_remember_token(token, device_uuid, user_uuid, &jwt_keys.access_secret))
 }
 
@@ -909,11 +909,11 @@ pub async fn token(
                     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &user.id)
                         .await?
                         .ok_or_else(|| AppError::Internal)?;
-                    let secret_encoded = two_factor::decrypt_secret_with_db_key(
-                        &db,
+                    let secret_encoded = two_factor::decrypt_secret_with_key(
+                        &state.two_factor_key,
                         &user.id,
                         &secret_enc,
-                    ).await?;
+                    )?;
                     if !two_factor::verify_totp_code(&secret_encoded, token)? {
                         notify::notify_background(
                             &state.ctx,
@@ -1239,7 +1239,7 @@ pub async fn token(
                 .or_else(|| get_cookie(&headers, "bw_refresh_token"))
                 .ok_or_else(|| AppError::BadRequest("Missing refresh_token".to_string()))?;
 
-            let jwt_keys = state.get_jwt_keys().await?;
+            let jwt_keys = state.jwt_keys.clone();
             let token_data = decode::<Claims>(
                 &refresh_token,
                 &DecodingKey::from_secret(jwt_keys.refresh_secret.as_ref()),
@@ -1315,7 +1315,7 @@ pub async fn token(
                 payload.device_name,
                 payload.device_type
             );
-            let jwt_keys = state.get_jwt_keys().await?;
+            let jwt_keys = state.jwt_keys.clone();
             let login_result = webauthn::verify_passwordless_login_assertion(
                 &db,
                 &challenge_token,

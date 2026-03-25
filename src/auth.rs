@@ -57,29 +57,14 @@ impl FromRequestParts<Arc<AppState>> for Claims
                 None
             });
 
-        let jwt_keys = state.jwt_keys.get();
-        
-        let result = match (token, jwt_keys) {
-            (Some(token), Some(keys)) => {
-                let decoding_key = DecodingKey::from_secret(keys.access_secret.as_ref());
+        let result = match token {
+            Some(token) => {
+                let decoding_key = DecodingKey::from_secret(state.jwt_keys.access_secret.as_ref());
                 decode::<Claims>(&token, &decoding_key, &Validation::default())
                     .map(|td| td.claims)
                     .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
             }
-            (Some(token), None) => {
-                let jwt_keys = futures::executor::block_on(state.get_jwt_keys())
-                    .map_err(|e| AppError::Unauthorized(format!("Failed to get JWT keys: {}", e)));
-                match jwt_keys {
-                    Ok(keys) => {
-                        let decoding_key = DecodingKey::from_secret(keys.access_secret.as_ref());
-                        decode::<Claims>(&token, &decoding_key, &Validation::default())
-                            .map(|td| td.claims)
-                            .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            (None, _) => Err(AppError::Unauthorized("Missing or invalid token".to_string())),
+            None => Err(AppError::Unauthorized("Missing or invalid token".to_string())),
         };
 
         Box::pin(std::future::ready(result))

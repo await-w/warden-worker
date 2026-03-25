@@ -258,7 +258,7 @@ async fn claims_from_bearer(
     let Some(token) = bearer_token_from_headers(headers) else {
         return Ok(None);
     };
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     let claims = jwt::decode_hs256(&token, &jwt_keys.access_secret)?;
     Ok(Some(claims))
 }
@@ -821,7 +821,7 @@ pub async fn identity_assertion_options(
     let db = db::get_db(&state.env)?;
     let rp_id = webauthn::rp_id_from_headers(&headers);
     let origin = webauthn::origin_from_headers(&headers);
-    let jwt_keys = state.get_jwt_keys().await?;
+    let jwt_keys = state.jwt_keys.clone();
     let payload =
         webauthn::issue_passwordless_assertion_options(&db, &rp_id, &origin, &jwt_keys.access_secret).await?;
     Ok(Json(payload))

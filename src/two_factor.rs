@@ -239,6 +239,22 @@ pub async fn decrypt_secret_with_db_key(
     decrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_enc)
 }
 
+pub fn encrypt_secret_with_key(
+    key: &crate::two_factor_key_manager::TwoFactorKey,
+    user_id: &str,
+    secret_encoded: &str,
+) -> Result<String, AppError> {
+    encrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_encoded)
+}
+
+pub fn decrypt_secret_with_key(
+    key: &crate::two_factor_key_manager::TwoFactorKey,
+    user_id: &str,
+    secret_enc: &str,
+) -> Result<String, AppError> {
+    decrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_enc)
+}
+
 pub fn verify_totp_code(secret_encoded: &str, token: &str) -> Result<bool, AppError> {
     let token = token.trim();
     if token.len() != 6 || !token.chars().all(|c| c.is_ascii_digit()) {

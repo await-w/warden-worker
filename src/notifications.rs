@@ -66,7 +66,7 @@ impl DurableObject for NotificationsHub {
         let path = normalize_path(&path_owned);
 
         if req.method() == Method::Get && (path == HUB_PATH || path == HUB_PATH_WITH_PREFIX) {
-            return self.handle_user_hub(&req);
+            return self.handle_user_hub(&req).await;
         }
 
         if req.method() == Method::Get
@@ -76,21 +76,21 @@ impl DurableObject for NotificationsHub {
         }
 
         if req.method() == Method::Post && path == INTERNAL_AUTH_REQUEST_PATH {
-            if !self.is_internal_request(&req) {
+            if !self.is_internal_request(&req).await {
                 return Response::error("Forbidden", 403);
             }
             return self.handle_internal_auth_request(&mut req).await;
         }
 
         if req.method() == Method::Post && path == INTERNAL_AUTH_RESPONSE_PATH {
-            if !self.is_internal_request(&req) {
+            if !self.is_internal_request(&req).await {
                 return Response::error("Forbidden", 403);
             }
             return self.handle_internal_auth_response(&mut req).await;
         }
 
         if req.method() == Method::Post && path == INTERNAL_CLOSE_ANONYMOUS_PATH {
-            if !self.is_internal_request(&req) {
+            if !self.is_internal_request(&req).await {
                 return Response::error("Forbidden", 403);
             }
             return self.handle_internal_close_anonymous(&mut req).await;
@@ -146,11 +146,11 @@ impl NotificationsHub {
             .ok_or_else(|| Error::RustError("JWT keys not found".to_string()))
     }
 
-    fn handle_user_hub(&self, req: &Request) -> Result<Response> {
+    async fn handle_user_hub(&self, req: &Request) -> Result<Response> {
         let access_token = extract_access_token(req)
             .ok_or_else(|| Error::RustError("Missing access token".to_string()))?;
 
-        let jwt_secret = futures::executor::block_on(self.get_jwt_secret())
+        let jwt_secret = self.get_jwt_secret().await
             .map_err(|e| Error::RustError(format!("Failed to get JWT secret: {}", e)))?;
         
         let decoding_key = DecodingKey::from_secret(jwt_secret.as_ref());
@@ -239,7 +239,7 @@ impl NotificationsHub {
         }
     }
 
-    fn is_internal_request(&self, req: &Request) -> bool {
+    async fn is_internal_request(&self, req: &Request) -> bool {
         let provided = req
             .headers()
             .get(INTERNAL_AUTH_HEADER)
@@ -250,7 +250,7 @@ impl NotificationsHub {
             return false;
         }
 
-        let expected = match futures::executor::block_on(self.get_jwt_secret()) {
+        let expected = match self.get_jwt_secret().await {
             Ok(secret) => secret,
             Err(_) => return false,
         };

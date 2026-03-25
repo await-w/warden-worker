@@ -151,7 +151,7 @@ struct SendAccessPassClaims {
 /// Create a signed JWT cookie value valid for `SEND_ACCESS_COOKIE_TTL_MINUTES`.
 fn generate_send_access_cookie(state: &Arc<AppState>) -> impl std::future::Future<Output = Result<String, AppError>> {
     async move {
-        let jwt_keys = state.get_jwt_keys().await?;
+        let jwt_keys = state.jwt_keys.clone();
         let now = Utc::now();
         let claims = SendAccessPassClaims {
             aud: "send_access".to_string(),
@@ -170,7 +170,7 @@ fn generate_send_access_cookie(state: &Arc<AppState>) -> impl std::future::Futur
 /// Validate the signed cookie; returns `Ok(())` if valid.
 fn validate_send_access_cookie(state: &Arc<AppState>, token: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
     async move {
-        let jwt_keys = state.get_jwt_keys().await?;
+        let jwt_keys = state.jwt_keys.clone();
         let mut validation = jsonwebtoken::Validation::default();
         validation.set_audience(&["send_access"]);
         validation.set_required_spec_claims(&["exp", "aud"]);
@@ -1454,7 +1454,7 @@ struct SendDownloadClaims {
 
 fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<String, AppError>> {
     async move {
-        let jwt_keys = state.get_jwt_keys().await?;
+        let jwt_keys = state.jwt_keys.clone();
         let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
         let claims = SendDownloadClaims {
             sub: format!("{send_id}/{file_id}"),
@@ -1471,7 +1471,7 @@ fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) 
 
 fn validate_download_token(state: &Arc<AppState>, token: &str, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
     async move {
-        let jwt_keys = state.get_jwt_keys().await?;
+        let jwt_keys = state.jwt_keys.clone();
         let data = jsonwebtoken::decode::<SendDownloadClaims>(
             token,
             &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),

@@ -38,6 +38,14 @@ pub async fn main(
         return Ok(worker_resp.into());
     }
 
+    let db = env.d1("vaultsql").map_err(|e| worker::Error::RustError(format!("Failed to get database: {}", e)))?;
+    
+    let jwt_keys = jwt_manager::JwtKeyManager::get_or_create_keys(&db).await
+        .map_err(|e| worker::Error::RustError(format!("Failed to initialize JWT keys: {}", e)))?;
+    
+    let two_factor_key = two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(&db).await
+        .map_err(|e| worker::Error::RustError(format!("Failed to initialize two-factor key: {}", e)))?;
+
     let (city, region, country) = {
         if let Some(cf) = req.cf() {
             (cf.city(), cf.region(), cf.country())
@@ -64,7 +72,7 @@ pub async fn main(
         .allow_headers(Any)
         .allow_origin(Any);
 
-    let mut app = router::api_router(env, Some(ctx)).layer(cors);
+    let mut app = router::api_router_with_keys(env, Some(ctx), jwt_keys, two_factor_key).layer(cors);
 
     Ok(Service::call(&mut app, http_req).await?)
 }
