@@ -85,9 +85,9 @@ if (targets.length === 0) {
 const patches = [
   {
     name: "default-kdf-config",
-    search: /const ne=new ee\(ee\.ITERATIONS\.defaultValue\);/g,
+    search: /const (\w+)=new Q\(Q\.ITERATIONS\.defaultValue\);/g,
     replace:
-      "const ne=new te(te.ITERATIONS.defaultValue,te.MEMORY.defaultValue,te.PARALLELISM.defaultValue);",
+      "const $1=new ee(ee.ITERATIONS.defaultValue,ee.MEMORY.defaultValue,ee.PARALLELISM.defaultValue);",
   },
   {
     name: "kdf-form-default",
