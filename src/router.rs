@@ -10,10 +10,29 @@ use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
 use crate::handlers::{accounts, ciphers, compat, config, css, identity, sync, folders, import, two_factor, devices, sends, usage, icons, settings, webauthn};
+use crate::jwt_manager::JwtKeys;
 
 pub struct AppState {
     pub env: Env,
     pub ctx: BackgroundExecutor,
+    pub jwt_keys: std::sync::OnceLock<Arc<JwtKeys>>,
+}
+
+impl AppState {
+    pub async fn get_jwt_keys(&self) -> Result<Arc<JwtKeys>, crate::error::AppError> {
+        if let Some(keys) = self.jwt_keys.get() {
+            return Ok(keys.clone());
+        }
+
+        let db = self.env.d1("vaultsql").map_err(crate::error::AppError::Worker)?;
+        let keys = crate::jwt_manager::JwtKeyManager::get_or_create_keys(&db).await?;
+
+        let jwt_keys = Arc::new(keys);
+
+        let _ = self.jwt_keys.set(jwt_keys.clone());
+
+        Ok(jwt_keys)
+    }
 }
 
 async fn demo_html(AxumState(_state): AxumState<Arc<AppState>>) -> Html<&'static str> {
@@ -27,6 +46,12 @@ pub fn api_router(env: Env, ctx: Option<Context>) -> Router<()> {
             Some(context) => BackgroundExecutor::from_context(context),
             None => BackgroundExecutor::detached(),
         },
+        jwt_keys: std::sync::OnceLock::new(),
+    });
+
+    let app_state_clone = app_state.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = app_state_clone.get_jwt_keys().await;
     });
 
     Router::new()

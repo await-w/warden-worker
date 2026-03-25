@@ -149,35 +149,39 @@ struct SendAccessPassClaims {
 }
 
 /// Create a signed JWT cookie value valid for `SEND_ACCESS_COOKIE_TTL_MINUTES`.
-fn generate_send_access_cookie(state: &Arc<AppState>) -> Result<String, AppError> {
-    let secret = state.env.secret("JWT_SECRET")?.to_string();
-    let now = Utc::now();
-    let claims = SendAccessPassClaims {
-        aud: "send_access".to_string(),
-        iat: now.timestamp() as usize,
-        exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp() as usize,
-    };
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-    )?;
-    Ok(token)
+fn generate_send_access_cookie(state: &Arc<AppState>) -> impl std::future::Future<Output = Result<String, AppError>> {
+    async move {
+        let jwt_keys = state.get_jwt_keys().await?;
+        let now = Utc::now();
+        let claims = SendAccessPassClaims {
+            aud: "send_access".to_string(),
+            iat: now.timestamp() as usize,
+            exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp() as usize,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+        )?;
+        Ok(token)
+    }
 }
 
 /// Validate the signed cookie; returns `Ok(())` if valid.
-fn validate_send_access_cookie(state: &Arc<AppState>, token: &str) -> Result<(), AppError> {
-    let secret = state.env.secret("JWT_SECRET")?.to_string();
-    let mut validation = jsonwebtoken::Validation::default();
-    validation.set_audience(&["send_access"]);
-    validation.set_required_spec_claims(&["exp", "aud"]);
-    jsonwebtoken::decode::<SendAccessPassClaims>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|_| AppError::Unauthorized("Invalid or expired send access pass".to_string()))?;
-    Ok(())
+fn validate_send_access_cookie(state: &Arc<AppState>, token: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
+    async move {
+        let jwt_keys = state.get_jwt_keys().await?;
+        let mut validation = jsonwebtoken::Validation::default();
+        validation.set_audience(&["send_access"]);
+        validation.set_required_spec_claims(&["exp", "aud"]);
+        jsonwebtoken::decode::<SendAccessPassClaims>(
+            token,
+            &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+            &validation,
+        )
+        .map_err(|_| AppError::Unauthorized("Invalid or expired send access pass".to_string()))?;
+        Ok(())
+    }
 }
 
 /// Extract the `cf_send_pass` cookie from request headers.
@@ -204,13 +208,13 @@ fn extract_send_access_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// Enforce Turnstile cookie on send-access endpoints.
 /// Returns `Ok(())` if Turnstile is disabled or the cookie is valid.
-fn require_send_access_pass(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), AppError> {
+async fn require_send_access_pass(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), AppError> {
     if !turnstile_enabled(state) {
         return Ok(());
     }
     let token = extract_send_access_cookie(headers)
         .ok_or_else(|| AppError::Unauthorized("Turnstile verification required".to_string()))?;
-    validate_send_access_cookie(state, &token)
+    validate_send_access_cookie(state, &token).await
 }
 
 /// Build the Set-Cookie header value for the send-access pass (HttpOnly, backend use).
@@ -284,7 +288,7 @@ pub async fn post_send_verify(
     let client_ip = request_client_ip(&headers);
     verify_turnstile_token(&state, &payload.token, client_ip.as_deref()).await?;
 
-    let cookie_value = generate_send_access_cookie(&state)?;
+    let cookie_value = generate_send_access_cookie(&state).await?;
     let mut response = Response::new(axum::body::Body::from(
         serde_json::to_string(&json!({ "ok": true })).unwrap(),
     ));
@@ -1331,7 +1335,7 @@ pub async fn post_access(
         extract_send_access_cookie(&headers).is_some()
     );
     // Require Turnstile send-access pass (cookie set by /send-verify flow)
-    require_send_access_pass(&state, &headers)?;
+    require_send_access_pass(&state, &headers).await?;
     enforce_send_access_rate_limit(
         &state,
         format!(
@@ -1385,8 +1389,8 @@ pub async fn post_access_file(
         payload.password.as_deref().map(str::trim).map(|s| !s.is_empty()).unwrap_or(false),
         extract_send_access_cookie(&headers).is_some()
     );
-    // Require Turnstile send-access pass (cookie set by /send-verify flow)
-    require_send_access_pass(&state, &headers)?;
+    // Require Turnstile send-access pass (cookie set by the /send-verify flow)
+    require_send_access_pass(&state, &headers).await?;
     enforce_send_access_rate_limit(
         &state,
         format!(
@@ -1425,7 +1429,7 @@ pub async fn post_access_file(
 
     update_send_access_count(&db, &send.id, 1).await?;
 
-    let token = generate_download_token(&state, &send_id, &file_id)?;
+    let token = generate_download_token(&state, &send_id, &file_id).await?;
     let url = format!("/api/sends/{send_id}/{file_id}?t={token}");
 
     log::info!(target: targets::AUTH, "send.access_file.success send_id={} file_id={}", send_id, file_id);
@@ -1448,34 +1452,38 @@ struct SendDownloadClaims {
     exp: usize,
 }
 
-fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) -> Result<String, AppError> {
-    let secret = state.env.secret("JWT_SECRET")?.to_string();
-    let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
-    let claims = SendDownloadClaims {
-        sub: format!("{send_id}/{file_id}"),
-        exp,
-    };
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-    )?;
-    Ok(token)
+fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<String, AppError>> {
+    async move {
+        let jwt_keys = state.get_jwt_keys().await?;
+        let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
+        let claims = SendDownloadClaims {
+            sub: format!("{send_id}/{file_id}"),
+            exp,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+        )?;
+        Ok(token)
+    }
 }
 
-fn validate_download_token(state: &Arc<AppState>, token: &str, send_id: &str, file_id: &str) -> Result<(), AppError> {
-    let secret = state.env.secret("JWT_SECRET")?.to_string();
-    let data = jsonwebtoken::decode::<SendDownloadClaims>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
-    )
-    .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
+fn validate_download_token(state: &Arc<AppState>, token: &str, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
+    async move {
+        let jwt_keys = state.get_jwt_keys().await?;
+        let data = jsonwebtoken::decode::<SendDownloadClaims>(
+            token,
+            &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+            &jsonwebtoken::Validation::default(),
+        )
+        .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
 
-    if data.claims.sub != format!("{send_id}/{file_id}") {
-        return Err(AppError::Unauthorized("Invalid token".to_string()));
+        if data.claims.sub != format!("{send_id}/{file_id}") {
+            return Err(AppError::Unauthorized("Invalid token".to_string()));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[worker::send]
@@ -1484,7 +1492,7 @@ pub async fn download_send(
     Path((send_id, file_id)): Path<(String, String)>,
     Query(q): Query<DownloadQuery>,
 ) -> Result<Response, AppError> {
-    validate_download_token(&state, &q.t, &send_id, &file_id)?;
+    validate_download_token(&state, &q.t, &send_id, &file_id).await?;
     let db = db::get_db(&state.env)?;
     let row: Option<Value> = db
         .prepare("SELECT * FROM send_files WHERE id = ?1 AND send_id = ?2 LIMIT 1")

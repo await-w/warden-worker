@@ -213,6 +213,21 @@ CREATE TABLE IF NOT EXISTS protected_action_otp (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS jwt_keys (
+    id TEXT PRIMARY KEY NOT NULL DEFAULT 'global',
+    access_secret TEXT NOT NULL,
+    refresh_secret TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS two_factor_keys (
+    id TEXT PRIMARY KEY NOT NULL DEFAULT 'global',
+    key_b64 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_id ON ciphers(user_id);
 CREATE INDEX IF NOT EXISTS idx_ciphers_folder_id ON ciphers(folder_id);
 CREATE INDEX IF NOT EXISTS idx_sends_user_id ON sends(user_id);

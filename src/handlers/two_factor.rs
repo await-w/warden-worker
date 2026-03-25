@@ -192,12 +192,11 @@ pub async fn authenticator_request(
     let user_email = user_email.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let secret_encoded = two_factor::generate_totp_secret_base32_20();
-    let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-    let secret_enc = two_factor::encrypt_secret_with_optional_key(
-        two_factor_key_b64.as_deref(),
+    let secret_enc = two_factor::encrypt_secret_with_db_key(
+        &db,
         &claims.sub,
         &secret_encoded,
-    )?;
+    ).await?;
 
     two_factor::upsert_authenticator_secret(&db, &claims.sub, secret_enc, false, &now).await?;
 
@@ -245,8 +244,7 @@ pub async fn get_authenticator(
         let secret_enc = two_factor::get_authenticator_secret_enc(&db, &claims.sub)
             .await?
             .ok_or_else(|| AppError::Internal)?;
-        let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-        two_factor::decrypt_secret_with_optional_key(two_factor_key_b64.as_deref(), &claims.sub, &secret_enc)?
+        two_factor::decrypt_secret_with_db_key(&db, &claims.sub, &secret_enc).await?
     } else {
         two_factor::generate_totp_secret_base32_20()
     };
@@ -289,8 +287,7 @@ pub async fn activate_authenticator(
     }
 
     let now = Utc::now().to_rfc3339();
-    let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-    let secret_enc = two_factor::encrypt_secret_with_optional_key(two_factor_key_b64.as_deref(), &claims.sub, &key)?;
+    let secret_enc = two_factor::encrypt_secret_with_db_key(&db, &claims.sub, &key).await?;
     two_factor::upsert_authenticator_secret(&db, &claims.sub, secret_enc, true, &now).await?;
 
     let _ = two_factor::get_or_create_recovery_code(&db, &claims.sub).await?;
@@ -350,9 +347,8 @@ pub async fn disable_authenticator_vw(
     }
 
     if let Some(secret_enc) = two_factor::get_authenticator_secret_enc(&db, &claims.sub).await? {
-        let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
         let secret_encoded =
-            two_factor::decrypt_secret_with_optional_key(two_factor_key_b64.as_deref(), &claims.sub, &secret_enc)?;
+            two_factor::decrypt_secret_with_db_key(&db, &claims.sub, &secret_enc).await?;
         if secret_encoded.eq_ignore_ascii_case(payload.key.trim()) {
             two_factor::disable_authenticator(&db, &claims.sub).await?;
         } else {
@@ -402,12 +398,11 @@ pub async fn authenticator_enable(
     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &claims.sub)
         .await?
         .ok_or_else(|| AppError::BadRequest("No pending authenticator setup".to_string()))?;
-    let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-    let secret_encoded = match two_factor::decrypt_secret_with_optional_key(
-        two_factor_key_b64.as_deref(),
+    let secret_encoded = match two_factor::decrypt_secret_with_db_key(
+        &db,
         &claims.sub,
         &secret_enc,
-    ) {
+    ).await {
         Ok(v) => v,
         Err(e) => {
             let _ = two_factor::disable_authenticator(&db, &claims.sub).await;
@@ -448,12 +443,11 @@ pub async fn authenticator_disable(
     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &claims.sub)
         .await?
         .ok_or_else(|| AppError::BadRequest("Authenticator not enabled".to_string()))?;
-    let two_factor_key_b64 = state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-    let secret_encoded = two_factor::decrypt_secret_with_optional_key(
-        two_factor_key_b64.as_deref(),
+    let secret_encoded = two_factor::decrypt_secret_with_db_key(
+        &db,
         &claims.sub,
         &secret_enc,
-    )?;
+    ).await?;
     if !two_factor::verify_totp_code(&secret_encoded, &payload.code)? {
         return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
     }

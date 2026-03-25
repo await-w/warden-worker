@@ -241,7 +241,7 @@ struct WebAuthnPrfOptionPayload {
     encrypted_user_key: String,
 }
 
-fn generate_tokens_and_response(
+async fn generate_tokens_and_response(
     user: User,
     state: &Arc<AppState>,
     device_identifier: Option<String>,
@@ -264,11 +264,11 @@ fn generate_tokens_and_response(
         device: device_identifier.clone(),
     };
 
-    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+    let jwt_keys = state.get_jwt_keys().await?;
     let access_token = encode(
         &Header::default(),
         &access_claims,
-        &EncodingKey::from_secret(jwt_secret.as_ref()),
+        &EncodingKey::from_secret(jwt_keys.access_secret.as_ref()),
     )?;
 
     let refresh_expires_in = Duration::days(30);
@@ -285,11 +285,10 @@ fn generate_tokens_and_response(
         security_stamp: Some(user.security_stamp.clone()),
         device: device_identifier,
     };
-    let jwt_refresh_secret = state.env.secret("JWT_REFRESH_SECRET")?.to_string();
     let refresh_token = encode(
         &Header::default(),
         &refresh_claims,
-        &EncodingKey::from_secret(jwt_refresh_secret.as_ref()),
+        &EncodingKey::from_secret(jwt_keys.refresh_secret.as_ref()),
     )?;
 
     let (kdf_memory, kdf_parallelism) = normalize_kdf_for_response(
@@ -327,31 +326,31 @@ fn generate_tokens_and_response(
         }
     }
 
-    Ok(json!({
-        "ForcePasswordReset": false,
-        "Kdf": user.kdf_type,
-        "KdfIterations": user.kdf_iterations,
-        "KdfMemory": kdf_memory,
-        "KdfParallelism": kdf_parallelism,
-        "Key": user.key,
-        "MasterPasswordPolicy": { "Object": "masterPasswordPolicy" },
-        "PrivateKey": user.private_key,
-        "ResetMasterPassword": false,
-        "UserDecryptionOptions": user_decryption_options,
-        "AccountKeys": {
-            "publicKeyEncryptionKeyPair": {
-                "wrappedPrivateKey": user.private_key,
-                "publicKey": user.public_key,
-                "Object": "publicKeyEncryptionKeyPair"
+        Ok(json!({
+            "ForcePasswordReset": false,
+            "Kdf": user.kdf_type,
+            "KdfIterations": user.kdf_iterations,
+            "KdfMemory": kdf_memory,
+            "KdfParallelism": kdf_parallelism,
+            "Key": user.key,
+            "MasterPasswordPolicy": { "Object": "masterPasswordPolicy" },
+            "PrivateKey": user.private_key,
+            "ResetMasterPassword": false,
+            "UserDecryptionOptions": user_decryption_options,
+            "AccountKeys": {
+                "publicKeyEncryptionKeyPair": {
+                    "wrappedPrivateKey": user.private_key,
+                    "publicKey": user.public_key,
+                    "Object": "publicKeyEncryptionKeyPair"
+                },
+                "Object": "privateKeys"
             },
-            "Object": "privateKeys"
-        },
-        "access_token": access_token,
-        "expires_in": expires_in.num_seconds(),
-        "refresh_token": refresh_token,
-        "scope": "api offline_access",
-        "token_type": "Bearer"
-    }))
+            "access_token": access_token,
+            "expires_in": expires_in.num_seconds(),
+            "refresh_token": refresh_token,
+            "scope": "api offline_access",
+            "token_type": "Bearer"
+        }))
 }
 
 async fn ensure_devices_table(db: &worker::D1Database) -> Result<(), AppError> {
@@ -397,6 +396,17 @@ fn verify_remember_token(token: &str, device_uuid: &str, user_uuid: &str, jwt_se
         Ok(claims) => claims.sub == device_uuid && claims.user_uuid == user_uuid,
         Err(_) => false,
     }
+}
+
+async fn generate_remember_token_async(device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<String, AppError> {
+    let jwt_keys = state.get_jwt_keys().await?;
+    let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
+    jwt::encode_2fa_remember(&claims, &jwt_keys.access_secret)
+}
+
+async fn verify_remember_token_async(token: &str, device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<bool, AppError> {
+    let jwt_keys = state.get_jwt_keys().await?;
+    Ok(verify_remember_token(token, device_uuid, user_uuid, &jwt_keys.access_secret))
 }
 
 fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -783,7 +793,7 @@ pub async fn token(
                 let device_name = payload.device_name.clone();
                 let device_type = payload.device_type;
 
-                let response = generate_tokens_and_response(user, &state, device_identifier.clone(), None)?;
+                let response = generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
 
                 if let Some(device_id) = device_identifier {
                     update_device_background(
@@ -862,19 +872,18 @@ pub async fn token(
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     };
 
-                    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                    if !verify_remember_token(cookie_token.trim(), device_identifier, &user.id, &jwt_secret) {
+                    let valid = verify_remember_token_async(cookie_token.trim(), device_identifier, &user.id, &state).await?;
+                    if !valid {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                        remember_token_to_return = Some(generate_remember_token(
+                        remember_token_to_return = Some(generate_remember_token_async(
                             payload.device_identifier.as_deref().unwrap(),
                             &user.id,
-                            &jwt_secret,
-                        )?);
+                            &state,
+                        ).await?);
                     }
                 } else if provider == Some(5) {
                     let Some(device_identifier) = payload.device_identifier.as_deref() else {
@@ -886,8 +895,8 @@ pub async fn token(
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     };
 
-                    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                    if !verify_remember_token(token.trim(), device_identifier, &user.id, &jwt_secret) {
+                    let valid = verify_remember_token_async(token.trim(), device_identifier, &user.id, &state).await?;
+                    if !valid {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
                     }
@@ -900,13 +909,11 @@ pub async fn token(
                     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &user.id)
                         .await?
                         .ok_or_else(|| AppError::Internal)?;
-                    let two_factor_key_b64 =
-                        state.env.secret("TWO_FACTOR_ENC_KEY").ok().map(|s| s.to_string());
-                    let secret_encoded = two_factor::decrypt_secret_with_optional_key(
-                        two_factor_key_b64.as_deref(),
+                    let secret_encoded = two_factor::decrypt_secret_with_db_key(
+                        &db,
                         &user.id,
                         &secret_enc,
-                    )?;
+                    ).await?;
                     if !two_factor::verify_totp_code(&secret_encoded, token)? {
                         notify::notify_background(
                             &state.ctx,
@@ -927,12 +934,11 @@ pub async fn token(
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                        remember_token_to_return = Some(generate_remember_token(
+                        remember_token_to_return = Some(generate_remember_token_async(
                             payload.device_identifier.as_deref().unwrap(),
                             &user.id,
-                            &jwt_secret,
-                        )?);
+                            &state,
+                        ).await?);
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) && email_2fa_enabled {
                     let Some(token) = token.as_deref() else {
@@ -1026,12 +1032,11 @@ pub async fn token(
                     );
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                        remember_token_to_return = Some(generate_remember_token(
+                        remember_token_to_return = Some(generate_remember_token_async(
                             payload.device_identifier.as_deref().unwrap(),
                             &user.id,
-                            &jwt_secret,
-                        )?);
+                            &state,
+                        ).await?);
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_RECOVERY_CODE) {
                     let Some(token) = token.as_deref() else {
@@ -1117,12 +1122,11 @@ pub async fn token(
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
-                        remember_token_to_return = Some(generate_remember_token(
+                        remember_token_to_return = Some(generate_remember_token_async(
                             payload.device_identifier.as_deref().unwrap(),
                             &user.id,
-                            &jwt_secret,
-                        )?);
+                            &state,
+                        ).await?);
                     }
                 } else {
                     let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
@@ -1145,7 +1149,7 @@ pub async fn token(
                 payload.two_factor_remember
             );
 
-            let mut response = generate_tokens_and_response(user, &state, device_identifier.clone(), None)?;
+            let mut response = generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
             let remember_token_to_set = remember_token_to_return.clone();
 
             // 后台异步更新设备信息，减少登录响应延迟
@@ -1235,10 +1239,10 @@ pub async fn token(
                 .or_else(|| get_cookie(&headers, "bw_refresh_token"))
                 .ok_or_else(|| AppError::BadRequest("Missing refresh_token".to_string()))?;
 
-            let jwt_refresh_secret = state.env.secret("JWT_REFRESH_SECRET")?.to_string();
+            let jwt_keys = state.get_jwt_keys().await?;
             let token_data = decode::<Claims>(
                 &refresh_token,
-                &DecodingKey::from_secret(jwt_refresh_secret.as_ref()),
+                &DecodingKey::from_secret(jwt_keys.refresh_secret.as_ref()),
                 &Validation::default(),
             )
             .map_err(|_| AppError::Unauthorized("Invalid refresh token".to_string()))?;
@@ -1261,7 +1265,7 @@ pub async fn token(
                 return Err(AppError::Unauthorized("Invalid security stamp".to_string()));
             }
 
-            let response = generate_tokens_and_response(user.clone(), &state, payload.device_identifier.clone(), None)?;
+            let response = generate_tokens_and_response(user.clone(), &state, payload.device_identifier.clone(), None).await?;
             let mut resp = Json(response.clone()).into_response();
             if let Some(v) = response.get("access_token").and_then(|v| v.as_str()) {
                 set_cookie(
@@ -1311,12 +1315,12 @@ pub async fn token(
                 payload.device_name,
                 payload.device_type
             );
-            let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+            let jwt_keys = state.get_jwt_keys().await?;
             let login_result = webauthn::verify_passwordless_login_assertion(
                 &db,
                 &challenge_token,
                 &device_response,
-                &jwt_secret,
+                &jwt_keys.access_secret,
             )
             .await
             .map_err(|e| match e {
@@ -1383,7 +1387,7 @@ pub async fn token(
             );
 
             let user_email = user.email.clone();
-            let response = generate_tokens_and_response(user, &state, device_identifier.clone(), webauthn_prf_option.as_ref())?;
+            let response = generate_tokens_and_response(user, &state, device_identifier.clone(), webauthn_prf_option.as_ref()).await?;
 
             if let Some(device_identifier) = device_identifier.as_deref() {
                 ensure_devices_table(&db).await?;

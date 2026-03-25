@@ -11,12 +11,14 @@ mod error;
 mod handlers;
 mod heavy_do;
 mod jwt;
+mod jwt_manager;
 mod logging;
 mod models;
 mod notify;
 mod notifications;
 mod router;
 mod two_factor;
+mod two_factor_key_manager;
 mod webauthn;
 
 pub use heavy_do::HeavyDo;

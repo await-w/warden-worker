@@ -482,20 +482,21 @@ pub async fn register(
     }
     let now = Utc::now().to_rfc3339();
     let email = payload.email.to_lowercase();
-    
-    // Try to get name from email_verification_token first, then from payload.name
-    let name_from_token = payload.email_verification_token.as_ref().and_then(|token| {
+
+    let jwt_keys = state.get_jwt_keys().await?;
+    let name_from_token = if let Some(token) = payload.email_verification_token.as_ref() {
         use jsonwebtoken::{decode, DecodingKey, Validation};
-        let jwt_secret = state.env.secret("JWT_SECRET").ok()?.to_string();
-        let decoding_key = DecodingKey::from_secret(jwt_secret.as_ref());
-        let token_data = decode::<RegisterVerifyClaims>(token, &decoding_key, &Validation::default()).ok()?;
-        if token_data.claims.sub == email {
-            token_data.claims.name.filter(|n| !n.trim().is_empty())
-        } else {
-            None
+        let decoding_key = DecodingKey::from_secret(jwt_keys.access_secret.as_ref());
+        match decode::<RegisterVerifyClaims>(token, &decoding_key, &Validation::default()) {
+            Ok(token_data) if token_data.claims.sub == email => {
+                token_data.claims.name.filter(|n| !n.trim().is_empty())
+            }
+            _ => None,
         }
-    });
-    
+    } else {
+        None
+    };
+
     let name = name_from_token
         .or_else(|| payload.name.filter(|n| !n.trim().is_empty()))
         .unwrap_or_else(|| email.clone());
@@ -1103,6 +1104,8 @@ pub async fn send_verification_email(
 
     log::info!("Send verification email: name={:?}, email={}", payload.name, payload.email);
 
+    let jwt_keys = state.get_jwt_keys().await?;
+
     // Generate a token containing the name
     let now = Utc::now();
     let exp = (now + Duration::hours(24)).timestamp() as usize;
@@ -1113,11 +1116,10 @@ pub async fn send_verification_email(
         exp,
     };
 
-    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(jwt_secret.as_ref()),
+        &EncodingKey::from_secret(jwt_keys.access_secret.as_ref()),
     ).map_err(|_| AppError::Internal)?;
 
     // Return token as JSON to skip email verification

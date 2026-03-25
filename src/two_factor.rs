@@ -141,10 +141,10 @@ pub fn encrypt_secret_with_optional_key(
 
     let key_bytes = general_purpose::STANDARD
         .decode(key_b64)
-        .map_err(|_| AppError::BadRequest("Invalid TWO_FACTOR_ENC_KEY".to_string()))?;
+        .map_err(|_| AppError::BadRequest("Invalid two-factor encryption key".to_string()))?;
     if key_bytes.len() != 32 {
         return Err(AppError::BadRequest(
-            "Invalid TWO_FACTOR_ENC_KEY".to_string(),
+            "Invalid two-factor encryption key".to_string(),
         ));
     }
 
@@ -182,16 +182,16 @@ pub fn decrypt_secret_with_optional_key(
     };
     let Some(key_b64) = two_factor_enc_key_b64 else {
         return Err(AppError::BadRequest(
-            "Missing TWO_FACTOR_ENC_KEY".to_string(),
+            "Missing two-factor encryption key".to_string(),
         ));
     };
 
     let key_bytes = general_purpose::STANDARD
         .decode(key_b64)
-        .map_err(|_| AppError::BadRequest("Invalid TWO_FACTOR_ENC_KEY".to_string()))?;
+        .map_err(|_| AppError::BadRequest("Invalid two-factor encryption key".to_string()))?;
     if key_bytes.len() != 32 {
         return Err(AppError::BadRequest(
-            "Invalid TWO_FACTOR_ENC_KEY".to_string(),
+            "Invalid two-factor encryption key".to_string(),
         ));
     }
 
@@ -219,6 +219,24 @@ pub fn decrypt_secret_with_optional_key(
         })?;
 
     Ok(String::from_utf8(pt).map_err(|_| AppError::Internal)?)
+}
+
+pub async fn encrypt_secret_with_db_key(
+    db: &D1Database,
+    user_id: &str,
+    secret_encoded: &str,
+) -> Result<String, AppError> {
+    let key = crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(db).await?;
+    encrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_encoded)
+}
+
+pub async fn decrypt_secret_with_db_key(
+    db: &D1Database,
+    user_id: &str,
+    secret_enc: &str,
+) -> Result<String, AppError> {
+    let key = crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(db).await?;
+    decrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_enc)
 }
 
 pub fn verify_totp_code(secret_encoded: &str, token: &str) -> Result<bool, AppError> {

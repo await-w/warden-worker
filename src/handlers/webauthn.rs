@@ -253,13 +253,13 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<String> {
 
 async fn claims_from_bearer(
     headers: &HeaderMap,
-    env: &worker::Env,
+    state: &Arc<AppState>,
 ) -> Result<Option<Claims>, AppError> {
     let Some(token) = bearer_token_from_headers(headers) else {
         return Ok(None);
     };
-    let jwt_secret = env.secret("JWT_SECRET")?.to_string();
-    let claims = jwt::decode_hs256(&token, &jwt_secret)?;
+    let jwt_keys = state.get_jwt_keys().await?;
+    let claims = jwt::decode_hs256(&token, &jwt_keys.access_secret)?;
     Ok(Some(claims))
 }
 
@@ -269,7 +269,7 @@ pub async fn api_webauthn_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
-    if let Some(claims) = claims_from_bearer(&headers, &state.env).await? {
+    if let Some(claims) = claims_from_bearer(&headers, &state).await? {
         return Ok(Json(webauthn_credentials_response(&db, &claims.sub).await?));
     }
     Ok(Json(json!({
@@ -821,9 +821,9 @@ pub async fn identity_assertion_options(
     let db = db::get_db(&state.env)?;
     let rp_id = webauthn::rp_id_from_headers(&headers);
     let origin = webauthn::origin_from_headers(&headers);
-    let jwt_secret = state.env.secret("JWT_SECRET")?.to_string();
+    let jwt_keys = state.get_jwt_keys().await?;
     let payload =
-        webauthn::issue_passwordless_assertion_options(&db, &rp_id, &origin, &jwt_secret).await?;
+        webauthn::issue_passwordless_assertion_options(&db, &rp_id, &origin, &jwt_keys.access_secret).await?;
     Ok(Json(payload))
 }
 

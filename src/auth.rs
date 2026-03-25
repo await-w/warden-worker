@@ -5,6 +5,8 @@ use axum::{
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::error::AppError;
 use crate::router::AppState;
@@ -30,7 +32,7 @@ impl FromRequestParts<Arc<AppState>> for Claims
 {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send>> {
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -54,15 +56,28 @@ impl FromRequestParts<Arc<AppState>> for Claims
                 }
                 None
             })
-            .ok_or_else(|| AppError::Unauthorized("Missing or invalid token".to_string()))?;
+            .ok_or_else(|| AppError::Unauthorized("Missing or invalid token".to_string()));
 
-        let secret = state.env.secret("JWT_SECRET")?;
+        let result = match token {
+            Ok(token) => {
+                let jwt_keys = state.jwt_keys
+                    .get()
+                    .ok_or_else(|| AppError::Unauthorized("JWT keys not initialized".to_string()));
+                
+                match jwt_keys {
+                    Ok(keys) => {
+                        let decoding_key = DecodingKey::from_secret(keys.access_secret.to_string().as_ref());
+                        let token_data = decode::<Claims>(&token, &decoding_key, &Validation::default())
+                            .map_err(|_| AppError::Unauthorized("Invalid token".to_string()));
+                        token_data.map(|td| td.claims)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
 
-        let decoding_key = DecodingKey::from_secret(secret.to_string().as_ref());
-        let token_data = decode::<Claims>(&token, &decoding_key, &Validation::default())
-            .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
-
-        Ok(token_data.claims)
+        Box::pin(std::future::ready(result))
     }
 }
 
