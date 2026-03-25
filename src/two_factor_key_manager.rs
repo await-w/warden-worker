@@ -31,18 +31,16 @@ fn generate_random_key() -> Result<String, AppError> {
 
 impl TwoFactorKeyManager {
     pub async fn get_or_create_key(db: &D1Database) -> Result<TwoFactorKey, AppError> {
-        match Self::get_key(db).await {
-            Ok(k) => Ok(TwoFactorKey {
-                key_b64: k.key_b64,
-            }),
-            Err(_) => {
-                Self::create_key(db).await?;
-                let k = Self::get_key(db).await?;
-                Ok(TwoFactorKey {
-                    key_b64: k.key_b64,
-                })
-            }
+        if let Ok(k) = Self::get_key(db).await {
+            return Ok(TwoFactorKey { key_b64: k.key_b64 });
         }
+
+        Self::create_key(db).await?;
+
+        let k = Self::get_key(db).await
+            .map_err(|_| AppError::Database)?;
+
+        Ok(TwoFactorKey { key_b64: k.key_b64 })
     }
 
     pub async fn get_key(db: &D1Database) -> Result<TwoFactorKeyRow, AppError> {
@@ -62,7 +60,7 @@ impl TwoFactorKeyManager {
         let key_b64 = generate_random_key()?;
 
         db.prepare(
-            "INSERT INTO two_factor_keys (id, key_b64, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT OR IGNORE INTO two_factor_keys (id, key_b64, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)"
         )
         .bind(&[
             TWO_FACTOR_KEY_ID.into(),

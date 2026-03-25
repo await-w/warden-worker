@@ -33,20 +33,22 @@ fn generate_random_secret() -> Result<String, AppError> {
 
 impl JwtKeyManager {
     pub async fn get_or_create_keys(db: &D1Database) -> Result<JwtKeys, AppError> {
-        match Self::get_keys(db).await {
-            Ok(k) => Ok(JwtKeys {
+        if let Ok(k) = Self::get_keys(db).await {
+            return Ok(JwtKeys {
                 access_secret: k.access_secret,
                 refresh_secret: k.refresh_secret,
-            }),
-            Err(_) => {
-                Self::create_keys(db).await?;
-                let k = Self::get_keys(db).await?;
-                Ok(JwtKeys {
-                    access_secret: k.access_secret,
-                    refresh_secret: k.refresh_secret,
-                })
-            }
+            });
         }
+
+        Self::create_keys(db).await?;
+
+        let k = Self::get_keys(db).await
+            .map_err(|_| AppError::Database)?;
+
+        Ok(JwtKeys {
+            access_secret: k.access_secret,
+            refresh_secret: k.refresh_secret,
+        })
     }
 
     pub async fn get_keys(db: &D1Database) -> Result<JwtKeysRow, AppError> {
@@ -67,7 +69,7 @@ impl JwtKeyManager {
         let refresh_secret = generate_random_secret()?;
 
         db.prepare(
-            "INSERT INTO jwt_keys (id, access_secret, refresh_secret, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT OR IGNORE INTO jwt_keys (id, access_secret, refresh_secret, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)"
         )
         .bind(&[
             JWT_KEYS_ID.into(),
