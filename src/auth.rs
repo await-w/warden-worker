@@ -55,26 +55,31 @@ impl FromRequestParts<Arc<AppState>> for Claims
                     }
                 }
                 None
-            })
-            .ok_or_else(|| AppError::Unauthorized("Missing or invalid token".to_string()));
+            });
 
-        let result = match token {
-            Ok(token) => {
-                let jwt_keys = state.jwt_keys
-                    .get()
-                    .ok_or_else(|| AppError::Unauthorized("JWT keys not initialized".to_string()));
-                
+        let jwt_keys = state.jwt_keys.get();
+        
+        let result = match (token, jwt_keys) {
+            (Some(token), Some(keys)) => {
+                let decoding_key = DecodingKey::from_secret(keys.access_secret.as_ref());
+                decode::<Claims>(&token, &decoding_key, &Validation::default())
+                    .map(|td| td.claims)
+                    .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
+            }
+            (Some(token), None) => {
+                let jwt_keys = futures::executor::block_on(state.get_jwt_keys())
+                    .map_err(|e| AppError::Unauthorized(format!("Failed to get JWT keys: {}", e)));
                 match jwt_keys {
                     Ok(keys) => {
-                        let decoding_key = DecodingKey::from_secret(keys.access_secret.to_string().as_ref());
-                        let token_data = decode::<Claims>(&token, &decoding_key, &Validation::default())
-                            .map_err(|_| AppError::Unauthorized("Invalid token".to_string()));
-                        token_data.map(|td| td.claims)
+                        let decoding_key = DecodingKey::from_secret(keys.access_secret.as_ref());
+                        decode::<Claims>(&token, &decoding_key, &Validation::default())
+                            .map(|td| td.claims)
+                            .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
                     }
                     Err(e) => Err(e),
                 }
             }
-            Err(e) => Err(e),
+            (None, _) => Err(AppError::Unauthorized("Missing or invalid token".to_string())),
         };
 
         Box::pin(std::future::ready(result))
