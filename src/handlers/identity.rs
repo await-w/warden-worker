@@ -200,39 +200,13 @@ fn js_opt_i64(v: Option<i64>) -> JsValue {
     }
 }
 
-const KDF_TYPE_PBKDF2: i32 = 0;
-const KDF_TYPE_ARGON2ID: i32 = 1;
-const ARGON2ID_MEMORY_DEFAULT_MB: i32 = 64;
-const ARGON2ID_PARALLELISM_DEFAULT: i32 = 4;
-
 fn normalize_kdf_for_response(
     kdf_type: i32,
     kdf_iterations: i32,
     kdf_memory: Option<i32>,
     kdf_parallelism: Option<i32>,
 ) -> (Option<i32>, Option<i32>) {
-    match kdf_type {
-        KDF_TYPE_PBKDF2 => (None, None),
-        KDF_TYPE_ARGON2ID => {
-            if kdf_iterations < 1 {
-                return (Some(ARGON2ID_MEMORY_DEFAULT_MB), Some(ARGON2ID_PARALLELISM_DEFAULT));
-            }
-            let mem = kdf_memory.unwrap_or(ARGON2ID_MEMORY_DEFAULT_MB);
-            let par = kdf_parallelism.unwrap_or(ARGON2ID_PARALLELISM_DEFAULT);
-            let mem = if (15..=1024).contains(&mem) {
-                mem
-            } else {
-                ARGON2ID_MEMORY_DEFAULT_MB
-            };
-            let par = if (1..=16).contains(&par) {
-                par
-            } else {
-                ARGON2ID_PARALLELISM_DEFAULT
-            };
-            (Some(mem), Some(par))
-        }
-        _ => (None, None),
-    }
+    crypto::normalize_kdf_params(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +652,7 @@ pub async fn token(
                     return Err(AppError::Unauthorized("Invalid credentials".to_string()));
                 }
             };
-            let user: User = serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
+            let mut user: User = serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
 
             // If this is an auth-request login (trusted device), skip master password check
             // and verify the auth-request access code instead.
@@ -810,7 +784,16 @@ pub async fn token(
             }
 
             let password_valid = if let Some(salt) = &user.password_salt {
-                crypto::verify_password(&password_hash, salt, &user.master_password_hash).await
+                crypto::verify_password(
+                    &password_hash,
+                    salt,
+                    &user.master_password_hash,
+                    user.kdf_type,
+                    user.kdf_iterations,
+                    user.kdf_memory,
+                    user.kdf_parallelism,
+                )
+                .await
             } else {
                 constant_time_eq(
                     user.master_password_hash.as_bytes(),
@@ -834,6 +817,11 @@ pub async fn token(
                     },
                 );
                 return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+            }
+
+            // KDF 升级（参照 vaultwarden 实现）
+            if let Err(e) = crate::handlers::accounts::kdf_upgrade(&db, &mut user, &password_hash).await {
+                log::warn!(target: targets::AUTH, "KDF upgrade failed for user {}: {:?}", user.id, e);
             }
 
             let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user.id).await?;

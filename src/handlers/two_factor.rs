@@ -42,7 +42,7 @@ impl PasswordOrOtpData {
             (Some(master_password_hash), None) => {
                 // 查询用户的密码哈希和salt
                 let result: Option<serde_json::Value> = db
-                    .prepare("SELECT master_password_hash, password_salt FROM users WHERE id = ?1")
+                    .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
                     .bind(&[user_id.into()])?
                     .first(None)
                     .await
@@ -62,21 +62,34 @@ impl PasswordOrOtpData {
                     .unwrap_or("");
                 let password_salt = row.get("password_salt")
                     .and_then(|v| v.as_str());
+                let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
+                let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
+                let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
 
                 // 调试日志：记录哈希长度（不记录实际哈希值）
                 log::debug!(
                     target: targets::AUTH,
-                    "PasswordOrOtpData.validate: comparing hashes user_id={} stored_len={} provided_len={} has_salt={}",
+                    "PasswordOrOtpData.validate: comparing hashes user_id={} stored_len={} provided_len={} has_salt={} kdf_type={}",
                     user_id,
                     stored_hash.len(),
                     master_password_hash.len(),
-                    password_salt.is_some()
+                    password_salt.is_some(),
+                    kdf_type
                 );
 
-                // 根据是否有salt选择验证方式
+                // 根据 KDF 类型验证密码
                 let password_valid = if let Some(salt) = password_salt {
-                    // 使用PBKDF2验证
-                    crate::crypto::verify_password(master_password_hash, salt, stored_hash).await
+                    crate::crypto::verify_password(
+                        master_password_hash,
+                        salt,
+                        stored_hash,
+                        kdf_type,
+                        kdf_iterations,
+                        kdf_memory,
+                        kdf_parallelism,
+                    )
+                    .await
                 } else {
                     // 直接比较哈希值
                     constant_time_eq(stored_hash.as_bytes(), master_password_hash.as_bytes())
@@ -763,7 +776,7 @@ pub async fn send_email_login(
         }
 
         let result: Option<serde_json::Value> = db
-            .prepare("SELECT id, master_password_hash, password_salt FROM users WHERE email = ?1")
+            .prepare("SELECT id, master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE email = ?1")
             .bind(&[email.into()])?
             .first(None)
             .await
@@ -776,10 +789,23 @@ pub async fn send_email_login(
         let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let stored_hash = row.get("master_password_hash").and_then(|v| v.as_str()).unwrap_or("");
         let password_salt = row.get("password_salt").and_then(|v| v.as_str());
+        let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
+        let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
+        let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
+        let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
 
         if let Some(master_password_hash) = &payload.master_password_hash {
             let password_valid = if let Some(salt) = password_salt {
-                crate::crypto::verify_password(master_password_hash, salt, stored_hash).await
+                crate::crypto::verify_password(
+                    master_password_hash,
+                    salt,
+                    stored_hash,
+                    kdf_type,
+                    kdf_iterations,
+                    kdf_memory,
+                    kdf_parallelism,
+                )
+                .await
             } else {
                 constant_time_eq(stored_hash.as_bytes(), master_password_hash.as_bytes())
             };
@@ -1084,7 +1110,7 @@ pub async fn recover(
     );
 
     let result: Option<serde_json::Value> = db
-        .prepare("SELECT id, master_password_hash, password_salt FROM users WHERE email = ?1")
+        .prepare("SELECT id, master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE email = ?1")
         .bind(&[payload.email.to_lowercase().into()])?
         .first(None)
         .await
@@ -1102,9 +1128,22 @@ pub async fn recover(
     let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let stored_hash = row.get("master_password_hash").and_then(|v| v.as_str()).unwrap_or("");
     let password_salt = row.get("password_salt").and_then(|v| v.as_str());
+    let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
+    let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
+    let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
 
     let password_valid = if let Some(salt) = password_salt {
-        crate::crypto::verify_password(&payload.master_password_hash, salt, stored_hash).await
+        crate::crypto::verify_password(
+            &payload.master_password_hash,
+            salt,
+            stored_hash,
+            kdf_type,
+            kdf_iterations,
+            kdf_memory,
+            kdf_parallelism,
+        )
+        .await
     } else {
         constant_time_eq::constant_time_eq(stored_hash.as_bytes(), payload.master_password_hash.as_bytes())
     };

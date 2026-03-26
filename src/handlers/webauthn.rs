@@ -24,9 +24,9 @@ impl SecretVerificationData {
     async fn validate(&self, db: &worker::D1Database, user_id: &str) -> Result<(), AppError> {
         match (&self.master_password_hash, &self.otp) {
             (Some(master_password_hash), None) => {
-                // 查询用户的密码哈希和salt
+                // 查询用户的密码哈希、salt 和 KDF 参数
                 let result: Option<serde_json::Value> = db
-                    .prepare("SELECT master_password_hash, password_salt FROM users WHERE id = ?1")
+                    .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
                     .bind(&[user_id.into()])?
                     .first(None)
                     .await
@@ -41,11 +41,23 @@ impl SecretVerificationData {
                     .unwrap_or("");
                 let password_salt = row.get("password_salt")
                     .and_then(|v| v.as_str());
+                let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
+                let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
+                let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
 
-                // 根据是否有salt选择验证方式
+                // 根据 KDF 类型验证密码
                 let password_valid = if let Some(salt) = password_salt {
-                    // 使用PBKDF2验证
-                    crate::crypto::verify_password(master_password_hash, salt, stored_hash).await
+                    crate::crypto::verify_password(
+                        master_password_hash,
+                        salt,
+                        stored_hash,
+                        kdf_type,
+                        kdf_iterations,
+                        kdf_memory,
+                        kdf_parallelism,
+                    )
+                    .await
                 } else {
                     // 直接比较哈希值
                     constant_time_eq(stored_hash.as_bytes(), master_password_hash.as_bytes())
