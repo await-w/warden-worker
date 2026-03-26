@@ -387,14 +387,35 @@ pub async fn prelogin(
                 .and_then(|x| x.as_i64())
                 .map(|v| v as i32)
                 .or(Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
+            
+            let kdf_name = match kdf_type {
+                crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
+                crypto::KDF_TYPE_ARGON2ID => "Argon2id",
+                _ => "Unknown",
+            };
+            log::info!(
+                "[KDF] prelogin response for email={}: kdf_type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
+                email,
+                kdf_type,
+                kdf_name,
+                kdf_iterations,
+                kdf_memory,
+                kdf_parallelism
+            );
             (kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)
         }
-        None => (
-            KDF_TYPE_ARGON2ID,
-            3,
-            Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB),
-            Some(crypto::ARGON2ID_PARALLELISM_DEFAULT),
-        ),
+        None => {
+            log::info!(
+                "[KDF] prelogin response for email={}: user not found, returning defaults (Argon2id)",
+                email
+            );
+            (
+                KDF_TYPE_ARGON2ID,
+                3,
+                Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB),
+                Some(crypto::ARGON2ID_PARALLELISM_DEFAULT),
+            )
+        },
     };
 
     let (kdf_memory, kdf_parallelism) =
@@ -1156,6 +1177,21 @@ pub async fn kdf_upgrade(
     user: &mut User,
     password_hash: &str,
 ) -> Result<(), AppError> {
+    let kdf_name = match user.kdf_type {
+        crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
+        crypto::KDF_TYPE_ARGON2ID => "Argon2id",
+        _ => "Unknown",
+    };
+    log::info!(
+        "[KDF] kdf_upgrade check: user_id={}, kdf_type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
+        user.id,
+        user.kdf_type,
+        kdf_name,
+        user.kdf_iterations,
+        user.kdf_memory,
+        user.kdf_parallelism
+    );
+    
     let needs_upgrade = match user.kdf_type {
         KDF_TYPE_PBKDF2 => user.kdf_iterations < crypto::PBKDF2_ITERATIONS_DEFAULT,
         KDF_TYPE_ARGON2ID => {
@@ -1167,8 +1203,15 @@ pub async fn kdf_upgrade(
     };
 
     if !needs_upgrade {
+        log::info!("[KDF] kdf_upgrade: no upgrade needed for user {}", user.id);
         return Ok(());
     }
+    
+    log::info!(
+        "[KDF] kdf_upgrade: upgrading KDF for user {} from {} to recommended values",
+        user.id,
+        kdf_name
+    );
 
     // 确定升级后的参数
     let (new_iterations, new_memory, new_parallelism) = match user.kdf_type {
@@ -1222,10 +1265,10 @@ pub async fn kdf_upgrade(
     user.kdf_parallelism = new_parallelism;
 
     log::info!(
-        target: "auth",
-        "KDF upgraded for user {} to type={} iterations={} memory={:?} parallelism={:?}",
+        "[KDF] kdf_upgrade SUCCESS: user_id={}, kdf_type={} ({}), new_iterations={}, new_memory={:?}, new_parallelism={:?}",
         user.id,
         user.kdf_type,
+        kdf_name,
         user.kdf_iterations,
         user.kdf_memory,
         user.kdf_parallelism

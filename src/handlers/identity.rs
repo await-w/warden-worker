@@ -784,6 +784,20 @@ pub async fn token(
             }
 
             let password_valid = if let Some(salt) = &user.password_salt {
+                let kdf_name = match user.kdf_type {
+                    crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
+                    crypto::KDF_TYPE_ARGON2ID => "Argon2id",
+                    _ => "Unknown",
+                };
+                log::info!(
+                    "[KDF] Login verification for user {}: kdf_type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
+                    user.id,
+                    user.kdf_type,
+                    kdf_name,
+                    user.kdf_iterations,
+                    user.kdf_memory,
+                    user.kdf_parallelism
+                );
                 crypto::verify_password(
                     &password_hash,
                     salt,
@@ -795,6 +809,10 @@ pub async fn token(
                 )
                 .await
             } else {
+                log::info!(
+                    "[KDF] Login verification for user {}: using legacy hash comparison (no salt)",
+                    user.id
+                );
                 constant_time_eq(
                     user.master_password_hash.as_bytes(),
                     password_hash.as_bytes(),

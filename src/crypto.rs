@@ -172,16 +172,31 @@ pub async fn hash_password(
     memory: Option<i32>,
     parallelism: Option<i32>,
 ) -> Result<String, String> {
+    let kdf_name = match kdf_type {
+        KDF_TYPE_PBKDF2 => "PBKDF2",
+        KDF_TYPE_ARGON2ID => "Argon2id",
+        _ => "Unknown",
+    };
+    log::info!(
+        "[KDF] hash_password: type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
+        kdf_type, kdf_name, iterations, memory, parallelism
+    );
+    
     match kdf_type {
         KDF_TYPE_PBKDF2 => {
+            log::debug!("[KDF] Hashing with PBKDF2, {} iterations", iterations);
             hash_password_pbkdf2(password, salt, iterations).await
         }
         KDF_TYPE_ARGON2ID => {
             let memory = memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
             let parallelism = parallelism.ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
+            log::debug!("[KDF] Hashing with Argon2id, iterations={}, memory={}MB, parallelism={}", iterations, memory, parallelism);
             hash_password_argon2id(password, salt, iterations, memory, parallelism)
         }
-        _ => Err(format!("Invalid KDF type: {}", kdf_type)),
+        _ => {
+            log::error!("[KDF] Invalid KDF type: {}", kdf_type);
+            Err(format!("Invalid KDF type: {}", kdf_type))
+        }
     }
 }
 
@@ -235,16 +250,30 @@ pub async fn verify_password(
     memory: Option<i32>,
     parallelism: Option<i32>,
 ) -> bool {
+    let kdf_name = match kdf_type {
+        KDF_TYPE_PBKDF2 => "PBKDF2",
+        KDF_TYPE_ARGON2ID => "Argon2id",
+        _ => "Unknown",
+    };
+    log::info!(
+        "[KDF] verify_password: type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
+        kdf_type, kdf_name, iterations, memory, parallelism
+    );
+    
     match kdf_type {
         KDF_TYPE_PBKDF2 => {
+            log::debug!("[KDF] Using PBKDF2 verification with {} iterations", iterations);
             verify_password_pbkdf2(password, salt, hash, iterations).await
         }
         KDF_TYPE_ARGON2ID => {
-            // Argon2id 使用 PHC 格式，不需要单独传 salt 和参数
-            let _ = (salt, memory, parallelism); // 避免未使用变量警告
+            log::debug!("[KDF] Using Argon2id verification (PHC format)");
+            let _ = (salt, memory, parallelism);
             verify_password_argon2id(password, hash)
         }
-        _ => false,
+        _ => {
+            log::warn!("[KDF] Unknown KDF type: {}", kdf_type);
+            false
+        }
     }
 }
 
