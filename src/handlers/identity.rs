@@ -1246,29 +1246,79 @@ pub async fn token(
                 .ok_or_else(|| AppError::BadRequest("Missing refresh_token".to_string()))?;
 
             let jwt_keys = state.jwt_keys.clone();
-            let token_data = decode::<Claims>(
+            let token_data = match decode::<Claims>(
                 &refresh_token,
                 &DecodingKey::from_secret(jwt_keys.refresh_secret.as_ref()),
                 &Validation::default(),
-            )
-            .map_err(|_| AppError::Unauthorized("Invalid refresh token".to_string()))?;
+            ) {
+                Ok(data) => data,
+                Err(_) => {
+                    // Return OAuth2 error format for Bitwarden client compatibility
+                    return Ok((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": "Invalid refresh token"
+                        })),
+                    ).into_response());
+                }
+            };
 
             let user_id = token_data.claims.sub;
-            let user: Value = db
+            let user: Value = match db
                 .prepare("SELECT * FROM users WHERE id = ?1")
                 .bind(&[user_id.into()])?
                 .first(None)
                 .await
-                .map_err(|_| AppError::Unauthorized("Invalid user".to_string()))?
-                .ok_or_else(|| AppError::Unauthorized("Invalid user".to_string()))?;
-            let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
+            {
+                Ok(Some(v)) => v,
+                _ => {
+                    // Return OAuth2 error format for Bitwarden client compatibility
+                    return Ok((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": "Invalid user"
+                        })),
+                    ).into_response());
+                }
+            };
+            let user: User = match serde_json::from_value(user) {
+                Ok(u) => u,
+                Err(_) => {
+                    return Ok((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": "Invalid user"
+                        })),
+                    ).into_response());
+                }
+            };
 
-            let stamp = token_data
-                .claims
-                .security_stamp
-                .ok_or_else(|| AppError::Unauthorized("Missing security stamp".to_string()))?;
+            let stamp = match token_data.claims.security_stamp {
+                Some(s) => s,
+                None => {
+                    return Ok((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": "Missing security stamp"
+                        })),
+                    ).into_response());
+                }
+            };
+
             if stamp != user.security_stamp {
-                return Err(AppError::Unauthorized("Invalid security stamp".to_string()));
+                // Return OAuth2 error format for Bitwarden client compatibility
+                // This triggers the client to logout when the security stamp has changed
+                return Ok((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "Invalid security stamp"
+                    })),
+                ).into_response());
             }
 
             let response = generate_tokens_and_response(user.clone(), &state, payload.device_identifier.clone(), None).await?;
