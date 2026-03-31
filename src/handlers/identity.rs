@@ -1253,9 +1253,8 @@ pub async fn token(
             ) {
                 Ok(data) => data,
                 Err(_) => {
-                    // Return OAuth2 error format for Bitwarden client compatibility
                     return Ok((
-                        StatusCode::UNAUTHORIZED,
+                        StatusCode::BAD_REQUEST,
                         Json(json!({
                             "error": "invalid_grant",
                             "error_description": "Invalid refresh token"
@@ -1273,9 +1272,8 @@ pub async fn token(
             {
                 Ok(Some(v)) => v,
                 _ => {
-                    // Return OAuth2 error format for Bitwarden client compatibility
                     return Ok((
-                        StatusCode::UNAUTHORIZED,
+                        StatusCode::BAD_REQUEST,
                         Json(json!({
                             "error": "invalid_grant",
                             "error_description": "Invalid user"
@@ -1287,7 +1285,7 @@ pub async fn token(
                 Ok(u) => u,
                 Err(_) => {
                     return Ok((
-                        StatusCode::UNAUTHORIZED,
+                        StatusCode::BAD_REQUEST,
                         Json(json!({
                             "error": "invalid_grant",
                             "error_description": "Invalid user"
@@ -1300,7 +1298,7 @@ pub async fn token(
                 Some(s) => s,
                 None => {
                     return Ok((
-                        StatusCode::UNAUTHORIZED,
+                        StatusCode::BAD_REQUEST,
                         Json(json!({
                             "error": "invalid_grant",
                             "error_description": "Missing security stamp"
@@ -1310,10 +1308,8 @@ pub async fn token(
             };
 
             if stamp != user.security_stamp {
-                // Return OAuth2 error format for Bitwarden client compatibility
-                // This triggers the client to logout when the security stamp has changed
                 return Ok((
-                    StatusCode::UNAUTHORIZED,
+                    StatusCode::BAD_REQUEST,
                     Json(json!({
                         "error": "invalid_grant",
                         "error_description": "Invalid security stamp"
