@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
+use url::Url;
 use uuid::Uuid;
 use worker::wasm_bindgen::JsValue;
 use worker::D1Database;
@@ -628,6 +629,25 @@ pub async fn disable_webauthn(db: &D1Database, user_id: &str) -> Result<(), AppE
         .await
         .map_err(|_| AppError::Database)?;
     Ok(())
+}
+
+pub fn is_webauthn_2fa_supported(headers: &HeaderMap) -> bool {
+    let rp_id = rp_id_from_headers(headers);
+    let origin = origin_from_headers(headers);
+    
+    if rp_id.is_empty() || origin.is_empty() {
+        return false;
+    }
+    
+    if rp_id == "localhost" || rp_id == "127.0.0.1" || rp_id == "::1" {
+        return true;
+    }
+    
+    if let Ok(url) = Url::parse(&origin) {
+        url.domain().is_some()
+    } else {
+        false
+    }
 }
 
 pub fn rp_id_from_headers(headers: &HeaderMap) -> String {

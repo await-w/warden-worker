@@ -520,19 +520,21 @@ async fn two_factor_required_response(
                 providers2.insert(p.to_string(), Value::Null);
             }
         } else if p == two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN {
-            let rp_id = webauthn::rp_id_from_headers(headers);
-            let origin = webauthn::origin_from_headers(headers);
-            if let Ok(Some(challenge)) = webauthn::issue_login_challenge(
-                db,
-                user_id,
-                &rp_id,
-                &origin,
-                webauthn::WEBAUTHN_USE_2FA,
-            )
-            .await
-            {
-                response_providers.push(p.to_string());
-                providers2.insert(p.to_string(), challenge);
+            if webauthn::is_webauthn_2fa_supported(headers) {
+                let rp_id = webauthn::rp_id_from_headers(headers);
+                let origin = webauthn::origin_from_headers(headers);
+                if let Ok(Some(challenge)) = webauthn::issue_login_challenge(
+                    db,
+                    user_id,
+                    &rp_id,
+                    &origin,
+                    webauthn::WEBAUTHN_USE_2FA,
+                )
+                .await
+                {
+                    response_providers.push(p.to_string());
+                    providers2.insert(p.to_string(), challenge);
+                }
             }
         } else {
             response_providers.push(p.to_string());
@@ -574,19 +576,21 @@ async fn invalid_two_factor_response(
                 providers2.insert(p.to_string(), Value::Null);
             }
         } else if p == two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN {
-            let rp_id = webauthn::rp_id_from_headers(headers);
-            let origin = webauthn::origin_from_headers(headers);
-            if let Ok(Some(challenge)) = webauthn::issue_login_challenge(
-                db,
-                user_id,
-                &rp_id,
-                &origin,
-                webauthn::WEBAUTHN_USE_2FA,
-            )
-            .await
-            {
-                response_providers.push(p.to_string());
-                providers2.insert(p.to_string(), challenge);
+            if webauthn::is_webauthn_2fa_supported(headers) {
+                let rp_id = webauthn::rp_id_from_headers(headers);
+                let origin = webauthn::origin_from_headers(headers);
+                if let Ok(Some(challenge)) = webauthn::issue_login_challenge(
+                    db,
+                    user_id,
+                    &rp_id,
+                    &origin,
+                    webauthn::WEBAUTHN_USE_2FA,
+                )
+                .await
+                {
+                    response_providers.push(p.to_string());
+                    providers2.insert(p.to_string(), challenge);
+                }
             }
         } else {
             response_providers.push(p.to_string());

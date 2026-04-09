@@ -1,11 +1,25 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }))
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportCipher {
     #[serde(rename = "type")]
     pub r#type: i32,
+    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     pub organization_id: Option<String>,
     pub name: String,

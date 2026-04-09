@@ -2125,6 +2125,7 @@ dependencies = [
  "totp-rs",
  "tower-http",
  "tower-service",
+ "url",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

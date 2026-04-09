@@ -66,6 +66,21 @@ where
     deserializer.deserialize_any(BoolOrIntVisitor)
 }
 
+// Custom deserialization function for optional non-empty strings
+// Converts empty strings to None to handle newer Bitwarden clients
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }))
+}
+
 // The struct that is stored in the database and used in handlers.
 // For serialization to JSON for the client, we implement a custom `Serialize`.
 #[derive(Debug, Deserialize, Clone)]
@@ -81,7 +96,7 @@ pub struct Cipher {
     pub data: Value,
     #[serde(deserialize_with = "deserialize_bool_from_int")]
     pub favorite: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
@@ -326,7 +341,7 @@ mod tests {
 pub struct CipherRequestData {
     #[serde(rename = "type")]
     pub r#type: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
