@@ -500,6 +500,17 @@ fn obscure_email(email: &str) -> String {
     format!("{}@{}", obscured_name, domain)
 }
 
+fn invalid_grant_response(error_description: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_grant",
+            "error_description": error_description,
+        })),
+    )
+        .into_response()
+}
+
 async fn two_factor_required_response(
     providers: &[i32],
     user_id: &str,
@@ -848,18 +859,25 @@ pub async fn token(
 
             let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user.id).await?;
             let email_2fa_enabled = two_factor::is_email_2fa_enabled(&db, &user.id).await?;
+            let email_2fa_usable = email_2fa_enabled && notify::is_email_webhook_configured(&state.env);
             let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &user.id).await?;
+            let webauthn_usable = webauthn_enabled && webauthn::is_webauthn_2fa_supported(&headers);
             let two_factor_enabled = authenticator_enabled || email_2fa_enabled || webauthn_enabled;
 
             let mut providers: Vec<i32> = Vec::new();
             if authenticator_enabled {
                 providers.push(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR);
             }
-            if email_2fa_enabled {
+            if email_2fa_usable {
                 providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
             }
-            if webauthn_enabled {
+            if webauthn_usable {
                 providers.push(two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN);
+            }
+            if two_factor_enabled && providers.is_empty() {
+                return Ok(invalid_grant_response(
+                    "No enabled and usable two factor providers are available for this account",
+                ));
             }
             // 注意：Recovery Code (type=8) 不在这里添加，因为它不是常规的2FA方式
             // 它只在登录验证时作为一种特殊的恢复选项处理
@@ -950,7 +968,7 @@ pub async fn token(
                             &state,
                         ).await?);
                     }
-                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) && email_2fa_enabled {
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) && email_2fa_usable {
                     let Some(token) = token.as_deref() else {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
@@ -1106,7 +1124,7 @@ pub async fn token(
                             ..Default::default()
                         },
                     );
-                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN) && webauthn_enabled {
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN) && webauthn_usable {
                     let Some(token) = token.as_deref() else {
                         let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
@@ -1244,10 +1262,12 @@ pub async fn token(
             Ok(resp)
         }
         "refresh_token" => {
-            let refresh_token = payload
+            let Some(refresh_token) = payload
                 .refresh_token
                 .or_else(|| get_cookie(&headers, "bw_refresh_token"))
-                .ok_or_else(|| AppError::BadRequest("Missing refresh_token".to_string()))?;
+            else {
+                return Ok(invalid_grant_response("Missing refresh_token"));
+            };
 
             let jwt_keys = state.jwt_keys.clone();
             let token_data = match decode::<Claims>(

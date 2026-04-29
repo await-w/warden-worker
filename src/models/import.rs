@@ -19,7 +19,7 @@ where
 pub struct ImportCipher {
     #[serde(rename = "type")]
     pub r#type: i32,
-    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     pub organization_id: Option<String>,
     pub name: String,
@@ -59,4 +59,33 @@ pub struct ImportRequest {
     pub folders: Vec<ImportFolder>,
     #[serde(default)]
     pub folder_relationships: Vec<FolderRelationship>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImportCipher;
+    use serde_json::json;
+
+    #[test]
+    fn import_cipher_allows_missing_folder_id() {
+        let body = json!({
+            "type": 1,
+            "organizationId": null,
+            "name": "n",
+            "notes": null,
+            "favorite": false,
+            "login": null,
+            "card": null,
+            "identity": null,
+            "secureNote": null,
+            "fields": null,
+            "passwordHistory": null,
+            "reprompt": null,
+            "lastKnownRevisionDate": null,
+            "encryptedFor": ""
+        });
+
+        let cipher: ImportCipher = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(cipher.folder_id, None);
+    }
 }

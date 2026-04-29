@@ -49,7 +49,9 @@ pub fn api_router_with_keys(
         .route("/api/send-verify", post(sends::post_send_verify))
         // Identity/Auth routes
         .route("/identity/accounts/prelogin", post(accounts::prelogin))
+        .route("/identity/accounts/prelogin/password", post(accounts::prelogin))
         .route("/api/accounts/prelogin", post(accounts::prelogin))
+        .route("/api/accounts/prelogin/password", post(accounts::prelogin))
         .route(
             "/identity/accounts/register/finish",
             post(accounts::register),

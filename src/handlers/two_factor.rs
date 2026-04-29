@@ -158,6 +158,7 @@ pub struct DisableAuthenticatorData {
 pub async fn two_factor_status(
     claims: Claims,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
@@ -171,11 +172,13 @@ pub async fn two_factor_status(
     
     let email_enabled = two_factor::is_email_2fa_enabled(&db, &claims.sub).await?;
     if email_enabled {
-        providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
+        if notify::is_email_webhook_configured(&state.env) {
+            providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
+        }
     }
 
     let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &claims.sub).await?;
-    if webauthn_enabled {
+    if webauthn_enabled && webauthn::is_webauthn_2fa_supported(&headers) {
         providers.push(webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN);
     }
     

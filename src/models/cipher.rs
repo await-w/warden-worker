@@ -96,7 +96,7 @@ pub struct Cipher {
     pub data: Value,
     #[serde(deserialize_with = "deserialize_bool_from_int")]
     pub favorite: bool,
-    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
@@ -333,6 +333,17 @@ mod tests {
         assert_eq!(req.cipher.name, "n");
         assert_eq!(req.collection_ids, vec!["c1".to_string()]);
     }
+
+    #[test]
+    fn create_cipher_request_treats_empty_folder_id_as_none() {
+        let body = json!({
+            "cipher": { "type": 1, "name": "n", "folderId": "" },
+            "collectionIds": []
+        });
+
+        let req: CreateCipherRequest = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(req.cipher.folder_id, None);
+    }
 }
 
 // Represents the "Cipher" object within the incoming request payload.
@@ -341,7 +352,7 @@ mod tests {
 pub struct CipherRequestData {
     #[serde(rename = "type")]
     pub r#type: i32,
-    #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,

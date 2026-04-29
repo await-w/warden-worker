@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 pub const SEND_TYPE_TEXT: i32 = 0;
 pub const SEND_TYPE_FILE: i32 = 1;
+const SEND_AUTH_TYPE_PASSWORD: i32 = 1;
+const SEND_AUTH_TYPE_NONE: i32 = 2;
 
 fn deserialize_trimmed_i32_opt<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
 where
@@ -218,6 +220,11 @@ pub fn send_to_json(send: &SendDBModel) -> Value {
         "key": send.key,
         "maxAccessCount": send.max_access_count,
         "accessCount": send.access_count,
+        "authType": if send.password_hash.is_some() {
+            SEND_AUTH_TYPE_PASSWORD
+        } else {
+            SEND_AUTH_TYPE_NONE
+        },
         "disabled": send.disabled,
         "hideEmail": send.hide_email,
         "revisionDate": send.updated_at,
@@ -256,4 +263,51 @@ pub fn send_to_json_access(send: &SendDBModel, creator_identifier: Option<String
         "creatorIdentifier": creator_identifier,
         "object": "send-access",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{send_to_json, SendDBModel, SEND_AUTH_TYPE_NONE, SEND_AUTH_TYPE_PASSWORD};
+
+    fn base_send(password_hash: Option<String>) -> SendDBModel {
+        SendDBModel {
+            id: "00000000-0000-0000-0000-000000000001".to_string(),
+            user_id: "user-1".to_string(),
+            organization_id: None,
+            r#type: super::SEND_TYPE_TEXT,
+            name: "send".to_string(),
+            notes: None,
+            data: "{}".to_string(),
+            key: "key".to_string(),
+            password_hash,
+            password_salt: None,
+            password_iter: None,
+            max_access_count: None,
+            access_count: 0,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            expiration_date: None,
+            deletion_date: "2026-01-02T00:00:00.000Z".to_string(),
+            disabled: false,
+            hide_email: None,
+        }
+    }
+
+    #[test]
+    fn send_to_json_marks_password_auth_type() {
+        let value = send_to_json(&base_send(Some("cGFzcw==".to_string())));
+        assert_eq!(
+            value.get("authType").and_then(|v| v.as_i64()),
+            Some(SEND_AUTH_TYPE_PASSWORD as i64)
+        );
+    }
+
+    #[test]
+    fn send_to_json_marks_no_auth_type() {
+        let value = send_to_json(&base_send(None));
+        assert_eq!(
+            value.get("authType").and_then(|v| v.as_i64()),
+            Some(SEND_AUTH_TYPE_NONE as i64)
+        );
+    }
 }

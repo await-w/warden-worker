@@ -66,6 +66,16 @@ fn infer_device_type(headers: &HeaderMap) -> Option<i64> {
     header_i64(headers, "device-type").or_else(|| header_i64(headers, "Device-Type"))
 }
 
+fn decode_request_email_header(email_b64: &str) -> Result<String, AppError> {
+    let email_b64 = email_b64.trim_end_matches('=');
+    let email_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(email_b64.as_bytes())
+        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as base64url".to_string()))?;
+    Ok(String::from_utf8(email_bytes)
+        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as UTF-8".to_string()))?
+        .to_lowercase())
+}
+
 fn js_opt_string(v: Option<String>) -> JsValue {
     match v {
         Some(v) => JsValue::from_str(&v),
@@ -99,12 +109,7 @@ pub async fn knowndevice(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::BadRequest("X-Device-Identifier value is required".to_string()))?;
 
-    let email_bytes = general_purpose::URL_SAFE_NO_PAD
-        .decode(email_b64.as_bytes())
-        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as base64url".to_string()))?;
-    let email = String::from_utf8(email_bytes)
-        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as UTF-8".to_string()))?
-        .to_lowercase();
+    let email = decode_request_email_header(email_b64)?;
 
     let user_id: Option<String> = db
         .prepare("SELECT id FROM users WHERE email = ?1")
@@ -562,6 +567,7 @@ fn device_type_to_string(device_type: i32) -> &'static str {
         23 => "Windows CLI",
         24 => "macOS CLI",
         25 => "Linux CLI",
+        26 => "DuckDuckGo",
         _ => "Unknown Browser",
     }
 }
@@ -1075,4 +1081,23 @@ pub async fn get_auth_requests_pending(
         "continuationToken": Value::Null,
         "object": "list"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_request_email_header, device_type_to_string};
+    use base64::{engine::general_purpose, Engine as _};
+
+    #[test]
+    fn decode_request_email_header_accepts_padded_base64url() {
+        let encoded = general_purpose::URL_SAFE.encode("User@Example.COM");
+        let decoded = decode_request_email_header(&encoded).expect("decode request email");
+
+        assert_eq!(decoded, "user@example.com");
+    }
+
+    #[test]
+    fn device_type_to_string_supports_duckduckgo_browser() {
+        assert_eq!(device_type_to_string(26), "DuckDuckGo");
+    }
 }
