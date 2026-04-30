@@ -4,6 +4,9 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 
 本项目不接触你的明文密码：Bitwarden系列客户端会在本地完成加密，服务端只保存密文数据。
 
+# 特别注意
+请Fork本项目到你的GitHub账号，不要拉取本项目的代码到本地后创建新的仓库，否则部署脚本会缺失权限从而失败。
+
 ## 功能
 
 - 无服务器部署：Cloudflare Workers + D1 Sql + R2 存储桶
