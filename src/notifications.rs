@@ -1,9 +1,9 @@
 use constant_time_eq::constant_time_eq;
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use worker::{
-    durable_object, wasm_bindgen::JsValue, DurableObject, Env, Error, Headers, Method, Request,
-    RequestInit, Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    DurableObject, Env, Error, Headers, Method, Request, RequestInit, Response, Result, State,
+    WebSocket, WebSocketIncomingMessage, WebSocketPair, durable_object, wasm_bindgen::JsValue,
 };
 
 use crate::auth::Claims;
@@ -130,9 +130,11 @@ impl DurableObject for NotificationsHub {
 
 impl NotificationsHub {
     async fn get_jwt_secret(&self) -> std::result::Result<String, Error> {
-        let db = self.env.d1("vaultsql")
+        let db = self
+            .env
+            .d1("vaultsql")
             .map_err(|e| Error::RustError(format!("Failed to get database: {}", e)))?;
-        
+
         let result: Option<serde_json::Value> = db
             .prepare("SELECT access_secret FROM jwt_keys WHERE id = ?1")
             .bind(&["global".into()])
@@ -140,9 +142,12 @@ impl NotificationsHub {
             .first(None)
             .await
             .map_err(|e| Error::RustError(format!("Failed to query database: {}", e)))?;
-        
+
         result
-            .and_then(|row| row.get("access_secret").and_then(|v| v.as_str().map(String::from)))
+            .and_then(|row| {
+                row.get("access_secret")
+                    .and_then(|v| v.as_str().map(String::from))
+            })
             .ok_or_else(|| Error::RustError("JWT keys not found".to_string()))
     }
 
@@ -150,9 +155,11 @@ impl NotificationsHub {
         let access_token = extract_access_token(req)
             .ok_or_else(|| Error::RustError("Missing access token".to_string()))?;
 
-        let jwt_secret = self.get_jwt_secret().await
+        let jwt_secret = self
+            .get_jwt_secret()
+            .await
             .map_err(|e| Error::RustError(format!("Failed to get JWT secret: {}", e)))?;
-        
+
         let decoding_key = DecodingKey::from_secret(jwt_secret.as_ref());
         let token_data = decode::<Claims>(&access_token, &decoding_key, &Validation::default())
             .map_err(|_| Error::RustError("Invalid token".to_string()))?;
@@ -308,12 +315,17 @@ async fn dispatch_internal(env: &Env, path: &str, payload: &impl Serialize) -> R
     Ok(())
 }
 
-async fn build_internal_request(env: &Env, path: &str, payload: &impl Serialize) -> Result<Request> {
+async fn build_internal_request(
+    env: &Env,
+    path: &str,
+    payload: &impl Serialize,
+) -> Result<Request> {
     let payload_json = serde_json::to_string(payload)?;
 
-    let db = env.d1("vaultsql")
+    let db = env
+        .d1("vaultsql")
         .map_err(|e| Error::RustError(format!("Failed to get database: {}", e)))?;
-    
+
     let result: Option<serde_json::Value> = db
         .prepare("SELECT access_secret FROM jwt_keys WHERE id = ?1")
         .bind(&["global".into()])
@@ -321,9 +333,12 @@ async fn build_internal_request(env: &Env, path: &str, payload: &impl Serialize)
         .first(None)
         .await
         .map_err(|e| Error::RustError(format!("Failed to query database: {}", e)))?;
-    
+
     let jwt_secret = result
-        .and_then(|row| row.get("access_secret").and_then(|v| v.as_str().map(String::from)))
+        .and_then(|row| {
+            row.get("access_secret")
+                .and_then(|v| v.as_str().map(String::from))
+        })
         .ok_or_else(|| Error::RustError("JWT keys not found".to_string()))?;
 
     let headers = Headers::new();

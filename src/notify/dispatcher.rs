@@ -72,7 +72,11 @@ impl Dispatcher {
         true
     }
 
-    pub async fn dispatch(&self, env: &worker::Env, mut notification: Notification) -> Result<(), worker::Error> {
+    pub async fn dispatch(
+        &self,
+        env: &worker::Env,
+        mut notification: Notification,
+    ) -> Result<(), worker::Error> {
         if !self.should_dispatch(&notification) {
             log::debug!(
                 target: targets::NOTIFY,
@@ -122,7 +126,9 @@ impl Dispatcher {
         }
 
         if !has_success && !self.channels.is_empty() {
-            return Err(worker::Error::RustError("All notification channels failed".to_string()));
+            return Err(worker::Error::RustError(
+                "All notification channels failed".to_string(),
+            ));
         }
 
         Ok(())

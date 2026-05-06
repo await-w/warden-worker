@@ -1,16 +1,16 @@
 use axum::{
+    Json,
     extract::{Multipart, Path, Query, State},
     http::HeaderMap,
     http::StatusCode,
     response::Response,
-    Json,
 };
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use constant_time_eq::constant_time_eq;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -21,12 +21,12 @@ use crate::{
     db,
     error::AppError,
     logging::targets,
+    models::send::{
+        SEND_TYPE_FILE, SEND_TYPE_TEXT, SendAccessData, SendDBModel, SendData, SendFileDBModel,
+        send_to_json, send_to_json_access, uuid_from_access_id,
+    },
     notify::{self, NotifyContext, NotifyEvent},
     router::AppState,
-    models::send::{
-        send_to_json, send_to_json_access, uuid_from_access_id, SendAccessData, SendDBModel,
-        SendData, SendFileDBModel, SEND_TYPE_FILE, SEND_TYPE_TEXT,
-    },
 };
 
 const SEND_FILES_BUCKET_BINDING: &str = "SEND_FILES_BUCKET";
@@ -49,12 +49,12 @@ const R2_MAX_BYTES: i64 = 10 * 1024 * 1024 * 1024;
 const STORAGE_MIN_FREE_RATIO: f64 = 0.20;
 
 fn now_rfc3339_millis() -> String {
-    Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn parse_rfc3339(s: &str) -> Result<DateTime<Utc>, AppError> {
-    let dt = DateTime::parse_from_rfc3339(s).map_err(|_| AppError::BadRequest("Invalid date".to_string()))?;
+    let dt = DateTime::parse_from_rfc3339(s)
+        .map_err(|_| AppError::BadRequest("Invalid date".to_string()))?;
     Ok(dt.with_timezone(&Utc))
 }
 
@@ -109,11 +109,15 @@ async fn verify_turnstile_token(
         "response": token
     });
     if let Some(ip) = client_ip {
-        body.as_object_mut().unwrap().insert("remoteip".to_string(), Value::String(ip.to_string()));
+        body.as_object_mut()
+            .unwrap()
+            .insert("remoteip".to_string(), Value::String(ip.to_string()));
     }
 
     let headers = worker::Headers::new();
-    headers.set("Content-Type", "application/json").map_err(|_| AppError::Internal)?;
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|_| AppError::Internal)?;
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Post)
         .with_headers(headers)
@@ -134,7 +138,9 @@ async fn verify_turnstile_token(
     } else {
         let codes = result.get("error-codes").cloned().unwrap_or(json!([]));
         log::warn!(target: targets::AUTH, "turnstile.verify.fail codes={}", codes);
-        Err(AppError::Unauthorized("Turnstile verification failed".to_string()))
+        Err(AppError::Unauthorized(
+            "Turnstile verification failed".to_string(),
+        ))
     }
 }
 
@@ -149,14 +155,17 @@ struct SendAccessPassClaims {
 }
 
 /// Create a signed JWT cookie value valid for `SEND_ACCESS_COOKIE_TTL_MINUTES`.
-fn generate_send_access_cookie(state: &Arc<AppState>) -> impl std::future::Future<Output = Result<String, AppError>> {
+fn generate_send_access_cookie(
+    state: &Arc<AppState>,
+) -> impl std::future::Future<Output = Result<String, AppError>> {
     async move {
         let jwt_keys = state.jwt_keys.clone();
         let now = Utc::now();
         let claims = SendAccessPassClaims {
             aud: "send_access".to_string(),
             iat: now.timestamp() as usize,
-            exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp() as usize,
+            exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp()
+                as usize,
         };
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
@@ -168,7 +177,10 @@ fn generate_send_access_cookie(state: &Arc<AppState>) -> impl std::future::Futur
 }
 
 /// Validate the signed cookie; returns `Ok(())` if valid.
-fn validate_send_access_cookie(state: &Arc<AppState>, token: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
+fn validate_send_access_cookie(
+    state: &Arc<AppState>,
+    token: &str,
+) -> impl std::future::Future<Output = Result<(), AppError>> {
     async move {
         let jwt_keys = state.jwt_keys.clone();
         let mut validation = jsonwebtoken::Validation::default();
@@ -208,7 +220,10 @@ fn extract_send_access_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// Enforce Turnstile cookie on send-access endpoints.
 /// Returns `Ok(())` if Turnstile is disabled or the cookie is valid.
-async fn require_send_access_pass(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), AppError> {
+async fn require_send_access_pass(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
     if !turnstile_enabled(state) {
         return Ok(());
     }
@@ -237,20 +252,17 @@ fn send_access_flag_cookie_header() -> String {
 
 /// `GET /send-verify` – serves the Turnstile challenge page with the site key injected.
 #[worker::send]
-pub async fn send_verify_page(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response, AppError> {
+pub async fn send_verify_page(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
     let site_key = state
         .env
         .var("TURNSTILE_SITE_KEY")
         .map(|v| v.to_string())
         .unwrap_or_default();
 
-    let html = include_str!("../../static/send-verify.html")
-        .replace(
-            "|| window.__TURNSTILE_SITE_KEY__",
-            &format!("|| '{}'", site_key),
-        );
+    let html = include_str!("../../static/send-verify.html").replace(
+        "|| window.__TURNSTILE_SITE_KEY__",
+        &format!("|| '{}'", site_key),
+    );
 
     let mut response = Response::new(axum::body::Body::from(html));
     *response.status_mut() = StatusCode::OK;
@@ -267,7 +279,7 @@ pub async fn send_verify_page(
              frame-src https://challenges.cloudflare.com; \
              style-src 'self' 'unsafe-inline'; \
              connect-src 'self' https://challenges.cloudflare.com; \
-             img-src 'self' data:"
+             img-src 'self' data:",
         ),
     );
     Ok(response)
@@ -313,14 +325,17 @@ pub async fn post_send_verify(
 }
 
 /// Check that both D1 and R2 have at least 20% free space before allowing a file upload.
-async fn check_storage_quota(db: &worker::D1Database, incoming_file_size: i64) -> Result<(), AppError> {
+async fn check_storage_quota(
+    db: &worker::D1Database,
+    incoming_file_size: i64,
+) -> Result<(), AppError> {
     // --- D1 check ---
     let d1_used: Option<i64> = db
         .prepare(
             "SELECT COALESCE(SUM(LENGTH(data)),0) \
              + (SELECT COALESCE(SUM(LENGTH(data)),0) FROM sends) \
              + (SELECT COALESCE(SUM(LENGTH(name)),0) FROM folders) \
-             AS bytes FROM ciphers"
+             AS bytes FROM ciphers",
         )
         .bind(&[])?
         .first(Some("bytes"))
@@ -359,7 +374,10 @@ async fn check_storage_quota(db: &worker::D1Database, incoming_file_size: i64) -
     Ok(())
 }
 
-async fn enforce_send_access_rate_limit(state: &Arc<AppState>, key: String) -> Result<(), AppError> {
+async fn enforce_send_access_rate_limit(
+    state: &Arc<AppState>,
+    key: String,
+) -> Result<(), AppError> {
     let limiter = match state.env.rate_limiter(SEND_ACCESS_RATE_LIMITER_BINDING) {
         Ok(l) => l,
         Err(_) => return Ok(()), // Skip rate limiting if binding is not configured
@@ -370,7 +388,6 @@ async fn enforce_send_access_rate_limit(state: &Arc<AppState>, key: String) -> R
     }
     Ok(())
 }
-
 
 fn display_size(bytes: i64) -> String {
     if bytes < 1024 {
@@ -408,8 +425,14 @@ fn new_salt_b64() -> String {
 fn extract_send_payload_data(mut data: SendData) -> Result<(i32, String, Value), AppError> {
     let send_type = data.r#type;
     let mut payload = match send_type {
-        SEND_TYPE_TEXT => data.text.take().ok_or_else(|| AppError::BadRequest("Missing text".to_string()))?,
-        SEND_TYPE_FILE => data.file.take().ok_or_else(|| AppError::BadRequest("Missing file".to_string()))?,
+        SEND_TYPE_TEXT => data
+            .text
+            .take()
+            .ok_or_else(|| AppError::BadRequest("Missing text".to_string()))?,
+        SEND_TYPE_FILE => data
+            .file
+            .take()
+            .ok_or_else(|| AppError::BadRequest("Missing file".to_string()))?,
         _ => return Err(AppError::BadRequest("Invalid send type".to_string())),
     };
 
@@ -420,7 +443,10 @@ fn extract_send_payload_data(mut data: SendData) -> Result<(i32, String, Value),
     Ok((send_type, data.key, payload))
 }
 
-async fn get_send_by_id(db: &worker::D1Database, send_id: &str) -> Result<Option<SendDBModel>, AppError> {
+async fn get_send_by_id(
+    db: &worker::D1Database,
+    send_id: &str,
+) -> Result<Option<SendDBModel>, AppError> {
     let value: Option<Value> = db
         .prepare("SELECT * FROM sends WHERE id = ?1")
         .bind(&[send_id.into()])?
@@ -444,13 +470,13 @@ async fn get_send_by_id_and_user(
     Ok(value.and_then(|v| serde_json::from_value::<SendDBModel>(v).ok()))
 }
 
-async fn update_send_access_count(db: &worker::D1Database, send_id: &str, delta: i32) -> Result<(), AppError> {
+async fn update_send_access_count(
+    db: &worker::D1Database,
+    send_id: &str,
+    delta: i32,
+) -> Result<(), AppError> {
     db.prepare("UPDATE sends SET access_count = access_count + ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[
-            delta.into(),
-            now_rfc3339_millis().into(),
-            send_id.into(),
-        ])?
+        .bind(&[delta.into(), now_rfc3339_millis().into(), send_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
@@ -745,7 +771,9 @@ pub async fn post_send(
     claims.verify_security_stamp(&db).await?;
 
     if payload.r#type == SEND_TYPE_FILE {
-        return Err(AppError::BadRequest("File sends should use /api/sends/file/v2".to_string()));
+        return Err(AppError::BadRequest(
+            "File sends should use /api/sends/file/v2".to_string(),
+        ));
     }
 
     log::info!(
@@ -1070,7 +1098,9 @@ pub async fn post_send_file_v2(
     claims.verify_security_stamp(&db).await?;
 
     if payload.r#type != SEND_TYPE_FILE {
-        return Err(AppError::BadRequest("Send content is not a file".to_string()));
+        return Err(AppError::BadRequest(
+            "Send content is not a file".to_string(),
+        ));
     }
 
     log::info!(
@@ -1086,7 +1116,9 @@ pub async fn post_send_file_v2(
         .file_length
         .ok_or_else(|| AppError::BadRequest("Invalid send length".to_string()))?;
     if file_length < 0 {
-        return Err(AppError::BadRequest("Send size can't be negative".to_string()));
+        return Err(AppError::BadRequest(
+            "Send size can't be negative".to_string(),
+        ));
     }
 
     // Reject early if D1 or R2 is nearly full
@@ -1106,7 +1138,10 @@ pub async fn post_send_file_v2(
     if let Some(obj) = data_value.as_object_mut() {
         obj.insert("id".to_string(), Value::String(file_id.clone()));
         obj.insert("size".to_string(), Value::Number(file_length.into()));
-        obj.insert("sizeName".to_string(), Value::String(display_size(file_length)));
+        obj.insert(
+            "sizeName".to_string(),
+            Value::String(display_size(file_length)),
+        );
     }
 
     let send_id = Uuid::new_v4().to_string();
@@ -1213,9 +1248,13 @@ pub async fn post_send_file_v2_data(
     claims.verify_security_stamp(&db).await?;
     let send = get_send_by_id_and_user(&db, &send_id, &claims.sub)
         .await?
-        .ok_or_else(|| AppError::NotFound("Send not found. Unable to save the file.".to_string()))?;
+        .ok_or_else(|| {
+            AppError::NotFound("Send not found. Unable to save the file.".to_string())
+        })?;
     if send.r#type != SEND_TYPE_FILE {
-        return Err(AppError::BadRequest("Send content is not a file".to_string()));
+        return Err(AppError::BadRequest(
+            "Send content is not a file".to_string(),
+        ));
     }
 
     let file_row: Option<Value> = db
@@ -1224,13 +1263,17 @@ pub async fn post_send_file_v2_data(
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
-    let file_row = file_row.ok_or_else(|| AppError::NotFound("Send not found. Unable to save the file.".to_string()))?;
+    let file_row = file_row.ok_or_else(|| {
+        AppError::NotFound("Send not found. Unable to save the file.".to_string())
+    })?;
     let size = file_row
         .get("size")
         .and_then(|v| v.as_i64())
         .ok_or(AppError::Internal)?;
     if size < 0 {
-        return Err(AppError::BadRequest("Send size can't be negative".to_string()));
+        return Err(AppError::BadRequest(
+            "Send size can't be negative".to_string(),
+        ));
     }
     let object_key = file_row
         .get("r2_object_key")
@@ -1242,7 +1285,9 @@ pub async fn post_send_file_v2_data(
         .and_then(|v| v.as_str())
         .unwrap_or("d1_base64");
     if storage_type != "r2" {
-        return Err(AppError::BadRequest("Send storage backend mismatch".to_string()));
+        return Err(AppError::BadRequest(
+            "Send storage backend mismatch".to_string(),
+        ));
     }
 
     let now = now_rfc3339_millis();
@@ -1346,7 +1391,8 @@ pub async fn post_access(
     )
     .await?;
 
-    let send_id = uuid_from_access_id(&access_id).ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
+    let send_id = uuid_from_access_id(&access_id)
+        .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
     let send = get_send_by_id(&db, &send_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
@@ -1452,7 +1498,11 @@ struct SendDownloadClaims {
     exp: usize,
 }
 
-fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<String, AppError>> {
+fn generate_download_token(
+    state: &Arc<AppState>,
+    send_id: &str,
+    file_id: &str,
+) -> impl std::future::Future<Output = Result<String, AppError>> {
     async move {
         let jwt_keys = state.jwt_keys.clone();
         let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
@@ -1469,7 +1519,12 @@ fn generate_download_token(state: &Arc<AppState>, send_id: &str, file_id: &str) 
     }
 }
 
-fn validate_download_token(state: &Arc<AppState>, token: &str, send_id: &str, file_id: &str) -> impl std::future::Future<Output = Result<(), AppError>> {
+fn validate_download_token(
+    state: &Arc<AppState>,
+    token: &str,
+    send_id: &str,
+    file_id: &str,
+) -> impl std::future::Future<Output = Result<(), AppError>> {
     async move {
         let jwt_keys = state.jwt_keys.clone();
         let data = jsonwebtoken::decode::<SendDownloadClaims>(

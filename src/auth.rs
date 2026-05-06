@@ -2,11 +2,11 @@ use axum::{
     extract::FromRequestParts,
     http::{header, request::Parts},
 };
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::error::AppError;
 use crate::router::AppState;
@@ -28,11 +28,13 @@ pub struct Claims {
     pub device: Option<String>,
 }
 
-impl FromRequestParts<Arc<AppState>> for Claims
-{
+impl FromRequestParts<Arc<AppState>> for Claims {
     type Rejection = AppError;
 
-    fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send>> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send>> {
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -64,7 +66,9 @@ impl FromRequestParts<Arc<AppState>> for Claims
                     .map(|td| td.claims)
                     .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))
             }
-            None => Err(AppError::Unauthorized("Missing or invalid token".to_string())),
+            None => Err(AppError::Unauthorized(
+                "Missing or invalid token".to_string(),
+            )),
         };
 
         Box::pin(std::future::ready(result))

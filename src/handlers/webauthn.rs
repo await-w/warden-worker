@@ -1,16 +1,18 @@
 use axum::{
-    extract::{Path, State},
-    http::{header, HeaderMap},
     Json,
+    extract::{Path, State},
+    http::{HeaderMap, header},
 };
 use constant_time_eq::constant_time_eq;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::{auth::Claims, db, error::AppError, jwt, webauthn, router::AppState, notify, two_factor};
 use crate::logging::targets;
 use crate::notify::{NotifyContext, NotifyEvent, extract_request_meta};
+use crate::{
+    auth::Claims, db, error::AppError, jwt, notify, router::AppState, two_factor, webauthn,
+};
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -36,15 +38,29 @@ impl SecretVerificationData {
                     return Err(AppError::NotFound("User not found".to_string()));
                 };
 
-                let stored_hash = row.get("master_password_hash")
+                let stored_hash = row
+                    .get("master_password_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let password_salt = row.get("password_salt")
-                    .and_then(|v| v.as_str());
-                let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
-                let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
-                let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
-                let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let password_salt = row.get("password_salt").and_then(|v| v.as_str());
+                let kdf_type: i32 = row
+                    .get("kdf_type")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(0);
+                let kdf_iterations: i32 = row
+                    .get("kdf_iterations")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(600_000);
+                let kdf_memory: Option<i32> = row
+                    .get("kdf_memory")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                let kdf_parallelism: Option<i32> = row
+                    .get("kdf_parallelism")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
 
                 // 根据 KDF 类型验证密码
                 let password_valid = if let Some(salt) = password_salt {
@@ -68,7 +84,9 @@ impl SecretVerificationData {
                 }
                 Ok(())
             }
-            (None, Some(otp)) => two_factor::validate_protected_action_otp(db, user_id, otp, true).await,
+            (None, Some(otp)) => {
+                two_factor::validate_protected_action_otp(db, user_id, otp, true).await
+            }
             _ => Err(AppError::BadRequest("No validation provided".to_string())),
         }
     }
@@ -81,7 +99,13 @@ pub struct UpdateTwoFactorWebAuthnRequest {
     master_password_hash: Option<String>,
     otp: Option<String>,
     id: i32,
-    #[serde(alias = "Name", alias = "keyName", alias = "KeyName", alias = "deviceName", alias = "DeviceName")]
+    #[serde(
+        alias = "Name",
+        alias = "keyName",
+        alias = "KeyName",
+        alias = "deviceName",
+        alias = "DeviceName"
+    )]
     name: Option<String>,
     #[serde(rename = "deviceResponse")]
     device_response: WebAuthnDeviceResponse,
@@ -115,7 +139,13 @@ struct WebAuthnDeviceResponseInner {
 pub struct SaveWebAuthnCredentialRequest {
     #[serde(rename = "token")]
     _token: Option<String>,
-    #[serde(alias = "Name", alias = "keyName", alias = "KeyName", alias = "deviceName", alias = "DeviceName")]
+    #[serde(
+        alias = "Name",
+        alias = "keyName",
+        alias = "KeyName",
+        alias = "deviceName",
+        alias = "DeviceName"
+    )]
     name: Option<String>,
     #[serde(rename = "deviceResponse")]
     device_response: WebAuthnDeviceResponse,
@@ -526,7 +556,12 @@ pub async fn webauthn_save_credential(
         meta,
         is_new_ua: false,
     };
-    notify::notify_best_effort(&state.env, NotifyEvent::WebAuthnCredentialCreate, notify_ctx).await;
+    notify::notify_best_effort(
+        &state.env,
+        NotifyEvent::WebAuthnCredentialCreate,
+        notify_ctx,
+    )
+    .await;
 
     Ok(Json(json!({
         "success": true,
@@ -655,7 +690,12 @@ pub async fn webauthn_update_credential(
         meta,
         is_new_ua: false,
     };
-    notify::notify_best_effort(&state.env, NotifyEvent::WebAuthnCredentialUpdate, notify_ctx).await;
+    notify::notify_best_effort(
+        &state.env,
+        NotifyEvent::WebAuthnCredentialUpdate,
+        notify_ctx,
+    )
+    .await;
 
     Ok(Json(json!({ "success": true })))
 }
@@ -700,11 +740,19 @@ pub async fn webauthn_delete_credential(
         device_type: None,
         cipher_id: None,
         send_id: None,
-        detail: Some(format!("删除 Passkey 凭证: {}", credential_name.unwrap_or_else(|| format!("ID {}", id)))),
+        detail: Some(format!(
+            "删除 Passkey 凭证: {}",
+            credential_name.unwrap_or_else(|| format!("ID {}", id))
+        )),
         meta,
         is_new_ua: false,
     };
-    notify::notify_best_effort(&state.env, NotifyEvent::WebAuthnCredentialDelete, notify_ctx).await;
+    notify::notify_best_effort(
+        &state.env,
+        NotifyEvent::WebAuthnCredentialDelete,
+        notify_ctx,
+    )
+    .await;
 
     Ok(Json(json!({ "success": true })))
 }
@@ -789,11 +837,7 @@ pub async fn put_webauthn(
         &db,
         &claims.sub,
         slot_id,
-        payload
-            .name
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or(""),
+        payload.name.as_deref().map(str::trim).unwrap_or(""),
         &payload.device_response.response.attestation_object,
         &payload.device_response.response.client_data_json,
         webauthn::WEBAUTHN_USE_2FA,
@@ -834,8 +878,13 @@ pub async fn identity_assertion_options(
     let rp_id = webauthn::rp_id_from_headers(&headers);
     let origin = webauthn::origin_from_headers(&headers);
     let jwt_keys = state.jwt_keys.clone();
-    let payload =
-        webauthn::issue_passwordless_assertion_options(&db, &rp_id, &origin, &jwt_keys.access_secret).await?;
+    let payload = webauthn::issue_passwordless_assertion_options(
+        &db,
+        &rp_id,
+        &origin,
+        &jwt_keys.access_secret,
+    )
+    .await?;
     Ok(Json(payload))
 }
 

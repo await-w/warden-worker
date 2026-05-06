@@ -1,7 +1,7 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::{auth::Claims, db, domains, error::AppError, router::AppState};
@@ -52,7 +52,9 @@ async fn update_domains(
     let now = Utc::now().to_rfc3339();
 
     let equivalent_domains = payload.equivalent_domains.unwrap_or_default();
-    let excluded_globals = payload.excluded_global_equivalent_domains.unwrap_or_default();
+    let excluded_globals = payload
+        .excluded_global_equivalent_domains
+        .unwrap_or_default();
 
     domains::update_domains_settings(&db, &claims.sub, equivalent_domains, excluded_globals, &now)
         .await?;

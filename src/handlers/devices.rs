@@ -1,10 +1,15 @@
-use axum::{extract::State, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
 use axum::extract::{Path, Query};
-use base64::{engine::general_purpose, Engine as _};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -39,7 +44,10 @@ async fn ensure_devices_table(db: &worker::D1Database) -> Result<(), AppError> {
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
@@ -70,9 +78,13 @@ fn decode_request_email_header(email_b64: &str) -> Result<String, AppError> {
     let email_b64 = email_b64.trim_end_matches('=');
     let email_bytes = general_purpose::URL_SAFE_NO_PAD
         .decode(email_b64.as_bytes())
-        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as base64url".to_string()))?;
+        .map_err(|_| {
+            AppError::BadRequest("X-Request-Email value failed to decode as base64url".to_string())
+        })?;
     Ok(String::from_utf8(email_bytes)
-        .map_err(|_| AppError::BadRequest("X-Request-Email value failed to decode as UTF-8".to_string()))?
+        .map_err(|_| {
+            AppError::BadRequest("X-Request-Email value failed to decode as UTF-8".to_string())
+        })?
         .to_lowercase())
 }
 
@@ -123,7 +135,9 @@ pub async fn knowndevice(
     };
 
     let exists: Option<i64> = db
-        .prepare("SELECT 1 AS ok FROM devices WHERE user_id = ?1 AND device_identifier = ?2 LIMIT 1")
+        .prepare(
+            "SELECT 1 AS ok FROM devices WHERE user_id = ?1 AND device_identifier = ?2 LIMIT 1",
+        )
         .bind(&[user_id.into(), device_identifier.into()])?
         .first(Some("ok"))
         .await
@@ -251,7 +265,11 @@ pub async fn get_devices(
     let data = rows
         .into_iter()
         .map(|row| {
-            let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let identifier = row
                 .get("device_identifier")
                 .and_then(|v| v.as_str())
@@ -383,7 +401,11 @@ pub async fn get_device_by_identifier(
         .get("device_name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let row_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let row_id = row
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let row_created_at = row
         .get("created_at")
         .and_then(|v| v.as_str())
@@ -477,14 +499,17 @@ pub(crate) async fn ensure_auth_requests_table(db: &worker::D1Database) -> Resul
     Ok(())
 }
 
-pub(crate) async fn ensure_device_management_tables(db: &worker::D1Database) -> Result<(), AppError> {
+pub(crate) async fn ensure_device_management_tables(
+    db: &worker::D1Database,
+) -> Result<(), AppError> {
     ensure_devices_table(db).await?;
     ensure_auth_requests_table(db).await?;
     Ok(())
 }
 
 pub(crate) async fn purge_expired_auth_requests(db: &worker::D1Database) -> Result<(), AppError> {
-    let cutoff = (Utc::now() - Duration::minutes(15)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let cutoff =
+        (Utc::now() - Duration::minutes(15)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     db.prepare("DELETE FROM auth_requests WHERE creation_date < ?1")
         .bind(&[cutoff.into()])?
         .run()
@@ -716,10 +741,14 @@ pub async fn post_auth_request(
     let notify_request_id = request_id.clone();
     let env = state.env.clone();
     state.ctx.wait_until(async move {
-        if let Err(e) = crate::notifications::publish_auth_request(&env, &user_id, &notify_request_id).await {
+        if let Err(e) =
+            crate::notifications::publish_auth_request(&env, &user_id, &notify_request_id).await
+        {
             log::warn!("publish auth request realtime failed: {e}");
         }
-        if let Err(e) = crate::notify::publish_auth_request(&env, &user_id, &notify_request_id).await {
+        if let Err(e) =
+            crate::notify::publish_auth_request(&env, &user_id, &notify_request_id).await
+        {
             log::warn!("publish auth request notify failed: {e}");
         }
     });
@@ -1031,11 +1060,7 @@ pub async fn get_auth_request_response(
         return Ok(auth_request_not_exist_response());
     }
 
-    Ok(Json(auth_request_to_json(
-        &row,
-        &origin_from_headers(&headers),
-    ))
-    .into_response())
+    Ok(Json(auth_request_to_json(&row, &origin_from_headers(&headers))).into_response())
 }
 
 #[worker::send]
@@ -1086,7 +1111,7 @@ pub async fn get_auth_requests_pending(
 #[cfg(test)]
 mod tests {
     use super::{decode_request_email_header, device_type_to_string};
-    use base64::{engine::general_purpose, Engine as _};
+    use base64::{Engine as _, engine::general_purpose};
 
     #[test]
     fn decode_request_email_header_accepts_padded_base64url() {

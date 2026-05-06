@@ -1,5 +1,5 @@
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{json, Map, Value};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde_json::{Map, Value, json};
 
 // This struct represents the data stored in the `data` column of the `ciphers` table.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -72,13 +72,8 @@ fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Optio
 where
     D: Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?.and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }))
+    Ok(Option::<String>::deserialize(deserializer)?
+        .and_then(|s| if s.is_empty() { None } else { Some(s) }))
 }
 
 // The struct that is stored in the database and used in handlers.
@@ -100,6 +95,8 @@ pub struct Cipher {
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 
@@ -129,6 +126,8 @@ pub struct CipherDBModel {
     pub favorite: i32,
     pub folder_id: Option<String>,
     pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -147,6 +146,7 @@ impl Into<Cipher> for CipherDBModel {
             },
             folder_id: self.folder_id,
             deleted_at: self.deleted_at,
+            archived_at: self.archived_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
             object: default_object(),
@@ -188,6 +188,7 @@ impl Serialize for Cipher {
         response_map.insert("revisionDate".to_string(), json!(self.updated_at));
         response_map.insert("creationDate".to_string(), json!(self.created_at));
         response_map.insert("deletedDate".to_string(), json!(self.deleted_at));
+        response_map.insert("archivedDate".to_string(), json!(self.archived_at));
 
         if let Some(data_obj) = self.data.as_object() {
             let data_clone = data_obj.clone();
@@ -263,7 +264,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Cipher, CreateCipherRequest};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     #[test]
     fn cipher_serialization_includes_permissions_delete() {
@@ -280,6 +281,7 @@ mod tests {
             favorite: false,
             folder_id: None,
             deleted_at: None,
+            archived_at: None,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             updated_at: "2026-01-01T00:00:00.000Z".to_string(),
             object: "cipher".to_string(),
@@ -306,6 +308,7 @@ mod tests {
             Some(&Value::Bool(true)),
             "permissions.restore must exist and be true when edit=true"
         );
+        assert_eq!(value.get("archivedDate"), Some(&Value::Null));
     }
 
     #[test]
@@ -344,6 +347,24 @@ mod tests {
         let req: CreateCipherRequest = serde_json::from_value(body).expect("deserialize");
         assert_eq!(req.cipher.folder_id, None);
     }
+
+    #[test]
+    fn create_cipher_request_deserializes_archived_date() {
+        let body = json!({
+            "cipher": {
+                "type": 1,
+                "name": "n",
+                "archivedDate": "2026-05-06T00:00:00.000Z"
+            },
+            "collectionIds": []
+        });
+
+        let req: CreateCipherRequest = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(
+            req.cipher.archived_date,
+            Some("2026-05-06T00:00:00.000Z".to_string())
+        );
+    }
 }
 
 // Represents the "Cipher" object within the incoming request payload.
@@ -377,6 +398,9 @@ pub struct CipherRequestData {
     pub reprompt: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_known_revision_date: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_date: Option<String>,
 }
 
 // Represents the full request payload for creating a cipher.

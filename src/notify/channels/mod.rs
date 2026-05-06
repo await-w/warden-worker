@@ -1,14 +1,17 @@
+mod telegram;
 mod r#trait;
 mod wework;
-mod telegram;
 
+pub use telegram::TelegramChannel;
 pub use r#trait::{Channel, ChannelError};
 pub use wework::WeWorkChannel;
-pub use telegram::TelegramChannel;
 
 use crate::notify::types::{ChannelType, Notification};
 
-pub async fn dispatch_to_channels(notification: &Notification, env: &worker::Env) -> Result<(), ChannelError> {
+pub async fn dispatch_to_channels(
+    notification: &Notification,
+    env: &worker::Env,
+) -> Result<(), ChannelError> {
     let mut errors = Vec::new();
 
     if let Some(channel) = WeWorkChannel::from_env(env) {

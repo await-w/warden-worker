@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS two_factor_authenticator;
 DROP TABLE IF EXISTS webauthn_challenges;
 DROP TABLE IF EXISTS two_factor_webauthn_settings;
 DROP TABLE IF EXISTS two_factor_webauthn;
+DROP TABLE IF EXISTS archives;
 DROP TABLE IF EXISTS folders;
 DROP TABLE IF EXISTS ciphers;
 DROP TABLE IF EXISTS send_file_chunks;
@@ -65,6 +66,15 @@ CREATE TABLE IF NOT EXISTS ciphers (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS archives (
+    user_id TEXT NOT NULL,
+    cipher_id TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, cipher_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sends (
@@ -230,6 +240,8 @@ CREATE TABLE IF NOT EXISTS two_factor_keys (
 
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_id ON ciphers(user_id);
 CREATE INDEX IF NOT EXISTS idx_ciphers_folder_id ON ciphers(folder_id);
+CREATE INDEX IF NOT EXISTS idx_archives_user_id ON archives(user_id);
+CREATE INDEX IF NOT EXISTS idx_archives_cipher_id ON archives(cipher_id);
 CREATE INDEX IF NOT EXISTS idx_sends_user_id ON sends(user_id);
 CREATE INDEX IF NOT EXISTS idx_sends_deletion_date ON sends(deletion_date);
 CREATE INDEX IF NOT EXISTS idx_send_files_send_id ON send_files(send_id);

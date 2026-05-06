@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,7 @@ impl JwtKeyManager {
 
         Self::create_keys(db).await?;
 
-        let k = Self::get_keys(db).await
-            .map_err(|_| AppError::Database)?;
+        let k = Self::get_keys(db).await.map_err(|_| AppError::Database)?;
 
         Ok(JwtKeys {
             access_secret: k.access_secret,
@@ -55,7 +54,9 @@ impl JwtKeyManager {
         let stmt = db
             .prepare("SELECT id, access_secret, refresh_secret, created_at, updated_at FROM jwt_keys WHERE id = ?1");
 
-        let stmt = stmt.bind(&[JWT_KEYS_ID.into()]).map_err(|_| AppError::Database)?;
+        let stmt = stmt
+            .bind(&[JWT_KEYS_ID.into()])
+            .map_err(|_| AppError::Database)?;
 
         let result: Option<JwtKeysRow> = stmt.first(None).await.map_err(|_| AppError::Database)?;
 

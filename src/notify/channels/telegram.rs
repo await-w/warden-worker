@@ -1,5 +1,5 @@
 use serde_json::json;
-use worker::{wasm_bindgen::JsValue, Env, Fetch, Method, Request, RequestInit};
+use worker::{Env, Fetch, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 use crate::notify::types::{ChannelType, Notification};
 
@@ -36,10 +36,7 @@ impl TelegramChannel {
             });
         }
 
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let body = json!({
             "chat_id": self.chat_id,
@@ -51,8 +48,9 @@ impl TelegramChannel {
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
         init.with_body(Some(JsValue::from_str(&body)));
-        let mut request = Request::new_with_init(&url, &init)
-            .map_err(|e| ChannelError { message: e.to_string() })?;
+        let mut request = Request::new_with_init(&url, &init).map_err(|e| ChannelError {
+            message: e.to_string(),
+        })?;
 
         if let Ok(headers) = request.headers_mut() {
             let _ = headers.set("content-type", "application/json; charset=utf-8");
@@ -61,7 +59,9 @@ impl TelegramChannel {
         let r = Fetch::Request(request)
             .send()
             .await
-            .map_err(|e| ChannelError { message: e.to_string() })?;
+            .map_err(|e| ChannelError {
+                message: e.to_string(),
+            })?;
         let status = r.status_code();
 
         if (200..300).contains(&status) {

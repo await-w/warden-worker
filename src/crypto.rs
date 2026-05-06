@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use constant_time_eq::constant_time_eq;
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
@@ -23,20 +23,24 @@ async fn get_subtle_crypto() -> Result<web_sys::SubtleCrypto, String> {
     let crypto = crypto_val
         .dyn_into::<web_sys::Crypto>()
         .map_err(|_| "Failed to cast to Crypto".to_string())?;
-    
+
     Ok(crypto.subtle())
 }
 
 /// 使用 PBKDF2-HMAC-SHA256 哈希密码
-/// 
+///
 /// # 参数
 /// * `password` - 密码字符串
 /// * `salt` - Base64 编码的盐值
 /// * `iterations` - 迭代次数
-/// 
+///
 /// # 返回
 /// Base64 编码的哈希值
-pub async fn hash_password_pbkdf2(password: &str, salt: &str, iterations: i32) -> Result<String, String> {
+pub async fn hash_password_pbkdf2(
+    password: &str,
+    salt: &str,
+    iterations: i32,
+) -> Result<String, String> {
     let salt_bytes = general_purpose::STANDARD
         .decode(salt)
         .map_err(|e| format!("Invalid salt: {}", e))?;
@@ -44,7 +48,8 @@ pub async fn hash_password_pbkdf2(password: &str, salt: &str, iterations: i32) -
     let subtle = get_subtle_crypto().await?;
 
     // Encode password to bytes
-    let enc = web_sys::TextEncoder::new().map_err(|_| "Failed to create TextEncoder".to_string())?;
+    let enc =
+        web_sys::TextEncoder::new().map_err(|_| "Failed to create TextEncoder".to_string())?;
     let password_vec = enc.encode_with_input(password);
     let password_bytes = Uint8Array::from(&password_vec[..]);
 
@@ -52,13 +57,7 @@ pub async fn hash_password_pbkdf2(password: &str, salt: &str, iterations: i32) -
     let key_usages = Array::of1(&JsValue::from_str("deriveBits"));
 
     let key_promise = subtle
-        .import_key_with_str(
-            "raw",
-            &password_bytes,
-            "PBKDF2",
-            false,
-            &key_usages,
-        )
+        .import_key_with_str("raw", &password_bytes, "PBKDF2", false, &key_usages)
         .map_err(|e| format!("ImportKey failed: {:?}", e))?;
 
     let key_val = JsFuture::from(key_promise)
@@ -74,23 +73,25 @@ pub async fn hash_password_pbkdf2(password: &str, salt: &str, iterations: i32) -
         .map_err(|e| format!("Failed to set params name: {:?}", e))?;
     Reflect::set(&params, &"salt".into(), &Uint8Array::from(&salt_bytes[..]))
         .map_err(|e| format!("Failed to set params salt: {:?}", e))?;
-    Reflect::set(&params, &"iterations".into(), &JsValue::from(iterations as u32))
-        .map_err(|e| format!("Failed to set params iterations: {:?}", e))?;
+    Reflect::set(
+        &params,
+        &"iterations".into(),
+        &JsValue::from(iterations as u32),
+    )
+    .map_err(|e| format!("Failed to set params iterations: {:?}", e))?;
     Reflect::set(&params, &"hash".into(), &"SHA-256".into())
         .map_err(|e| format!("Failed to set params hash: {:?}", e))?;
 
     let derive_promise = subtle
         .derive_bits_with_object(
-            &params,
-            &key,
-            256, // 256 bits
+            &params, &key, 256, // 256 bits
         )
         .map_err(|e| format!("DeriveBits failed: {:?}", e))?;
 
     let derived_bits_val = JsFuture::from(derive_promise)
         .await
         .map_err(|e| format!("DeriveBits promise failed: {:?}", e))?;
-    
+
     let derived_array = Uint8Array::new(&derived_bits_val);
     let mut derived_vec = vec![0u8; derived_array.length() as usize];
     derived_array.copy_to(&mut derived_vec);
@@ -99,14 +100,14 @@ pub async fn hash_password_pbkdf2(password: &str, salt: &str, iterations: i32) -
 }
 
 /// 使用 Argon2id 哈希密码
-/// 
+///
 /// # 参数
 /// * `password` - 密码字符串
 /// * `salt` - Base64 编码的盐值
 /// * `iterations` - 迭代次数 (time cost)
 /// * `memory` - 内存使用量 (MB)
 /// * `parallelism` - 并行度
-/// 
+///
 /// # 返回
 /// Base64 编码的哈希值 (PHC 格式)
 pub fn hash_password_argon2id(
@@ -117,9 +118,8 @@ pub fn hash_password_argon2id(
     parallelism: i32,
 ) -> Result<String, String> {
     use argon2::{
+        Argon2, Params,
         password_hash::{PasswordHasher, SaltString},
-        Argon2,
-        Params,
     };
 
     // 解码 salt
@@ -153,7 +153,7 @@ pub fn hash_password_argon2id(
 }
 
 /// 根据 KDF 类型哈希密码
-/// 
+///
 /// # 参数
 /// * `password` - 密码字符串
 /// * `salt` - Base64 编码的盐值
@@ -161,7 +161,7 @@ pub fn hash_password_argon2id(
 /// * `iterations` - 迭代次数
 /// * `memory` - 内存使用量 (Argon2id 专用，MB)
 /// * `parallelism` - 并行度 (Argon2id 专用)
-/// 
+///
 /// # 返回
 /// Base64 编码的哈希值 (PBKDF2) 或 PHC 格式字符串 (Argon2id)
 pub async fn hash_password(
@@ -179,18 +179,29 @@ pub async fn hash_password(
     };
     log::info!(
         "[KDF] hash_password: type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
-        kdf_type, kdf_name, iterations, memory, parallelism
+        kdf_type,
+        kdf_name,
+        iterations,
+        memory,
+        parallelism
     );
-    
+
     match kdf_type {
         KDF_TYPE_PBKDF2 => {
             log::debug!("[KDF] Hashing with PBKDF2, {} iterations", iterations);
             hash_password_pbkdf2(password, salt, iterations).await
         }
         KDF_TYPE_ARGON2ID => {
-            let memory = memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
-            let parallelism = parallelism.ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
-            log::debug!("[KDF] Hashing with Argon2id, iterations={}, memory={}MB, parallelism={}", iterations, memory, parallelism);
+            let memory =
+                memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
+            let parallelism = parallelism
+                .ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
+            log::debug!(
+                "[KDF] Hashing with Argon2id, iterations={}, memory={}MB, parallelism={}",
+                iterations,
+                memory,
+                parallelism
+            );
             hash_password_argon2id(password, salt, iterations, memory, parallelism)
         }
         _ => {
@@ -201,7 +212,12 @@ pub async fn hash_password(
 }
 
 /// 验证 PBKDF2 密码
-pub async fn verify_password_pbkdf2(password: &str, salt: &str, hash: &str, iterations: i32) -> bool {
+pub async fn verify_password_pbkdf2(
+    password: &str,
+    salt: &str,
+    hash: &str,
+    iterations: i32,
+) -> bool {
     match hash_password_pbkdf2(password, salt, iterations).await {
         Ok(new_hash) => constant_time_eq(new_hash.as_bytes(), hash.as_bytes()),
         Err(_) => false,
@@ -210,7 +226,7 @@ pub async fn verify_password_pbkdf2(password: &str, salt: &str, hash: &str, iter
 
 /// 验证 Argon2id 密码 (PHC 格式)
 pub fn verify_password_argon2id(password: &str, hash: &str) -> bool {
-    use argon2::{password_hash::PasswordVerifier, Argon2};
+    use argon2::{Argon2, password_hash::PasswordVerifier};
 
     // 解析 PHC 格式哈希
     let parsed_hash = match argon2::password_hash::PasswordHash::new(hash) {
@@ -229,7 +245,7 @@ pub fn verify_password_argon2id(password: &str, hash: &str) -> bool {
 }
 
 /// 根据 KDF 类型验证密码
-/// 
+///
 /// # 参数
 /// * `password` - 密码字符串
 /// * `salt` - Base64 编码的盐值 (PBKDF2 需要)
@@ -238,7 +254,7 @@ pub fn verify_password_argon2id(password: &str, hash: &str) -> bool {
 /// * `iterations` - 迭代次数
 /// * `memory` - 内存使用量 (Argon2id 专用)
 /// * `parallelism` - 并行度 (Argon2id 专用)
-/// 
+///
 /// # 返回
 /// 密码是否匹配
 pub async fn verify_password(
@@ -257,12 +273,19 @@ pub async fn verify_password(
     };
     log::info!(
         "[KDF] verify_password: type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
-        kdf_type, kdf_name, iterations, memory, parallelism
+        kdf_type,
+        kdf_name,
+        iterations,
+        memory,
+        parallelism
     );
-    
+
     match kdf_type {
         KDF_TYPE_PBKDF2 => {
-            log::debug!("[KDF] Using PBKDF2 verification with {} iterations", iterations);
+            log::debug!(
+                "[KDF] Using PBKDF2 verification with {} iterations",
+                iterations
+            );
             verify_password_pbkdf2(password, salt, hash, iterations).await
         }
         KDF_TYPE_ARGON2ID => {
@@ -281,15 +304,18 @@ pub async fn verify_password(
 pub fn generate_salt() -> String {
     let mut salt = [0u8; 32];
     let global = js_sys::global();
-    
+
     if let Ok(crypto_val) = js_sys::Reflect::get(&global, &JsValue::from_str("crypto")) {
         if let Ok(crypto) = crypto_val.dyn_into::<web_sys::Crypto>() {
-             let array = Uint8Array::new_with_length(32);
-             if crypto.get_random_values_with_array_buffer_view(&array).is_ok() {
-                 let mut vec = vec![0u8; 32];
-                 array.copy_to(&mut vec);
-                 return general_purpose::STANDARD.encode(&vec);
-             }
+            let array = Uint8Array::new_with_length(32);
+            if crypto
+                .get_random_values_with_array_buffer_view(&array)
+                .is_ok()
+            {
+                let mut vec = vec![0u8; 32];
+                array.copy_to(&mut vec);
+                return general_purpose::STANDARD.encode(&vec);
+            }
         }
     }
 
@@ -318,8 +344,10 @@ pub fn validate_kdf_params(
             if iterations < 1 {
                 return Err("Argon2id iterations must be at least 1".to_string());
             }
-            let memory = memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
-            let parallelism = parallelism.ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
+            let memory =
+                memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
+            let parallelism = parallelism
+                .ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
 
             if !(15..=1024).contains(&memory) {
                 return Err("Argon2id memory must be between 15 MB and 1024 MB".to_string());
@@ -344,7 +372,10 @@ pub fn normalize_kdf_params(
         KDF_TYPE_PBKDF2 => (None, None),
         KDF_TYPE_ARGON2ID => {
             if iterations < 1 {
-                return (Some(ARGON2ID_MEMORY_DEFAULT_MB), Some(ARGON2ID_PARALLELISM_DEFAULT));
+                return (
+                    Some(ARGON2ID_MEMORY_DEFAULT_MB),
+                    Some(ARGON2ID_PARALLELISM_DEFAULT),
+                );
             }
             let mem = memory.unwrap_or(ARGON2ID_MEMORY_DEFAULT_MB);
             let par = parallelism.unwrap_or(ARGON2ID_PARALLELISM_DEFAULT);

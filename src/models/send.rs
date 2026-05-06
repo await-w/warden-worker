@@ -1,6 +1,6 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub const SEND_TYPE_TEXT: i32 = 0;
@@ -25,9 +25,7 @@ where
             if s.is_empty() {
                 return Ok(None);
             }
-            s.parse::<i32>()
-                .map(Some)
-                .map_err(serde::de::Error::custom)
+            s.parse::<i32>().map(Some).map_err(serde::de::Error::custom)
         }
         _ => Err(serde::de::Error::custom("Invalid value")),
     }
@@ -104,9 +102,7 @@ where
             if s.is_empty() {
                 return Ok(None);
             }
-            s.parse::<i64>()
-                .map(Some)
-                .map_err(serde::de::Error::custom)
+            s.parse::<i64>().map(Some).map_err(serde::de::Error::custom)
         }
         _ => Err(serde::de::Error::custom("Invalid value")),
     }
@@ -192,7 +188,9 @@ pub fn access_id_from_uuid(send_id: &str) -> String {
 }
 
 pub fn uuid_from_access_id(access_id: &str) -> Option<String> {
-    let bytes = general_purpose::URL_SAFE_NO_PAD.decode(access_id.as_bytes()).ok()?;
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(access_id.as_bytes())
+        .ok()?;
     if bytes.len() != 16 {
         return None;
     }
@@ -267,7 +265,7 @@ pub fn send_to_json_access(send: &SendDBModel, creator_identifier: Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::{send_to_json, SendDBModel, SEND_AUTH_TYPE_NONE, SEND_AUTH_TYPE_PASSWORD};
+    use super::{SEND_AUTH_TYPE_NONE, SEND_AUTH_TYPE_PASSWORD, SendDBModel, send_to_json};
 
     fn base_send(password_hash: Option<String>) -> SendDBModel {
         SendDBModel {

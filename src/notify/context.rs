@@ -20,7 +20,12 @@ pub struct NotifyContext {
 }
 
 pub fn extract_request_meta(headers: &HeaderMap) -> RequestMeta {
-    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let get = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
 
     let ip = get("CF-Connecting-IP")
         .or_else(|| {
@@ -46,7 +51,11 @@ pub fn extract_request_meta(headers: &HeaderMap) -> RequestMeta {
         None
     };
 
-    RequestMeta { ip, user_agent, geo }
+    RequestMeta {
+        ip,
+        user_agent,
+        geo,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,29 +109,47 @@ async fn get_user_ua_history(user_id: &str, env: &worker::Env) -> Result<UaHisto
         Err(e) => return Err(worker::Error::RustError(e.to_string())),
     };
     let query = "SELECT ua_history FROM users WHERE id = ?";
-    let result = db.prepare(query).bind(&[user_id.into()])?.first::<serde_json::Value>(None).await?;
+    let result = db
+        .prepare(query)
+        .bind(&[user_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
 
     match result {
         Some(row) => {
-            let history_json = row.get("ua_history").and_then(|v| v.as_str()).unwrap_or("{\"records\":[]}");
+            let history_json = row
+                .get("ua_history")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{\"records\":[]}");
             Ok(UaHistory::from_json(history_json))
         }
         None => Ok(UaHistory::default()),
     }
 }
 
-async fn update_user_ua_history(user_id: &str, env: &worker::Env, ua: &str) -> Result<(), worker::Error> {
+async fn update_user_ua_history(
+    user_id: &str,
+    env: &worker::Env,
+    ua: &str,
+) -> Result<(), worker::Error> {
     let db = match crate::db::get_db(env) {
         Ok(db) => db,
         Err(e) => return Err(worker::Error::RustError(e.to_string())),
     };
 
     let query = "SELECT ua_history FROM users WHERE id = ?";
-    let result = db.prepare(query).bind(&[user_id.into()])?.first::<serde_json::Value>(None).await?;
+    let result = db
+        .prepare(query)
+        .bind(&[user_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
 
     let mut history = match result {
         Some(row) => {
-            let history_json = row.get("ua_history").and_then(|v| v.as_str()).unwrap_or("{\"records\":[]}");
+            let history_json = row
+                .get("ua_history")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{\"records\":[]}");
             UaHistory::from_json(history_json)
         }
         None => UaHistory::default(),

@@ -1,15 +1,12 @@
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::router::AppState;
 
 #[worker::send]
-pub async fn config(
-    State(_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
+pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -46,7 +43,8 @@ pub async fn config(
             "email-verification": true,
             "unauth-ui-refresh": true,
             "enable-pm-flight-recorder": true,
-            "mobile-error-reporting": true
+            "mobile-error-reporting": true,
+            "pm-19148-innovation-archive": true
         },
         "object": "config",
     }))

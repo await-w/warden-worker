@@ -1,19 +1,22 @@
-use axum::{extract::{Query, State}, Json};
 use axum::http::HeaderMap;
-use serde_json::Value;
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Arc;
 
 use crate::{
     auth::Claims,
-    db,
-    domains,
+    db, domains,
     error::AppError,
     logging::targets,
     models::{
+        archive,
         cipher::{Cipher, CipherDBModel},
         folder::{Folder, FolderResponse},
-        send::{send_to_json, SendDBModel},
+        send::{SendDBModel, send_to_json},
         sync::{Profile, SyncResponse, UserDecryption},
         user::User,
     },
@@ -37,7 +40,10 @@ fn normalize_kdf_for_response(
         KDF_TYPE_PBKDF2 => (None, None),
         KDF_TYPE_ARGON2ID => {
             if kdf_iterations < 1 {
-                return (Some(ARGON2ID_MEMORY_DEFAULT_MB), Some(ARGON2ID_PARALLELISM_DEFAULT));
+                return (
+                    Some(ARGON2ID_MEMORY_DEFAULT_MB),
+                    Some(ARGON2ID_PARALLELISM_DEFAULT),
+                );
             }
             let mem = kdf_memory.unwrap_or(ARGON2ID_MEMORY_DEFAULT_MB);
             let par = kdf_parallelism.unwrap_or(ARGON2ID_PARALLELISM_DEFAULT);
@@ -72,6 +78,7 @@ pub async fn sync(
 ) -> Result<Json<SyncResponse>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    archive::ensure_table(&db).await?;
     let user_id = claims.sub;
 
     // Fetch profile
@@ -94,8 +101,13 @@ pub async fn sync(
 
     // Fetch ciphers
     let ciphers: Vec<Value> = db
-        .prepare("SELECT * FROM ciphers WHERE user_id = ?1")
-        .bind(&[user_id.clone().into()])?
+        .prepare(
+            "SELECT ciphers.*, archives.archived_at AS archived_at
+             FROM ciphers
+             LEFT JOIN archives ON archives.cipher_id = ciphers.id AND archives.user_id = ?2
+             WHERE ciphers.user_id = ?1",
+        )
+        .bind(&[user_id.clone().into(), user_id.clone().into()])?
         .all()
         .await?
         .results()?;

@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use hmac::{Hmac, Mac};
@@ -105,7 +105,10 @@ pub struct TwoFactorRememberClaims {
     pub user_uuid: String,
 }
 
-pub fn generate_2fa_remember_claims(device_uuid: String, user_uuid: String) -> TwoFactorRememberClaims {
+pub fn generate_2fa_remember_claims(
+    device_uuid: String,
+    user_uuid: String,
+) -> TwoFactorRememberClaims {
     let now = Utc::now();
     TwoFactorRememberClaims {
         nbf: now.timestamp(),
@@ -116,7 +119,10 @@ pub fn generate_2fa_remember_claims(device_uuid: String, user_uuid: String) -> T
     }
 }
 
-pub fn encode_2fa_remember(claims: &TwoFactorRememberClaims, secret: &str) -> Result<String, AppError> {
+pub fn encode_2fa_remember(
+    claims: &TwoFactorRememberClaims,
+    secret: &str,
+) -> Result<String, AppError> {
     encode_hs256(claims, secret)
 }
 

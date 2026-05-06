@@ -1,15 +1,18 @@
-use axum::{
-    routing::{get, post, put, delete},
-    Router,
-    response::Html,
-    extract::State as AxumState,
-};
 use axum::extract::DefaultBodyLimit;
+use axum::{
+    Router,
+    extract::State as AxumState,
+    response::Html,
+    routing::{delete, get, post, put},
+};
 use std::sync::Arc;
 use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
-use crate::handlers::{accounts, ciphers, compat, config, css, identity, sync, folders, import, two_factor, devices, sends, usage, icons, settings, webauthn};
+use crate::handlers::{
+    accounts, ciphers, compat, config, css, devices, folders, icons, identity, import, sends,
+    settings, sync, two_factor, usage, webauthn,
+};
 use crate::jwt_manager::JwtKeys;
 use crate::two_factor_key_manager::TwoFactorKey;
 
@@ -49,7 +52,10 @@ pub fn api_router_with_keys(
         .route("/api/send-verify", post(sends::post_send_verify))
         // Identity/Auth routes
         .route("/identity/accounts/prelogin", post(accounts::prelogin))
-        .route("/identity/accounts/prelogin/password", post(accounts::prelogin))
+        .route(
+            "/identity/accounts/prelogin/password",
+            post(accounts::prelogin),
+        )
         .route("/api/accounts/prelogin", post(accounts::prelogin))
         .route("/api/accounts/prelogin/password", post(accounts::prelogin))
         .route(
@@ -81,10 +87,16 @@ pub fn api_router_with_keys(
         .route("/accounts/request-otp", post(accounts::request_otp))
         .route("/api/accounts/verify-otp", post(accounts::verify_otp))
         .route("/accounts/verify-otp", post(accounts::verify_otp))
-        .route("/api/accounts/verify-password", post(accounts::verify_password))
+        .route(
+            "/api/accounts/verify-password",
+            post(accounts::verify_password),
+        )
         .route("/accounts/verify-password", post(accounts::verify_password))
         .route("/api/devices", get(devices::get_devices))
-        .route("/api/devices/identifier/{id}", get(devices::get_device_by_identifier))
+        .route(
+            "/api/devices/identifier/{id}",
+            get(devices::get_device_by_identifier),
+        )
         .route("/api/devices/knowndevice", get(devices::knowndevice))
         .route(
             "/api/devices/identifier/{id}/token",
@@ -134,20 +146,35 @@ pub fn api_router_with_keys(
             "/api/auth-requests/{id}/response/",
             get(devices::get_auth_request_response),
         )
-        .route("/api/accounts/password", put(accounts::change_master_password))
+        .route(
+            "/api/accounts/password",
+            put(accounts::change_master_password),
+        )
         .route("/api/accounts/email", put(accounts::change_email))
         .route("/api/accounts/kdf", post(accounts::post_kdf))
         .route("/api/two-factor", get(two_factor::two_factor_status))
-        .route("/api/two-factor/get-authenticator", post(two_factor::get_authenticator))
+        .route(
+            "/api/two-factor/get-authenticator",
+            post(two_factor::get_authenticator),
+        )
         .route(
             "/api/two-factor/authenticator",
             post(two_factor::activate_authenticator)
                 .put(two_factor::activate_authenticator_put)
                 .delete(two_factor::disable_authenticator_vw),
         )
-        .route("/api/two-factor/authenticator/request", post(two_factor::authenticator_request))
-        .route("/api/two-factor/authenticator/enable", post(two_factor::authenticator_enable))
-        .route("/api/two-factor/authenticator/disable", post(two_factor::authenticator_disable))
+        .route(
+            "/api/two-factor/authenticator/request",
+            post(two_factor::authenticator_request),
+        )
+        .route(
+            "/api/two-factor/authenticator/enable",
+            post(two_factor::authenticator_enable),
+        )
+        .route(
+            "/api/two-factor/authenticator/disable",
+            post(two_factor::authenticator_disable),
+        )
         .route("/api/two-factor/get-email", post(two_factor::get_email))
         .route(
             "/api/two-factor/get-webauthn",
@@ -168,11 +195,20 @@ pub fn api_router_with_keys(
             "/api/two-factor/email",
             put(two_factor::verify_email).delete(two_factor::disable_email),
         )
-        .route("/api/two-factor/disable", post(two_factor::disable_twofactor).put(two_factor::disable_twofactor_put))
+        .route(
+            "/api/two-factor/disable",
+            post(two_factor::disable_twofactor).put(two_factor::disable_twofactor_put),
+        )
         .route("/api/two-factor/get-recover", post(two_factor::get_recover))
         .route("/api/two-factor/recover", post(two_factor::recover))
-        .route("/two-factor/send-email-login", post(two_factor::send_email_login))
-        .route("/api/two-factor/send-email-login", post(two_factor::send_email_login))
+        .route(
+            "/two-factor/send-email-login",
+            post(two_factor::send_email_login),
+        )
+        .route(
+            "/api/two-factor/send-email-login",
+            post(two_factor::send_email_login),
+        )
         .route("/api/sends", get(sends::get_sends).post(sends::post_send))
         .route("/api/sends/file/v2", post(sends::post_send_file_v2))
         .route("/api/sends/access/{access_id}", post(sends::post_access))
@@ -193,13 +229,11 @@ pub fn api_router_with_keys(
         .route("/api/sends/{send_id}/{file_id}", get(sends::download_send))
         .route(
             "/api/sends/{send_id}/file/{file_id}",
-            post(sends::post_send_file_v2_data)
-                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(sends::post_send_file_v2_data).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
         .route(
             "/sends/{send_id}/file/{file_id}",
-            post(sends::post_send_file_v2_data)
-                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(sends::post_send_file_v2_data).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
         .route("/api/collections", get(compat::get_collections))
         .route("/api/policies", get(compat::get_policies))
@@ -222,11 +256,18 @@ pub fn api_router_with_keys(
             put(ciphers::soft_delete_cipher).post(ciphers::hard_delete_cipher_post),
         )
         .route("/api/ciphers/{id}/restore", put(ciphers::restore_cipher))
+        .route("/api/ciphers/{id}/archive", put(ciphers::archive_cipher))
+        .route(
+            "/api/ciphers/{id}/unarchive",
+            put(ciphers::unarchive_cipher),
+        )
         .route(
             "/api/ciphers/delete",
             put(ciphers::soft_delete_ciphers).post(ciphers::hard_delete_ciphers),
         )
         .route("/api/ciphers/restore", put(ciphers::restore_ciphers))
+        .route("/api/ciphers/archive", put(ciphers::archive_ciphers))
+        .route("/api/ciphers/unarchive", put(ciphers::unarchive_ciphers))
         // Folders CRUD
         .route("/api/folders", post(folders::create_folder))
         .route("/api/folders/{id}", put(folders::update_folder))

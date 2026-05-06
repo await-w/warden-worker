@@ -1,19 +1,21 @@
 use axum::http::HeaderMap;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration, Utc};
 use ciborium::value::Value as CborValue;
-use p256::ecdsa::{signature::Verifier as _, Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p256::ecdsa::{
+    Signature as P256Signature, VerifyingKey as P256VerifyingKey, signature::Verifier as _,
+};
 use rand::RngCore;
-use rsa::{RsaPublicKey, BigUint};
 use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
+use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use url::Url;
 use uuid::Uuid;
-use worker::wasm_bindgen::JsValue;
 use worker::D1Database;
+use worker::wasm_bindgen::JsValue;
 
 use crate::{error::AppError, jwt, logging::targets};
 
@@ -634,15 +636,15 @@ pub async fn disable_webauthn(db: &D1Database, user_id: &str) -> Result<(), AppE
 pub fn is_webauthn_2fa_supported(headers: &HeaderMap) -> bool {
     let rp_id = rp_id_from_headers(headers);
     let origin = origin_from_headers(headers);
-    
+
     if rp_id.is_empty() || origin.is_empty() {
         return false;
     }
-    
+
     if rp_id == "localhost" || rp_id == "127.0.0.1" || rp_id == "::1" {
         return true;
     }
-    
+
     if let Ok(url) = Url::parse(&origin) {
         url.domain().is_some()
     } else {
@@ -959,7 +961,7 @@ pub async fn verify_login_assertion(
         None => {
             return Err(AppError::Unauthorized(
                 "Invalid two factor token".to_string(),
-            ))
+            ));
         }
     };
     let credential_id_b64url = encode_b64url(&credential_id_raw);
@@ -976,8 +978,7 @@ pub async fn verify_login_assertion(
     let mut signed_data = Vec::with_capacity(authenticator_data.len() + 32);
     signed_data.extend_from_slice(&authenticator_data);
     signed_data.extend_from_slice(&Sha256::digest(&client_data_json));
-    verifying_key
-        .verify(&signed_data, &signature)?;
+    verifying_key.verify(&signed_data, &signature)?;
 
     let new_sign_count = parsed.sign_count as i64;
     let old_sign_count = stored.sign_count;
@@ -1135,8 +1136,7 @@ pub async fn verify_passwordless_login_assertion(
     let mut signed_data = Vec::with_capacity(authenticator_data.len() + 32);
     signed_data.extend_from_slice(&authenticator_data);
     signed_data.extend_from_slice(&Sha256::digest(&client_data_json));
-    verifying_key
-        .verify(&signed_data, &signature)?;
+    verifying_key.verify(&signed_data, &signature)?;
 
     let new_sign_count = parsed.sign_count as i64;
     let old_sign_count = stored.sign_count;
@@ -1179,7 +1179,7 @@ pub fn extract_assertion_credential_id_b64url(
         None => {
             return Err(AppError::BadRequest(
                 "Missing WebAuthn credential id".to_string(),
-            ))
+            ));
         }
     };
     Ok(encode_b64url(&credential_id_raw))
@@ -1422,22 +1422,26 @@ impl WebAuthnVerifyingKey {
             WebAuthnVerifyingKey::P256(vk) => {
                 let sig = P256Signature::from_der(signature)
                     .map_err(|_| AppError::Unauthorized("Invalid signature format".to_string()))?;
-                vk.verify(signed_data, &sig)
-                    .map_err(|_| AppError::Unauthorized("Signature verification failed".to_string()))
+                vk.verify(signed_data, &sig).map_err(|_| {
+                    AppError::Unauthorized("Signature verification failed".to_string())
+                })
             }
             WebAuthnVerifyingKey::Rsa(rsa_key) => {
                 // RS256: RSASSA-PKCS1-v1_5 with SHA-256
                 let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_key.clone());
                 let sig = RsaSignature::try_from(signature)
                     .map_err(|_| AppError::Unauthorized("Invalid signature format".to_string()))?;
-                verifying_key.verify(signed_data, &sig)
-                    .map_err(|_| AppError::Unauthorized("Signature verification failed".to_string()))
+                verifying_key.verify(signed_data, &sig).map_err(|_| {
+                    AppError::Unauthorized("Signature verification failed".to_string())
+                })
             }
         }
     }
 }
 
-fn parse_webauthn_public_key(cose_key_bytes: &[u8]) -> Result<(WebAuthnVerifyingKey, i64), AppError> {
+fn parse_webauthn_public_key(
+    cose_key_bytes: &[u8],
+) -> Result<(WebAuthnVerifyingKey, i64), AppError> {
     let value: CborValue = ciborium::de::from_reader(Cursor::new(cose_key_bytes))
         .map_err(|_| AppError::BadRequest("Invalid WebAuthn public key".to_string()))?;
     let map = value
@@ -1494,9 +1498,10 @@ fn parse_webauthn_public_key(cose_key_bytes: &[u8]) -> Result<(WebAuthnVerifying
                 .map_err(|_| AppError::BadRequest("Invalid RSA public key".to_string()))?;
             Ok((WebAuthnVerifyingKey::Rsa(rsa_key), alg as i64))
         }
-        _ => Err(AppError::BadRequest(
-            format!("Unsupported WebAuthn public key type: kty={}, alg={}", kty, alg),
-        )),
+        _ => Err(AppError::BadRequest(format!(
+            "Unsupported WebAuthn public key type: kty={}, alg={}",
+            kty, alg
+        ))),
     }
 }
 
@@ -1789,7 +1794,8 @@ async fn upsert_pending_challenge(
     origin: &str,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let expires_at = (now + Duration::seconds(CHALLENGE_TTL_SECONDS)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expires_at = (now + Duration::seconds(CHALLENGE_TTL_SECONDS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let now = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     db.prepare(
         "INSERT INTO webauthn_challenges (

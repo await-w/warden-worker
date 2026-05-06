@@ -1,14 +1,18 @@
-use axum::{extract::State, Json};
 use axum::http::HeaderMap;
+use axum::{Json, extract::State};
 use chrono::Utc;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
-use worker::query;
+use worker::{D1Database, query};
 
 use crate::auth::Claims;
 use crate::db;
 use crate::error::AppError;
-use crate::models::cipher::{Cipher, CipherData, CipherRequestData, CreateCipherRequest, CipherRequestFlat};
+use crate::models::{
+    archive,
+    cipher::{Cipher, CipherData, CipherRequestData, CipherRequestFlat, CreateCipherRequest},
+};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 use axum::extract::Path;
@@ -19,22 +23,47 @@ pub struct CipherIdsRequest {
     ids: Vec<String>,
 }
 
-async fn get_cipher_dbmodel(
-    state: &Arc<AppState>,
+fn now_string() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn normalize_archived_date(archived_date: Option<String>) -> Option<String> {
+    archived_date.and_then(|d| {
+        let d = d.trim().to_string();
+        if d.is_empty() { None } else { Some(d) }
+    })
+}
+
+async fn get_cipher_dbmodel_from_db(
+    db: &D1Database,
     cipher_id: &str,
     user_id: &str,
 ) -> Result<crate::models::cipher::CipherDBModel, AppError> {
-    let db = db::get_db(&state.env)?;
+    archive::ensure_table(db).await?;
+
     query!(
-        &db,
-        "SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2",
+        db,
+        "SELECT ciphers.*, archives.archived_at AS archived_at
+         FROM ciphers
+         LEFT JOIN archives ON archives.cipher_id = ciphers.id AND archives.user_id = ?3
+         WHERE ciphers.id = ?1 AND ciphers.user_id = ?2",
         cipher_id,
+        user_id,
         user_id
     )
     .map_err(|_| AppError::Database)?
     .first(None)
     .await?
     .ok_or(AppError::NotFound("Cipher not found".to_string()))
+}
+
+async fn get_cipher_dbmodel(
+    state: &Arc<AppState>,
+    cipher_id: &str,
+    user_id: &str,
+) -> Result<crate::models::cipher::CipherDBModel, AppError> {
+    let db = db::get_db(&state.env)?;
+    get_cipher_dbmodel_from_db(&db, cipher_id, user_id).await
 }
 
 async fn create_cipher_inner(
@@ -45,8 +74,9 @@ async fn create_cipher_inner(
 ) -> Result<Cipher, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    archive::ensure_table(&db).await?;
+    let now = now_string();
+    let archived_at = normalize_archived_date(cipher_data_req.archived_date.clone());
 
     let cipher_data = CipherData {
         name: cipher_data_req.name,
@@ -71,6 +101,7 @@ async fn create_cipher_inner(
         favorite: cipher_data_req.favorite,
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: None,
+        archived_at: archived_at.clone(),
         created_at: now.clone(),
         updated_at: now.clone(),
         object: "cipher".to_string(),
@@ -103,6 +134,10 @@ async fn create_cipher_inner(
     .run()
     .await?;
 
+    if let Some(archived_at) = &archived_at {
+        archive::save(&db, &claims.sub, &cipher.id, archived_at).await?;
+    }
+
     Ok(cipher)
 }
 
@@ -117,7 +152,8 @@ pub async fn create_cipher(
     let user_email = Some(claims.email.clone());
     let meta = notify::extract_request_meta(&headers);
 
-    let cipher = create_cipher_inner(claims, &state, payload.cipher, payload.collection_ids).await?;
+    let cipher =
+        create_cipher_inner(claims, &state, payload.cipher, payload.collection_ids).await?;
 
     notify::notify_background(
         &state.ctx,
@@ -146,7 +182,8 @@ pub async fn post_ciphers(
     let user_email = Some(claims.email.clone());
     let meta = notify::extract_request_meta(&headers);
 
-    let cipher = create_cipher_inner(claims, &state, payload.cipher, payload.collection_ids).await?;
+    let cipher =
+        create_cipher_inner(claims, &state, payload.cipher, payload.collection_ids).await?;
 
     notify::notify_background(
         &state.ctx,
@@ -174,21 +211,16 @@ pub async fn update_cipher(
 ) -> Result<Json<Cipher>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    archive::ensure_table(&db).await?;
+    let now = now_string();
 
-    let existing_cipher: crate::models::cipher::CipherDBModel = query!(
-        &db,
-        "SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|_| AppError::Database)?
-    .first(None)
-    .await?
-    .ok_or(AppError::NotFound("Cipher not found".to_string()))?;
+    let existing_cipher = get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
 
     let cipher_data_req = payload;
+    let requested_archived_at = normalize_archived_date(cipher_data_req.archived_date.clone());
+    let archived_at = requested_archived_at
+        .clone()
+        .or_else(|| existing_cipher.archived_at.clone());
 
     let cipher_data = CipherData {
         name: cipher_data_req.name,
@@ -213,6 +245,7 @@ pub async fn update_cipher(
         favorite: cipher_data_req.favorite,
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: existing_cipher.deleted_at,
+        archived_at: archived_at.clone(),
         created_at: existing_cipher.created_at,
         updated_at: now.clone(),
         object: "cipher".to_string(),
@@ -238,6 +271,10 @@ pub async fn update_cipher(
     ).map_err(|_|AppError::Database)?
     .run()
     .await?;
+
+    if let Some(archived_at) = &requested_archived_at {
+        archive::save(&db, &claims.sub, &id, archived_at).await?;
+    }
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -350,6 +387,198 @@ pub async fn restore_cipher(
     Ok(Json(cipher))
 }
 
+async fn archive_cipher_record(
+    db: &D1Database,
+    cipher_id: &str,
+    user_id: &str,
+    archived_at: String,
+) -> Result<Cipher, AppError> {
+    let existing = get_cipher_dbmodel_from_db(db, cipher_id, user_id).await?;
+
+    archive::save(db, user_id, cipher_id, &archived_at).await?;
+    query!(
+        db,
+        "UPDATE ciphers SET updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
+        archived_at,
+        cipher_id,
+        user_id
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await?;
+
+    let mut cipher: Cipher = existing.into();
+    cipher.archived_at = Some(archived_at.clone());
+    cipher.updated_at = archived_at;
+    Ok(cipher)
+}
+
+async fn unarchive_cipher_record(
+    db: &D1Database,
+    cipher_id: &str,
+    user_id: &str,
+    updated_at: String,
+) -> Result<Cipher, AppError> {
+    let existing = get_cipher_dbmodel_from_db(db, cipher_id, user_id).await?;
+
+    archive::delete(db, user_id, cipher_id).await?;
+    query!(
+        db,
+        "UPDATE ciphers SET updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
+        updated_at,
+        cipher_id,
+        user_id
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await?;
+
+    let mut cipher: Cipher = existing.into();
+    cipher.archived_at = None;
+    cipher.updated_at = updated_at;
+    Ok(cipher)
+}
+
+#[worker::send]
+pub async fn archive_cipher(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Cipher>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let cipher = archive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+
+    let meta = notify::extract_request_meta(&headers);
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::CipherUpdate,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            cipher_id: Some(id),
+            detail: Some("Action: Archive Cipher".to_string()),
+            meta,
+            ..Default::default()
+        },
+    );
+
+    Ok(Json(cipher))
+}
+
+#[worker::send]
+pub async fn unarchive_cipher(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Cipher>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let cipher = unarchive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+
+    let meta = notify::extract_request_meta(&headers);
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::CipherUpdate,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            cipher_id: Some(id),
+            detail: Some("Action: Unarchive Cipher".to_string()),
+            meta,
+            ..Default::default()
+        },
+    );
+
+    Ok(Json(cipher))
+}
+
+#[worker::send]
+pub async fn archive_ciphers(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CipherIdsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let user_id = claims.sub.clone();
+    let user_email = Some(claims.email.clone());
+    let count = payload.ids.len();
+    let mut ciphers = Vec::with_capacity(count);
+    for id in payload.ids {
+        let cipher = archive_cipher_record(&db, &id, &user_id, now_string()).await?;
+        ciphers.push(json!(cipher));
+    }
+
+    let meta = notify::extract_request_meta(&headers);
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::CipherUpdate,
+        NotifyContext {
+            user_id: Some(user_id),
+            user_email,
+            detail: Some(format!("Action: Batch Archive ({} items)", count)),
+            meta,
+            ..Default::default()
+        },
+    );
+
+    Ok(Json(json!({
+        "data": ciphers,
+        "object": "list",
+        "continuationToken": null
+    })))
+}
+
+#[worker::send]
+pub async fn unarchive_ciphers(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CipherIdsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let user_id = claims.sub.clone();
+    let user_email = Some(claims.email.clone());
+    let count = payload.ids.len();
+    let mut ciphers = Vec::with_capacity(count);
+    for id in payload.ids {
+        let cipher = unarchive_cipher_record(&db, &id, &user_id, now_string()).await?;
+        ciphers.push(json!(cipher));
+    }
+
+    let meta = notify::extract_request_meta(&headers);
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::CipherUpdate,
+        NotifyContext {
+            user_id: Some(user_id),
+            user_email,
+            detail: Some(format!("Action: Batch Unarchive ({} items)", count)),
+            meta,
+            ..Default::default()
+        },
+    );
+
+    Ok(Json(json!({
+        "data": ciphers,
+        "object": "list",
+        "continuationToken": null
+    })))
+}
+
 #[worker::send]
 pub async fn hard_delete_cipher(
     claims: Claims,
@@ -359,6 +588,7 @@ pub async fn hard_delete_cipher(
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    archive::delete(&db, &claims.sub, &id).await?;
 
     query!(
         &db,
@@ -496,6 +726,7 @@ pub async fn hard_delete_ciphers(
 
     let count = payload.ids.len();
     for id in payload.ids {
+        archive::delete(&db, &claims.sub, &id).await?;
         query!(
             &db,
             "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",

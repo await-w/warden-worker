@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -37,19 +37,22 @@ impl TwoFactorKeyManager {
 
         Self::create_key(db).await?;
 
-        let k = Self::get_key(db).await
-            .map_err(|_| AppError::Database)?;
+        let k = Self::get_key(db).await.map_err(|_| AppError::Database)?;
 
         Ok(TwoFactorKey { key_b64: k.key_b64 })
     }
 
     pub async fn get_key(db: &D1Database) -> Result<TwoFactorKeyRow, AppError> {
-        let stmt = db
-            .prepare("SELECT id, key_b64, created_at, updated_at FROM two_factor_keys WHERE id = ?1");
+        let stmt = db.prepare(
+            "SELECT id, key_b64, created_at, updated_at FROM two_factor_keys WHERE id = ?1",
+        );
 
-        let stmt = stmt.bind(&[TWO_FACTOR_KEY_ID.into()]).map_err(|_| AppError::Database)?;
+        let stmt = stmt
+            .bind(&[TWO_FACTOR_KEY_ID.into()])
+            .map_err(|_| AppError::Database)?;
 
-        let result: Option<TwoFactorKeyRow> = stmt.first(None).await.map_err(|_| AppError::Database)?;
+        let result: Option<TwoFactorKeyRow> =
+            stmt.first(None).await.map_err(|_| AppError::Database)?;
 
         result.ok_or_else(|| AppError::NotFound("Two-factor key not found".into()))
     }
@@ -82,22 +85,14 @@ impl TwoFactorKeyManager {
 
         let key_b64 = generate_random_key()?;
 
-        db.prepare(
-            "UPDATE two_factor_keys SET key_b64 = ?1, updated_at = ?2 WHERE id = ?3"
-        )
-        .bind(&[
-            key_b64.clone().into(),
-            now.into(),
-            TWO_FACTOR_KEY_ID.into(),
-        ])
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await
-        .map_err(|_| AppError::Database)?;
+        db.prepare("UPDATE two_factor_keys SET key_b64 = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(&[key_b64.clone().into(), now.into(), TWO_FACTOR_KEY_ID.into()])
+            .map_err(|_| AppError::Database)?
+            .run()
+            .await
+            .map_err(|_| AppError::Database)?;
 
         log::info!("Two-factor encryption key rotated in database");
-        Ok(TwoFactorKey {
-            key_b64,
-        })
+        Ok(TwoFactorKey { key_b64 })
     }
 }

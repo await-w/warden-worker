@@ -49,20 +49,24 @@ impl NotifyConfig {
 
 fn parse_notify_level(env: &worker::Env) -> NotifyLevel {
     let raw = env.var(NOTIFY_LEVEL_VAR).ok().map(|v| v.to_string());
-    let Some(raw) = raw else { return NotifyLevel::Info };
-    
+    let Some(raw) = raw else {
+        return NotifyLevel::Info;
+    };
+
     NotifyLevel::from_str(raw.trim()).unwrap_or(NotifyLevel::Info)
 }
 
 fn parse_enabled_events(env: &worker::Env) -> HashSet<String> {
     let raw = env.var(NOTIFY_EVENTS_VAR).ok().map(|v| v.to_string());
-    let Some(raw) = raw else { return HashSet::new() };
-    
+    let Some(raw) = raw else {
+        return HashSet::new();
+    };
+
     let raw = raw.trim().to_lowercase();
     if raw.is_empty() || matches!(raw.as_str(), "none" | "off" | "0" | "false") {
         return HashSet::new();
     }
-    
+
     if matches!(raw.as_str(), "all" | "*") {
         let mut set = HashSet::new();
         set.insert("*".to_string());
@@ -99,6 +103,6 @@ fn detect_enabled_channels(env: &worker::Env) -> Vec<ChannelType> {
 }
 
 pub fn is_webhook_configured(env: &worker::Env) -> bool {
-    env.secret("WEWORK_WEBHOOK_URL").is_ok() 
+    env.secret("WEWORK_WEBHOOK_URL").is_ok()
         || (env.secret("TELEGRAM_BOT_TOKEN").is_ok() && env.secret("TELEGRAM_CHAT_ID").is_ok())
 }

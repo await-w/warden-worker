@@ -99,23 +99,41 @@ impl NotifyEvent {
             "password" | "password_change" | "passwordchange" => Some(NotifyEvent::PasswordChange),
             "email" | "email_change" | "emailchange" => Some(NotifyEvent::EmailChange),
             "kdf" | "kdf_change" | "kdfchange" => Some(NotifyEvent::KdfChange),
-            "cipher_create" | "cipher.add" | "cipher_add" | "create_cipher" => Some(NotifyEvent::CipherCreate),
-            "cipher_update" | "cipher.update" | "cipher_edit" | "update_cipher" => Some(NotifyEvent::CipherUpdate),
+            "cipher_create" | "cipher.add" | "cipher_add" | "create_cipher" => {
+                Some(NotifyEvent::CipherCreate)
+            }
+            "cipher_update" | "cipher.update" | "cipher_edit" | "update_cipher" => {
+                Some(NotifyEvent::CipherUpdate)
+            }
             "cipher_delete" | "cipher.del" | "delete_cipher" => Some(NotifyEvent::CipherDelete),
             "import" => Some(NotifyEvent::Import),
             "send_create" | "send.create" | "send_add" => Some(NotifyEvent::SendCreate),
             "send_delete" | "send.del" | "send_remove" => Some(NotifyEvent::SendDelete),
-            "2fa_enable" | "two_factor_enable" | "twofactor_enable" => Some(NotifyEvent::TwoFactorEnable),
-            "2fa_disable" | "two_factor_disable" | "twofactor_disable" => Some(NotifyEvent::TwoFactorDisable),
-            "2fa_recovery_code_view" | "two_factor_recovery_code_view" => Some(NotifyEvent::TwoFactorRecoveryCodeView),
-            "2fa_recover" | "two_factor_recover" | "twofactor_recover" => Some(NotifyEvent::TwoFactorRecover),
+            "2fa_enable" | "two_factor_enable" | "twofactor_enable" => {
+                Some(NotifyEvent::TwoFactorEnable)
+            }
+            "2fa_disable" | "two_factor_disable" | "twofactor_disable" => {
+                Some(NotifyEvent::TwoFactorDisable)
+            }
+            "2fa_recovery_code_view" | "two_factor_recovery_code_view" => {
+                Some(NotifyEvent::TwoFactorRecoveryCodeView)
+            }
+            "2fa_recover" | "two_factor_recover" | "twofactor_recover" => {
+                Some(NotifyEvent::TwoFactorRecover)
+            }
             "token_refresh" | "unlock" => Some(NotifyEvent::TokenRefresh),
             "sync" => Some(NotifyEvent::Sync),
             "auth_request" | "authrequest" => Some(NotifyEvent::AuthRequest),
             "auth_response" | "authresponse" => Some(NotifyEvent::AuthResponse),
-            "webauthn_credential_create" | "webauthn_create" | "passkey_create" => Some(NotifyEvent::WebAuthnCredentialCreate),
-            "webauthn_credential_delete" | "webauthn_delete" | "passkey_delete" => Some(NotifyEvent::WebAuthnCredentialDelete),
-            "webauthn_credential_update" | "webauthn_update" | "passkey_update" => Some(NotifyEvent::WebAuthnCredentialUpdate),
+            "webauthn_credential_create" | "webauthn_create" | "passkey_create" => {
+                Some(NotifyEvent::WebAuthnCredentialCreate)
+            }
+            "webauthn_credential_delete" | "webauthn_delete" | "passkey_delete" => {
+                Some(NotifyEvent::WebAuthnCredentialDelete)
+            }
+            "webauthn_credential_update" | "webauthn_update" | "passkey_update" => {
+                Some(NotifyEvent::WebAuthnCredentialUpdate)
+            }
             "webauthn_login" | "passkey_login" => Some(NotifyEvent::WebAuthnLogin),
             _ => None,
         }

@@ -1,17 +1,17 @@
-use axum::{extract::State, Json};
 use axum::http::HeaderMap;
+use axum::{Json, extract::State};
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
-use worker::{D1Database, D1PreparedStatement};
 use wasm_bindgen::JsValue;
+use worker::{D1Database, D1PreparedStatement};
 
 use crate::auth::Claims;
 use crate::db;
 use crate::error::AppError;
-use crate::models::cipher::CipherData;
 use crate::models::folder::Folder;
 use crate::models::import::ImportRequest;
+use crate::models::{archive, cipher::CipherData};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 
@@ -26,6 +26,7 @@ pub async fn import_data(
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    archive::ensure_table(&db).await?;
     let folder_count = payload.folders.len();
     let cipher_count = payload.ciphers.len();
     let now = Utc::now();
@@ -66,12 +67,26 @@ pub async fn import_data(
     }
 
     let cipher_query = "INSERT OR IGNORE INTO ciphers (id, user_id, organization_id, type, data, favorite, folder_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+    let archive_query = "INSERT INTO archives (user_id, cipher_id, archived_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(user_id, cipher_id) DO UPDATE SET archived_at = excluded.archived_at";
 
     let mut cipher_stmts: Vec<D1PreparedStatement> = Vec::new();
+    let mut archive_stmts: Vec<D1PreparedStatement> = Vec::new();
     for import_cipher in payload.ciphers {
         if import_cipher.encrypted_for != claims.sub {
-            return Err(AppError::BadRequest("Cipher encrypted for wrong user".to_string()));
+            return Err(AppError::BadRequest(
+                "Cipher encrypted for wrong user".to_string(),
+            ));
         }
+        let archived_at = import_cipher.archived_date.as_ref().and_then(|d| {
+            let d = d.trim();
+            if d.is_empty() {
+                None
+            } else {
+                Some(d.to_string())
+            }
+        });
 
         let cipher_data = CipherData {
             name: import_cipher.name,
@@ -90,8 +105,8 @@ pub async fn import_data(
         let data = serde_json::to_string(&cipher_data).map_err(|_| AppError::Internal)?;
 
         cipher_stmts.push(db.prepare(cipher_query).bind(&[
-            id.into(),
-            user_id.into(),
+            id.clone().into(),
+            user_id.clone().into(),
             to_js_val(import_cipher.organization_id),
             import_cipher.r#type.into(),
             data.into(),
@@ -101,11 +116,23 @@ pub async fn import_data(
             now.clone().into(),
         ])?);
 
+        if let Some(archived_at) = archived_at {
+            archive_stmts.push(db.prepare(archive_query).bind(&[
+                user_id.clone().into(),
+                id.into(),
+                archived_at.into(),
+            ])?);
+        }
+
         if cipher_stmts.len() >= IMPORT_BATCH_SIZE {
             run_batch(&db, &mut cipher_stmts).await?;
         }
+        if archive_stmts.len() >= IMPORT_BATCH_SIZE {
+            run_batch(&db, &mut archive_stmts).await?;
+        }
     }
     run_batch(&db, &mut cipher_stmts).await?;
+    run_batch(&db, &mut archive_stmts).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(

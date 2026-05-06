@@ -1,21 +1,24 @@
-use axum::{extract::State, response::IntoResponse, Form, Json};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
+use axum::{Form, Json, extract::State, response::IntoResponse};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 use worker::wasm_bindgen::JsValue;
-use sha2::{Digest, Sha256};
 
 use crate::background::BackgroundExecutor;
-use crate::{auth::Claims, crypto, db, error::AppError, jwt, logging::targets, models::user::User, two_factor, webauthn};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
+use crate::{
+    auth::Claims, crypto, db, error::AppError, jwt, logging::targets, models::user::User,
+    two_factor, webauthn,
+};
 
 const LOGIN_RATE_LIMITER_BINDING: &str = "LOGIN_LIMITER";
 
@@ -165,7 +168,11 @@ pub struct TokenRequest {
     _scope: Option<String>,
     #[serde(rename = "client_id")]
     _client_id: Option<String>,
-    #[serde(rename = "deviceIdentifier", alias = "device_identifier", alias = "deviceId")]
+    #[serde(
+        rename = "deviceIdentifier",
+        alias = "device_identifier",
+        alias = "deviceId"
+    )]
     device_identifier: Option<String>,
     #[serde(rename = "deviceName", alias = "device_name")]
     device_name: Option<String>,
@@ -300,31 +307,31 @@ async fn generate_tokens_and_response(
         }
     }
 
-        Ok(json!({
-            "ForcePasswordReset": false,
-            "Kdf": user.kdf_type,
-            "KdfIterations": user.kdf_iterations,
-            "KdfMemory": kdf_memory,
-            "KdfParallelism": kdf_parallelism,
-            "Key": user.key,
-            "MasterPasswordPolicy": { "Object": "masterPasswordPolicy" },
-            "PrivateKey": user.private_key,
-            "ResetMasterPassword": false,
-            "UserDecryptionOptions": user_decryption_options,
-            "AccountKeys": {
-                "publicKeyEncryptionKeyPair": {
-                    "wrappedPrivateKey": user.private_key,
-                    "publicKey": user.public_key,
-                    "Object": "publicKeyEncryptionKeyPair"
-                },
-                "Object": "privateKeys"
+    Ok(json!({
+        "ForcePasswordReset": false,
+        "Kdf": user.kdf_type,
+        "KdfIterations": user.kdf_iterations,
+        "KdfMemory": kdf_memory,
+        "KdfParallelism": kdf_parallelism,
+        "Key": user.key,
+        "MasterPasswordPolicy": { "Object": "masterPasswordPolicy" },
+        "PrivateKey": user.private_key,
+        "ResetMasterPassword": false,
+        "UserDecryptionOptions": user_decryption_options,
+        "AccountKeys": {
+            "publicKeyEncryptionKeyPair": {
+                "wrappedPrivateKey": user.private_key,
+                "publicKey": user.public_key,
+                "Object": "publicKeyEncryptionKeyPair"
             },
-            "access_token": access_token,
-            "expires_in": expires_in.num_seconds(),
-            "refresh_token": refresh_token,
-            "scope": "api offline_access",
-            "token_type": "Bearer"
-        }))
+            "Object": "privateKeys"
+        },
+        "access_token": access_token,
+        "expires_in": expires_in.num_seconds(),
+        "refresh_token": refresh_token,
+        "scope": "api offline_access",
+        "token_type": "Bearer"
+    }))
 }
 
 async fn ensure_devices_table(db: &worker::D1Database) -> Result<(), AppError> {
@@ -360,27 +367,50 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn generate_remember_token(device_uuid: &str, user_uuid: &str, jwt_secret: &str) -> Result<String, AppError> {
+fn generate_remember_token(
+    device_uuid: &str,
+    user_uuid: &str,
+    jwt_secret: &str,
+) -> Result<String, AppError> {
     let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
     jwt::encode_2fa_remember(&claims, jwt_secret)
 }
 
-fn verify_remember_token(token: &str, device_uuid: &str, user_uuid: &str, jwt_secret: &str) -> bool {
+fn verify_remember_token(
+    token: &str,
+    device_uuid: &str,
+    user_uuid: &str,
+    jwt_secret: &str,
+) -> bool {
     match jwt::decode_2fa_remember(token, jwt_secret) {
         Ok(claims) => claims.sub == device_uuid && claims.user_uuid == user_uuid,
         Err(_) => false,
     }
 }
 
-async fn generate_remember_token_async(device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<String, AppError> {
+async fn generate_remember_token_async(
+    device_uuid: &str,
+    user_uuid: &str,
+    state: &Arc<AppState>,
+) -> Result<String, AppError> {
     let jwt_keys = state.jwt_keys.clone();
     let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
     jwt::encode_2fa_remember(&claims, &jwt_keys.access_secret)
 }
 
-async fn verify_remember_token_async(token: &str, device_uuid: &str, user_uuid: &str, state: &Arc<AppState>) -> Result<bool, AppError> {
+async fn verify_remember_token_async(
+    token: &str,
+    device_uuid: &str,
+    user_uuid: &str,
+    state: &Arc<AppState>,
+) -> Result<bool, AppError> {
     let jwt_keys = state.jwt_keys.clone();
-    Ok(verify_remember_token(token, device_uuid, user_uuid, &jwt_keys.access_secret))
+    Ok(verify_remember_token(
+        token,
+        device_uuid,
+        user_uuid,
+        &jwt_keys.access_secret,
+    ))
 }
 
 fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -450,7 +480,9 @@ async fn enforce_login_rate_limit(
     let key = format!("login:{}:{}", ip, username.trim().to_lowercase());
     let outcome = limiter.limit(key).await.map_err(|_| AppError::Internal)?;
     if !outcome.success {
-        return Err(AppError::TooManyRequests("Too many login attempts".to_string()));
+        return Err(AppError::TooManyRequests(
+            "Too many login attempts".to_string(),
+        ));
     }
     Ok(())
 }
@@ -524,9 +556,12 @@ async fn two_factor_required_response(
         if p == two_factor::TWO_FACTOR_PROVIDER_EMAIL {
             response_providers.push(p.to_string());
             if let Some((ref email, _)) = email_2fa_data {
-                providers2.insert(p.to_string(), json!({
-                    "Email": email
-                }));
+                providers2.insert(
+                    p.to_string(),
+                    json!({
+                        "Email": email
+                    }),
+                );
             } else {
                 providers2.insert(p.to_string(), Value::Null);
             }
@@ -580,9 +615,12 @@ async fn invalid_two_factor_response(
         if p == two_factor::TWO_FACTOR_PROVIDER_EMAIL {
             response_providers.push(p.to_string());
             if let Some((ref email, _)) = email_2fa_data {
-                providers2.insert(p.to_string(), json!({
-                    "Email": email
-                }));
+                providers2.insert(
+                    p.to_string(),
+                    json!({
+                        "Email": email
+                    }),
+                );
             } else {
                 providers2.insert(p.to_string(), Value::Null);
             }
@@ -667,7 +705,8 @@ pub async fn token(
                     return Err(AppError::Unauthorized("Invalid credentials".to_string()));
                 }
             };
-            let mut user: User = serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
+            let mut user: User =
+                serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
 
             // If this is an auth-request login (trusted device), skip master password check
             // and verify the auth-request access code instead.
@@ -749,7 +788,7 @@ pub async fn token(
                     .get("access_code_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                
+
                 let access_code = payload.access_code.as_deref().unwrap_or(&password_hash);
                 let candidate_hash = sha256_hex(access_code);
                 if !constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes()) {
@@ -762,7 +801,9 @@ pub async fn token(
                      WHERE id = ?2 AND user_id = ?3 AND authentication_date IS NULL",
                 )
                 .bind(&[
-                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true).into(),
+                    Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                        .into(),
                     auth_request_id.into(),
                     user.id.clone().into(),
                 ])?
@@ -782,7 +823,9 @@ pub async fn token(
                 let device_name = payload.device_name.clone();
                 let device_type = payload.device_type;
 
-                let response = generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
+                let response =
+                    generate_tokens_and_response(user, &state, device_identifier.clone(), None)
+                        .await?;
 
                 if let Some(device_id) = device_identifier {
                     update_device_background(
@@ -853,13 +896,16 @@ pub async fn token(
             }
 
             // KDF 升级（参照 vaultwarden 实现）
-            if let Err(e) = crate::handlers::accounts::kdf_upgrade(&db, &mut user, &password_hash).await {
+            if let Err(e) =
+                crate::handlers::accounts::kdf_upgrade(&db, &mut user, &password_hash).await
+            {
                 log::warn!(target: targets::AUTH, "KDF upgrade failed for user {}: {:?}", user.id, e);
             }
 
             let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user.id).await?;
             let email_2fa_enabled = two_factor::is_email_2fa_enabled(&db, &user.id).await?;
-            let email_2fa_usable = email_2fa_enabled && notify::is_email_webhook_configured(&state.env);
+            let email_2fa_usable =
+                email_2fa_enabled && notify::is_email_webhook_configured(&state.env);
             let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &user.id).await?;
             let webauthn_usable = webauthn_enabled && webauthn::is_webauthn_2fa_supported(&headers);
             let two_factor_enabled = authenticator_enabled || email_2fa_enabled || webauthn_enabled;
@@ -881,7 +927,7 @@ pub async fn token(
             }
             // 注意：Recovery Code (type=8) 不在这里添加，因为它不是常规的2FA方式
             // 它只在登录验证时作为一种特殊的恢复选项处理
-            
+
             let mut remember_token_to_return: Option<String> = None;
             if two_factor_enabled {
                 let wants_remember = payload.two_factor_remember.unwrap_or(0) == 1;
@@ -890,48 +936,93 @@ pub async fn token(
 
                 if provider.is_none() && token.is_none() {
                     let Some(device_identifier) = payload.device_identifier.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
                     let cookie_token = get_cookie(&headers, "twoFactorRemember")
                         .or_else(|| get_cookie(&headers, "TwoFactorRemember"));
                     let Some(cookie_token) = cookie_token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
-                    let valid = verify_remember_token_async(cookie_token.trim(), device_identifier, &user.id, &state).await?;
+                    let valid = verify_remember_token_async(
+                        cookie_token.trim(),
+                        device_identifier,
+                        &user.id,
+                        &state,
+                    )
+                    .await?;
                     if !valid {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token_async(
-                            payload.device_identifier.as_deref().unwrap(),
-                            &user.id,
-                            &state,
-                        ).await?);
+                        remember_token_to_return = Some(
+                            generate_remember_token_async(
+                                payload.device_identifier.as_deref().unwrap(),
+                                &user.id,
+                                &state,
+                            )
+                            .await?,
+                        );
                     }
                 } else if provider == Some(5) {
                     let Some(device_identifier) = payload.device_identifier.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
                     let Some(token) = token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
-                    let valid = verify_remember_token_async(token.trim(), device_identifier, &user.id, &state).await?;
+                    let valid = verify_remember_token_async(
+                        token.trim(),
+                        device_identifier,
+                        &user.id,
+                        &state,
+                    )
+                    .await?;
                     if !valid {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     }
-                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR) && authenticator_enabled {
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR)
+                    && authenticator_enabled
+                {
                     let Some(token) = token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
                     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &user.id)
@@ -958,20 +1049,32 @@ pub async fn token(
                                 ..Default::default()
                             },
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token_async(
-                            payload.device_identifier.as_deref().unwrap(),
-                            &user.id,
-                            &state,
-                        ).await?);
+                        remember_token_to_return = Some(
+                            generate_remember_token_async(
+                                payload.device_identifier.as_deref().unwrap(),
+                                &user.id,
+                                &state,
+                            )
+                            .await?,
+                        );
                     }
-                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) && email_2fa_usable {
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL)
+                    && email_2fa_usable
+                {
                     let Some(token) = token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
                     let (_, data) = two_factor::get_email_2fa(&db, &user.id)
@@ -985,7 +1088,10 @@ pub async fn token(
                             "email 2fa login failed: no token available user_id={}",
                             user.id
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     };
 
                     // 首先验证token是否匹配（常量时间比较）
@@ -1004,7 +1110,8 @@ pub async fn token(
                             true,
                             &email_data.to_json(),
                             &now,
-                        ).await;
+                        )
+                        .await;
 
                         log::warn!(
                             target: targets::AUTH,
@@ -1028,7 +1135,10 @@ pub async fn token(
                                 ..Default::default()
                             },
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     }
 
                     // token验证成功，先重置token
@@ -1041,7 +1151,8 @@ pub async fn token(
                         true,
                         &email_data.to_json(),
                         &now,
-                    ).await?;
+                    )
+                    .await?;
 
                     // 最后检查token是否过期（参考vaultwarden实现）
                     if two_factor::is_token_expired(email_data.token_sent, 600) {
@@ -1050,7 +1161,10 @@ pub async fn token(
                             "email 2fa login failed: token expired user_id={}",
                             user.id
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     }
 
                     log::info!(
@@ -1060,20 +1174,28 @@ pub async fn token(
                     );
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token_async(
-                            payload.device_identifier.as_deref().unwrap(),
-                            &user.id,
-                            &state,
-                        ).await?);
+                        remember_token_to_return = Some(
+                            generate_remember_token_async(
+                                payload.device_identifier.as_deref().unwrap(),
+                                &user.id,
+                                &state,
+                            )
+                            .await?,
+                        );
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_RECOVERY_CODE) {
                     let Some(token) = token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
                     // 验证恢复码
-                    let recovery_valid = two_factor::verify_recovery_code(&db, &user.id, token).await?;
+                    let recovery_valid =
+                        two_factor::verify_recovery_code(&db, &user.id, token).await?;
                     if !recovery_valid {
                         log::warn!(
                             target: targets::AUTH,
@@ -1096,7 +1218,10 @@ pub async fn token(
                                 ..Default::default()
                             },
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     }
 
                     // 恢复码验证成功，删除所有2FA并清除恢复码
@@ -1124,13 +1249,27 @@ pub async fn token(
                             ..Default::default()
                         },
                     );
-                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN) && webauthn_usable {
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_WEBAUTHN)
+                    && webauthn_usable
+                {
                     let Some(token) = token.as_deref() else {
-                        let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                        return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                        let email_data =
+                            get_email_2fa_display_info(&providers, &user.id, &state).await;
+                        return Ok(two_factor_required_response(
+                            &providers, &user.id, email_data, &headers, &db,
+                        )
+                        .await);
                     };
 
-                    if webauthn::verify_login_assertion(&db, &user.id, token, webauthn::WEBAUTHN_USE_2FA).await.is_err() {
+                    if webauthn::verify_login_assertion(
+                        &db,
+                        &user.id,
+                        token,
+                        webauthn::WEBAUTHN_USE_2FA,
+                    )
+                    .await
+                    .is_err()
+                    {
                         notify::notify_background(
                             &state.ctx,
                             state.env.clone(),
@@ -1146,19 +1285,28 @@ pub async fn token(
                                 ..Default::default()
                             },
                         );
-                        return Ok(invalid_two_factor_response(&providers, &user.id, &headers, &state, &db).await);
+                        return Ok(invalid_two_factor_response(
+                            &providers, &user.id, &headers, &state, &db,
+                        )
+                        .await);
                     }
 
                     if wants_remember && payload.device_identifier.is_some() {
-                        remember_token_to_return = Some(generate_remember_token_async(
-                            payload.device_identifier.as_deref().unwrap(),
-                            &user.id,
-                            &state,
-                        ).await?);
+                        remember_token_to_return = Some(
+                            generate_remember_token_async(
+                                payload.device_identifier.as_deref().unwrap(),
+                                &user.id,
+                                &state,
+                            )
+                            .await?,
+                        );
                     }
                 } else {
                     let email_data = get_email_2fa_display_info(&providers, &user.id, &state).await;
-                    return Ok(two_factor_required_response(&providers, &user.id, email_data, &headers, &db).await);
+                    return Ok(two_factor_required_response(
+                        &providers, &user.id, email_data, &headers, &db,
+                    )
+                    .await);
                 }
             }
 
@@ -1177,7 +1325,8 @@ pub async fn token(
                 payload.two_factor_remember
             );
 
-            let mut response = generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
+            let mut response =
+                generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
             let remember_token_to_set = remember_token_to_return.clone();
 
             // 后台异步更新设备信息，减少登录响应延迟
@@ -1283,7 +1432,8 @@ pub async fn token(
                             "error": "invalid_grant",
                             "error_description": "Invalid refresh token"
                         })),
-                    ).into_response());
+                    )
+                        .into_response());
                 }
             };
 
@@ -1302,7 +1452,8 @@ pub async fn token(
                             "error": "invalid_grant",
                             "error_description": "Invalid user"
                         })),
-                    ).into_response());
+                    )
+                        .into_response());
                 }
             };
             let user: User = match serde_json::from_value(user) {
@@ -1314,7 +1465,8 @@ pub async fn token(
                             "error": "invalid_grant",
                             "error_description": "Invalid user"
                         })),
-                    ).into_response());
+                    )
+                        .into_response());
                 }
             };
 
@@ -1327,7 +1479,8 @@ pub async fn token(
                             "error": "invalid_grant",
                             "error_description": "Missing security stamp"
                         })),
-                    ).into_response());
+                    )
+                        .into_response());
                 }
             };
 
@@ -1338,10 +1491,17 @@ pub async fn token(
                         "error": "invalid_grant",
                         "error_description": "Invalid security stamp"
                     })),
-                ).into_response());
+                )
+                    .into_response());
             }
 
-            let response = generate_tokens_and_response(user.clone(), &state, payload.device_identifier.clone(), None).await?;
+            let response = generate_tokens_and_response(
+                user.clone(),
+                &state,
+                payload.device_identifier.clone(),
+                None,
+            )
+            .await?;
             let mut resp = Json(response.clone()).into_response();
             if let Some(v) = response.get("access_token").and_then(|v| v.as_str()) {
                 set_cookie(
@@ -1463,7 +1623,13 @@ pub async fn token(
             );
 
             let user_email = user.email.clone();
-            let response = generate_tokens_and_response(user, &state, device_identifier.clone(), webauthn_prf_option.as_ref()).await?;
+            let response = generate_tokens_and_response(
+                user,
+                &state,
+                device_identifier.clone(),
+                webauthn_prf_option.as_ref(),
+            )
+            .await?;
 
             if let Some(device_identifier) = device_identifier.as_deref() {
                 ensure_devices_table(&db).await?;

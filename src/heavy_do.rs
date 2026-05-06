@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use tower_http::cors::{Any, CorsLayer};
 use tower_service::Service;
-use worker::{durable_object, DurableObject, Env, HttpRequest, Request, Response, Result, State};
+use worker::{DurableObject, Env, HttpRequest, Request, Response, Result, State, durable_object};
 
 pub struct HeavyDoState {
     router: axum::Router,
@@ -68,24 +68,35 @@ impl HeavyDo {
             return Ok(state);
         }
 
-        let db = self.env.d1("vaultsql")
+        let db = self
+            .env
+            .d1("vaultsql")
             .map_err(|e| worker::Error::RustError(format!("Failed to get database: {}", e)))?;
-        
-        let jwt_keys = crate::jwt_manager::JwtKeyManager::get_or_create_keys(&db).await
-            .map_err(|e| worker::Error::RustError(format!("Failed to initialize JWT keys: {}", e)))?;
-        
-        let two_factor_key = crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(&db).await
-            .map_err(|e| worker::Error::RustError(format!("Failed to initialize two-factor key: {}", e)))?;
+
+        let jwt_keys = crate::jwt_manager::JwtKeyManager::get_or_create_keys(&db)
+            .await
+            .map_err(|e| {
+                worker::Error::RustError(format!("Failed to initialize JWT keys: {}", e))
+            })?;
+
+        let two_factor_key =
+            crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(&db)
+                .await
+                .map_err(|e| {
+                    worker::Error::RustError(format!("Failed to initialize two-factor key: {}", e))
+                })?;
 
         let cors = CorsLayer::new()
             .allow_methods(Any)
             .allow_headers(Any)
             .allow_origin(Any);
-        
-        let router = crate::router::api_router_with_keys(self.env.clone(), None, jwt_keys, two_factor_key).layer(cors);
+
+        let router =
+            crate::router::api_router_with_keys(self.env.clone(), None, jwt_keys, two_factor_key)
+                .layer(cors);
 
         let state = HeavyDoState { router };
-        
+
         let _ = self.initialized.set(state);
 
         Ok(self.initialized.get().unwrap())

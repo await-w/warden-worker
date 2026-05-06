@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::RwLock;
 use worker::{D1Database, Fetch, Method, Request};
 
@@ -10,7 +10,8 @@ use crate::logging::targets;
 const GLOBAL_DOMAINS_URL: &str =
     "https://raw.githubusercontent.com/dani-garcia/vaultwarden/main/src/static/global_domains.json";
 
-static GLOBAL_DOMAINS_CACHE: Lazy<RwLock<Vec<GlobalDomain>>> = Lazy::new(|| RwLock::new(Vec::new()));
+static GLOBAL_DOMAINS_CACHE: Lazy<RwLock<Vec<GlobalDomain>>> =
+    Lazy::new(|| RwLock::new(Vec::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalDomain {
@@ -41,7 +42,8 @@ pub async fn build_domains_object(
 
     let equivalent_domains: Vec<Vec<String>> =
         serde_json::from_str(&row.equivalent_domains).unwrap_or_default();
-    let excluded_globals: Vec<i32> = serde_json::from_str(&row.excluded_globals).unwrap_or_default();
+    let excluded_globals: Vec<i32> =
+        serde_json::from_str(&row.excluded_globals).unwrap_or_default();
 
     let mut global_domains = get_global_domains().await;
     for g in &mut global_domains {
@@ -65,8 +67,10 @@ pub async fn update_domains_settings(
     excluded_globals: Vec<i32>,
     now: &str,
 ) -> Result<(), AppError> {
-    let equivalent_domains = serde_json::to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
-    let excluded_globals = serde_json::to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
+    let equivalent_domains =
+        serde_json::to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
+    let excluded_globals =
+        serde_json::to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
 
     db.prepare(
         "UPDATE users SET equivalent_domains = ?1, excluded_globals = ?2, updated_at = ?3 WHERE id = ?4",

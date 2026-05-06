@@ -1,11 +1,11 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use data_encoding::BASE32;
 use js_sys::Date;
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
 use worker::D1Database;
@@ -464,11 +464,15 @@ pub async fn get_email_2fa(
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     match result {
         Some(row) => {
             let enabled = row.get("enabled").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            let data = row.get("data").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+            let data = row
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}")
+                .to_string();
             Ok(Some((enabled, data)))
         }
         None => Ok(None),
@@ -527,14 +531,21 @@ pub async fn get_email_2fa_verification(
     ensure_two_factor_email_table(db).await?;
     let result: Option<serde_json::Value> = db
         .prepare("SELECT data FROM two_factor_email WHERE user_id = ?1 AND atype = ?2")
-        .bind(&[user_id.into(), TWO_FACTOR_TYPE_EMAIL_VERIFICATION_CHALLENGE.into()])?
+        .bind(&[
+            user_id.into(),
+            TWO_FACTOR_TYPE_EMAIL_VERIFICATION_CHALLENGE.into(),
+        ])?
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     match result {
         Some(row) => {
-            let data = row.get("data").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+            let data = row
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}")
+                .to_string();
             Ok(Some(data))
         }
         None => Ok(None),
@@ -552,60 +563,65 @@ pub fn generate_recovery_code() -> String {
     BASE32.encode(&bytes)
 }
 
-pub async fn get_or_create_recovery_code(db: &D1Database, user_id: &str) -> Result<String, AppError> {
+pub async fn get_or_create_recovery_code(
+    db: &D1Database,
+    user_id: &str,
+) -> Result<String, AppError> {
     let existing: Option<String> = db
         .prepare("SELECT totp_recover FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
         .first(Some("totp_recover"))
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     if let Some(code) = existing {
         if !code.is_empty() {
             return Ok(code);
         }
     }
-    
+
     let new_code = generate_recovery_code();
     let now = Utc::now().to_rfc3339();
-    
+
     db.prepare("UPDATE users SET totp_recover = ?1, updated_at = ?2 WHERE id = ?3")
         .bind(&[new_code.clone().into(), now.into(), user_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     Ok(new_code)
 }
 
-pub async fn verify_recovery_code(db: &D1Database, user_id: &str, code: &str) -> Result<bool, AppError> {
+pub async fn verify_recovery_code(
+    db: &D1Database,
+    user_id: &str,
+    code: &str,
+) -> Result<bool, AppError> {
     let stored: Option<String> = db
         .prepare("SELECT totp_recover FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
         .first(Some("totp_recover"))
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     match stored {
-        Some(stored_code) if !stored_code.is_empty() => {
-            Ok(constant_time_eq::constant_time_eq(
-                code.to_lowercase().as_bytes(),
-                stored_code.to_lowercase().as_bytes(),
-            ))
-        }
+        Some(stored_code) if !stored_code.is_empty() => Ok(constant_time_eq::constant_time_eq(
+            code.to_lowercase().as_bytes(),
+            stored_code.to_lowercase().as_bytes(),
+        )),
         _ => Ok(false),
     }
 }
 
 pub async fn clear_recovery_code(db: &D1Database, user_id: &str) -> Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
-    
+
     db.prepare("UPDATE users SET totp_recover = NULL, updated_at = ?1 WHERE id = ?2")
         .bind(&[now.into(), user_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
-    
+
     Ok(())
 }
 

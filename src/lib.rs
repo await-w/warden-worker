@@ -14,8 +14,8 @@ mod jwt;
 mod jwt_manager;
 mod logging;
 mod models;
-mod notify;
 mod notifications;
+mod notify;
 mod router;
 mod two_factor;
 mod two_factor_key_manager;
@@ -38,13 +38,19 @@ pub async fn main(
         return Ok(worker_resp.into());
     }
 
-    let db = env.d1("vaultsql").map_err(|e| worker::Error::RustError(format!("Failed to get database: {}", e)))?;
-    
-    let jwt_keys = jwt_manager::JwtKeyManager::get_or_create_keys(&db).await
+    let db = env
+        .d1("vaultsql")
+        .map_err(|e| worker::Error::RustError(format!("Failed to get database: {}", e)))?;
+
+    let jwt_keys = jwt_manager::JwtKeyManager::get_or_create_keys(&db)
+        .await
         .map_err(|e| worker::Error::RustError(format!("Failed to initialize JWT keys: {}", e)))?;
-    
-    let two_factor_key = two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(&db).await
-        .map_err(|e| worker::Error::RustError(format!("Failed to initialize two-factor key: {}", e)))?;
+
+    let two_factor_key = two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(&db)
+        .await
+        .map_err(|e| {
+            worker::Error::RustError(format!("Failed to initialize two-factor key: {}", e))
+        })?;
 
     let (city, region, country) = {
         if let Some(cf) = req.cf() {
@@ -54,7 +60,9 @@ pub async fn main(
         }
     };
 
-    let mut http_req: HttpRequest = req.try_into().map_err(|e| worker::Error::RustError(format!("Failed to convert request: {}", e)))?;
+    let mut http_req: HttpRequest = req
+        .try_into()
+        .map_err(|e| worker::Error::RustError(format!("Failed to convert request: {}", e)))?;
 
     let mut inject = |k: &'static str, v: Option<String>| {
         if let Some(v) = v {
@@ -72,7 +80,8 @@ pub async fn main(
         .allow_headers(Any)
         .allow_origin(Any);
 
-    let mut app = router::api_router_with_keys(env, Some(ctx), jwt_keys, two_factor_key).layer(cors);
+    let mut app =
+        router::api_router_with_keys(env, Some(ctx), jwt_keys, two_factor_key).layer(cors);
 
     Ok(Service::call(&mut app, http_req).await?)
 }

@@ -83,7 +83,7 @@ pub struct RegisterRequest {
 // Claims for email verification token
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterVerifyClaims {
-    pub sub: String,  // email
+    pub sub: String, // email
     pub name: Option<String>,
     pub exp: usize,
 }

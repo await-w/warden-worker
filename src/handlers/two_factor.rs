@@ -1,5 +1,5 @@
-use axum::{extract::State, Json};
 use axum::http::HeaderMap;
+use axum::{Json, extract::State};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use serde::Deserialize;
@@ -57,15 +57,29 @@ impl PasswordOrOtpData {
                     return Err(AppError::NotFound("User not found".to_string()));
                 };
 
-                let stored_hash = row.get("master_password_hash")
+                let stored_hash = row
+                    .get("master_password_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let password_salt = row.get("password_salt")
-                    .and_then(|v| v.as_str());
-                let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
-                let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
-                let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
-                let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let password_salt = row.get("password_salt").and_then(|v| v.as_str());
+                let kdf_type: i32 = row
+                    .get("kdf_type")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(0);
+                let kdf_iterations: i32 = row
+                    .get("kdf_iterations")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(600_000);
+                let kdf_memory: Option<i32> = row
+                    .get("kdf_memory")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                let kdf_parallelism: Option<i32> = row
+                    .get("kdf_parallelism")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
 
                 // 调试日志：记录哈希长度（不记录实际哈希值）
                 log::debug!(
@@ -162,14 +176,14 @@ pub async fn two_factor_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    
+
     let mut providers: Vec<i32> = Vec::new();
-    
+
     let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
     if authenticator_enabled {
         providers.push(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR);
     }
-    
+
     let email_enabled = two_factor::is_email_2fa_enabled(&db, &claims.sub).await?;
     if email_enabled {
         if notify::is_email_webhook_configured(&state.env) {
@@ -181,9 +195,9 @@ pub async fn two_factor_status(
     if webauthn_enabled && webauthn::is_webauthn_2fa_supported(&headers) {
         providers.push(webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN);
     }
-    
+
     let enabled = !providers.is_empty();
-    
+
     Ok(Json(json!({
         "enabled": enabled,
         "providers": providers
@@ -208,15 +222,13 @@ pub async fn authenticator_request(
     let user_email = user_email.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let secret_encoded = two_factor::generate_totp_secret_base32_20();
-    let secret_enc = two_factor::encrypt_secret_with_db_key(
-        &db,
-        &claims.sub,
-        &secret_encoded,
-    ).await?;
+    let secret_enc =
+        two_factor::encrypt_secret_with_db_key(&db, &claims.sub, &secret_encoded).await?;
 
     two_factor::upsert_authenticator_secret(&db, &claims.sub, secret_enc, false, &now).await?;
 
-    let issuer = state.env
+    let issuer = state
+        .env
         .var("TWO_FACTOR_ISSUER")
         .ok()
         .map(|v| v.to_string())
@@ -358,7 +370,10 @@ pub async fn disable_authenticator_vw(
     let Some(stored_hash) = stored_hash else {
         return Err(AppError::NotFound("User not found".to_string()));
     };
-    if !constant_time_eq(stored_hash.as_bytes(), payload.master_password_hash.as_bytes()) {
+    if !constant_time_eq(
+        stored_hash.as_bytes(),
+        payload.master_password_hash.as_bytes(),
+    ) {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
@@ -376,7 +391,9 @@ pub async fn disable_authenticator_vw(
 
     let type_ = match payload.r#type {
         NumberOrString::Number(n) => n as i32,
-        NumberOrString::String(s) => s.parse::<i32>().unwrap_or(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR),
+        NumberOrString::String(s) => s
+            .parse::<i32>()
+            .unwrap_or(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR),
     };
 
     let meta = notify::extract_request_meta(&headers);
@@ -459,11 +476,8 @@ pub async fn authenticator_disable(
     let secret_enc = two_factor::get_authenticator_secret_enc(&db, &claims.sub)
         .await?
         .ok_or_else(|| AppError::BadRequest("Authenticator not enabled".to_string()))?;
-    let secret_encoded = two_factor::decrypt_secret_with_key(
-        &state.two_factor_key,
-        &claims.sub,
-        &secret_enc,
-    )?;
+    let secret_encoded =
+        two_factor::decrypt_secret_with_key(&state.two_factor_key, &claims.sub, &secret_enc)?;
     if !two_factor::verify_totp_code(&secret_encoded, &payload.code)? {
         return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
     }
@@ -605,7 +619,9 @@ pub async fn send_email(
             "send_email_2fa failed: webhook not configured user_id={}",
             claims.sub
         );
-        return Err(AppError::BadRequest("Email 2FA is not configured on server".to_string()));
+        return Err(AppError::BadRequest(
+            "Email 2FA is not configured on server".to_string(),
+        ));
     }
 
     let now = Utc::now().to_rfc3339();
@@ -768,7 +784,9 @@ pub async fn send_email_login(
             target: targets::AUTH,
             "send_email_login failed: webhook not configured"
         );
-        return Err(AppError::BadRequest("Email 2FA is not configured on server".to_string()));
+        return Err(AppError::BadRequest(
+            "Email 2FA is not configured on server".to_string(),
+        ));
     }
 
     let db = db::get_db(&state.env)?;
@@ -786,16 +804,39 @@ pub async fn send_email_login(
             .map_err(|_| AppError::Database)?;
 
         let Some(row) = result else {
-            return Err(AppError::Unauthorized("Username or password is incorrect".to_string()));
+            return Err(AppError::Unauthorized(
+                "Username or password is incorrect".to_string(),
+            ));
         };
 
-        let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let stored_hash = row.get("master_password_hash").and_then(|v| v.as_str()).unwrap_or("");
+        let user_id = row
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let stored_hash = row
+            .get("master_password_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-        let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
-        let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
-        let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
-        let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
+        let kdf_type: i32 = row
+            .get("kdf_type")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(0);
+        let kdf_iterations: i32 = row
+            .get("kdf_iterations")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(600_000);
+        let kdf_memory: Option<i32> = row
+            .get("kdf_memory")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let kdf_parallelism: Option<i32> = row
+            .get("kdf_parallelism")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
 
         if let Some(master_password_hash) = &payload.master_password_hash {
             let password_valid = if let Some(salt) = password_salt {
@@ -814,7 +855,9 @@ pub async fn send_email_login(
             };
 
             if !password_valid {
-                return Err(AppError::Unauthorized("Username or password is incorrect".to_string()));
+                return Err(AppError::Unauthorized(
+                    "Username or password is incorrect".to_string(),
+                ));
             }
         }
 
@@ -827,13 +870,18 @@ pub async fn send_email_login(
             .await
             .map_err(|_| AppError::Database)?;
 
-        result.and_then(|r| r.get("user_id").and_then(|v| v.as_str().map(|s| s.to_string())))
+        result.and_then(|r| {
+            r.get("user_id")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
     } else {
         None
     };
 
     let Some(user_id) = user_id else {
-        return Err(AppError::Unauthorized("Username or password is incorrect".to_string()));
+        return Err(AppError::Unauthorized(
+            "Username or password is incorrect".to_string(),
+        ));
     };
 
     let (enabled, data) = match two_factor::get_email_2fa(&db, &user_id).await? {
@@ -960,7 +1008,9 @@ pub async fn disable_twofactor(
     // 解析类型
     let type_ = match payload.r#type {
         NumberOrString::Number(n) => n as i32,
-        NumberOrString::String(s) => s.parse::<i32>().unwrap_or(two_factor::TWO_FACTOR_PROVIDER_EMAIL),
+        NumberOrString::String(s) => s
+            .parse::<i32>()
+            .unwrap_or(two_factor::TWO_FACTOR_PROVIDER_EMAIL),
     };
 
     log::info!(
@@ -1003,7 +1053,10 @@ pub async fn disable_twofactor(
                 claims.sub,
                 type_
             );
-            return Err(AppError::BadRequest(format!("Unknown two factor type: {}", type_)));
+            return Err(AppError::BadRequest(format!(
+                "Unknown two factor type: {}",
+                type_
+            )));
         }
     }
 
@@ -1125,16 +1178,39 @@ pub async fn recover(
             "recover failed: user not found email={}",
             payload.email
         );
-        return Err(AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()));
+        return Err(AppError::Unauthorized(
+            "Username or password is incorrect. Try again.".to_string(),
+        ));
     };
 
-    let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let stored_hash = row.get("master_password_hash").and_then(|v| v.as_str()).unwrap_or("");
+    let user_id = row
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stored_hash = row
+        .get("master_password_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-    let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
-    let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
-    let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
-    let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let kdf_type: i32 = row
+        .get("kdf_type")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(0);
+    let kdf_iterations: i32 = row
+        .get("kdf_iterations")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(600_000);
+    let kdf_memory: Option<i32> = row
+        .get("kdf_memory")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let kdf_parallelism: Option<i32> = row
+        .get("kdf_parallelism")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
 
     let password_valid = if let Some(salt) = password_salt {
         crate::crypto::verify_password(
@@ -1148,7 +1224,10 @@ pub async fn recover(
         )
         .await
     } else {
-        constant_time_eq::constant_time_eq(stored_hash.as_bytes(), payload.master_password_hash.as_bytes())
+        constant_time_eq::constant_time_eq(
+            stored_hash.as_bytes(),
+            payload.master_password_hash.as_bytes(),
+        )
     };
 
     if !password_valid {
@@ -1157,17 +1236,22 @@ pub async fn recover(
             "recover failed: password mismatch email={}",
             payload.email
         );
-        return Err(AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()));
+        return Err(AppError::Unauthorized(
+            "Username or password is incorrect. Try again.".to_string(),
+        ));
     }
 
-    let recovery_valid = two_factor::verify_recovery_code(&db, &user_id, &payload.recovery_code).await?;
+    let recovery_valid =
+        two_factor::verify_recovery_code(&db, &user_id, &payload.recovery_code).await?;
     if !recovery_valid {
         log::warn!(
             target: targets::AUTH,
             "recover failed: invalid recovery code email={}",
             payload.email
         );
-        return Err(AppError::BadRequest("Recovery code is incorrect. Try again.".to_string()));
+        return Err(AppError::BadRequest(
+            "Recovery code is incorrect. Try again.".to_string(),
+        ));
     }
 
     two_factor::delete_all_two_factors(&db, &user_id).await?;

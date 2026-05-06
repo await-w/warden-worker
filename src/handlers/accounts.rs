@@ -1,18 +1,18 @@
-use axum::{extract::State, Json};
 use axum::http::{HeaderMap, StatusCode};
+use axum::{Json, extract::State};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use rand::Rng;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
-use worker::{query, Delay};
+use worker::{Delay, query};
 
 use crate::{
     auth::Claims,
-    crypto::{self, KDF_TYPE_PBKDF2, KDF_TYPE_ARGON2ID},
+    crypto::{self, KDF_TYPE_ARGON2ID, KDF_TYPE_PBKDF2},
     db,
     error::AppError,
     models::user::{KeyData, PreloginResponse, RegisterRequest, RegisterVerifyClaims, User},
@@ -46,9 +46,14 @@ fn validate_kdf(
 ) -> Result<(Option<i32>, Option<i32>), AppError> {
     crypto::validate_kdf_params(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)
         .map_err(|e| AppError::BadRequest(e))?;
-    
+
     // 返回标准化的参数
-    Ok(crypto::normalize_kdf_params(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism))
+    Ok(crypto::normalize_kdf_params(
+        kdf_type,
+        kdf_iterations,
+        kdf_memory,
+        kdf_parallelism,
+    ))
 }
 
 fn normalize_kdf_for_response(
@@ -80,7 +85,10 @@ pub struct AuthenticationData {
     pub salt: String,
     #[serde(alias = "Kdf")]
     pub kdf: KdfData,
-    #[serde(alias = "masterPasswordAuthenticationHash", alias = "MasterPasswordAuthenticationHash")]
+    #[serde(
+        alias = "masterPasswordAuthenticationHash",
+        alias = "MasterPasswordAuthenticationHash"
+    )]
     pub master_password_authentication_hash: String,
 }
 
@@ -102,7 +110,11 @@ pub struct ChangeKdfRequest {
     pub new_master_password_hash: String,
     #[serde(alias = "Key")]
     pub key: String,
-    #[serde(alias = "authenticationData", alias = "authentication_data", alias = "AuthenticationData")]
+    #[serde(
+        alias = "authenticationData",
+        alias = "authentication_data",
+        alias = "AuthenticationData"
+    )]
     pub authentication_data: AuthenticationData,
     #[serde(alias = "unlockData", alias = "unlock_data", alias = "UnlockData")]
     pub unlock_data: UnlockData,
@@ -192,15 +204,11 @@ pub async fn profile(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
     let two_factor_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
-    let user: User = query!(
-        &db,
-        "SELECT * FROM users WHERE id = ?1",
-        claims.sub
-    )
-    .map_err(|_| AppError::Database)?
-    .first(None)
-    .await?
-    .ok_or(AppError::NotFound("User not found".to_string()))?;
+    let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
+        .map_err(|_| AppError::Database)?
+        .first(None)
+        .await?
+        .ok_or(AppError::NotFound("User not found".to_string()))?;
 
     Ok(Json(json!({
         "id": user.id,
@@ -240,11 +248,7 @@ pub async fn post_profile(
     let now = Utc::now().to_rfc3339();
 
     db.prepare("UPDATE users SET name = ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[
-            name.into(),
-            now.into(),
-            claims.sub.clone().into(),
-        ])?
+        .bind(&[name.into(), now.into(), claims.sub.clone().into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
@@ -312,15 +316,11 @@ pub async fn post_security_stamp(
         .map_err(|_| AppError::Database)?;
 
     let two_factor_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
-    let user: User = query!(
-        &db,
-        "SELECT * FROM users WHERE id = ?1",
-        claims.sub
-    )
-    .map_err(|_| AppError::Database)?
-    .first(None)
-    .await?
-    .ok_or(AppError::NotFound("User not found".to_string()))?;
+    let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
+        .map_err(|_| AppError::Database)?
+        .first(None)
+        .await?
+        .ok_or(AppError::NotFound("User not found".to_string()))?;
 
     Ok(Json(json!({
         "id": user.id,
@@ -363,10 +363,7 @@ pub async fn prelogin(
         "SELECT kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE email = ?1",
     );
     let query = stmt.bind(&[email.into()])?;
-    let row: Option<Value> = query
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?;
+    let row: Option<Value> = query.first(None).await.map_err(|_| AppError::Database)?;
     let (kdf_type, kdf_iterations, kdf_memory, kdf_parallelism) = match row {
         Some(v) => {
             let kdf_type = v
@@ -387,7 +384,7 @@ pub async fn prelogin(
                 .and_then(|x| x.as_i64())
                 .map(|v| v as i32)
                 .or(Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
-            
+
             let kdf_name = match kdf_type {
                 crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
                 crypto::KDF_TYPE_ARGON2ID => "Argon2id",
@@ -415,7 +412,7 @@ pub async fn prelogin(
                 Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB),
                 Some(crypto::ARGON2ID_PARALLELISM_DEFAULT),
             )
-        },
+        }
     };
 
     let (kdf_memory, kdf_parallelism) =
@@ -435,12 +432,17 @@ pub async fn register(
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<Value>, AppError> {
     // Debug log
-    log::info!("Register payload: name={:?}, email={}", payload.name, payload.email);
-    
+    log::info!(
+        "Register payload: name={:?}, email={}",
+        payload.name,
+        payload.email
+    );
+
     let db = db::get_db(&state.env)?;
-    
+
     // Check if email is in ALLOWED_EMAILS list
-    let allowed_emails = state.env
+    let allowed_emails = state
+        .env
         .secret("ALLOWED_EMAILS")
         .map_err(|_| AppError::Internal)?;
     let allowed_emails = allowed_emails
@@ -458,7 +460,7 @@ pub async fn register(
 
     let jwt_keys = state.jwt_keys.clone();
     let name_from_token = if let Some(token) = payload.email_verification_token.as_ref() {
-        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use jsonwebtoken::{DecodingKey, Validation, decode};
         let decoding_key = DecodingKey::from_secret(jwt_keys.access_secret.as_ref());
         match decode::<RegisterVerifyClaims>(token, &decoding_key, &Validation::default()) {
             Ok(token_data) if token_data.claims.sub == email => {
@@ -563,7 +565,9 @@ pub async fn change_master_password(
     Json(payload): Json<ChangeMasterPasswordRequest>,
 ) -> Result<Json<Value>, AppError> {
     if payload.master_password_hash.is_empty() || payload.new_master_password_hash.is_empty() {
-        return Err(AppError::BadRequest("Missing masterPasswordHash".to_string()));
+        return Err(AppError::BadRequest(
+            "Missing masterPasswordHash".to_string(),
+        ));
     }
     if payload.user_symmetric_key.is_empty() {
         return Err(AppError::BadRequest("Missing userSymmetricKey".to_string()));
@@ -594,7 +598,10 @@ pub async fn change_master_password(
         .await
     } else {
         // 旧格式：直接比较哈希值
-        constant_time_eq(user.master_password_hash.as_bytes(), payload.master_password_hash.as_bytes())
+        constant_time_eq(
+            user.master_password_hash.as_bytes(),
+            payload.master_password_hash.as_bytes(),
+        )
     };
 
     if !password_valid {
@@ -678,7 +685,9 @@ pub async fn change_email(
     Json(payload): Json<ChangeEmailRequest>,
 ) -> Result<Json<Value>, AppError> {
     if payload.master_password_hash.is_empty() || payload.new_master_password_hash.is_empty() {
-        return Err(AppError::BadRequest("Missing masterPasswordHash".to_string()));
+        return Err(AppError::BadRequest(
+            "Missing masterPasswordHash".to_string(),
+        ));
     }
     if payload.new_email.trim().is_empty() {
         return Err(AppError::BadRequest("Missing newEmail".to_string()));
@@ -821,15 +830,24 @@ pub async fn post_kdf(
         )
         .await
     } else {
-        constant_time_eq(user.master_password_hash.as_bytes(), provided_old_hash.as_bytes())
+        constant_time_eq(
+            user.master_password_hash.as_bytes(),
+            provided_old_hash.as_bytes(),
+        )
     };
 
     if !password_valid {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    let (new_master_password_hash, key, kdf_type, kdf_iterations, kdf_memory_in, kdf_parallelism_in) =
-        match &payload {
+    let (
+        new_master_password_hash,
+        key,
+        kdf_type,
+        kdf_iterations,
+        kdf_memory_in,
+        kdf_parallelism_in,
+    ) = match &payload {
         ChangeKdfPayload::Vw(p) => {
             let _ = (
                 &p.authentication_data.master_password_authentication_hash,
@@ -845,7 +863,9 @@ pub async fn post_kdf(
             if !user.email.eq_ignore_ascii_case(&p.authentication_data.salt)
                 || !user.email.eq_ignore_ascii_case(&p.unlock_data.salt)
             {
-                return Err(AppError::BadRequest("Invalid master password salt".to_string()));
+                return Err(AppError::BadRequest(
+                    "Invalid master password salt".to_string(),
+                ));
             }
 
             (
@@ -857,16 +877,14 @@ pub async fn post_kdf(
                 p.unlock_data.kdf.kdf_parallelism,
             )
         }
-        ChangeKdfPayload::Flat(p) => {
-            (
-                &p.new_master_password_hash,
-                &p.key,
-                p.kdf,
-                p.kdf_iterations,
-                p.kdf_memory,
-                p.kdf_parallelism,
-            )
-        }
+        ChangeKdfPayload::Flat(p) => (
+            &p.new_master_password_hash,
+            &p.key,
+            p.kdf,
+            p.kdf_iterations,
+            p.kdf_memory,
+            p.kdf_parallelism,
+        ),
     };
 
     let (kdf_memory, kdf_parallelism) =
@@ -1046,7 +1064,11 @@ pub async fn request_otp(
         .await
         .map_err(|_| AppError::Database)?;
     let email = user_row
-        .and_then(|r| r.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .and_then(|r| {
+            r.get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let token = two_factor::generate_email_token(PROTECTED_ACTION_OTP_SIZE);
@@ -1109,10 +1131,24 @@ pub async fn verify_password(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-    let kdf_type: i32 = row.get("kdf_type").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(0);
-    let kdf_iterations: i32 = row.get("kdf_iterations").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(600_000);
-    let kdf_memory: Option<i32> = row.get("kdf_memory").and_then(|v| v.as_i64()).map(|v| v as i32);
-    let kdf_parallelism: Option<i32> = row.get("kdf_parallelism").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let kdf_type: i32 = row
+        .get("kdf_type")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(0);
+    let kdf_iterations: i32 = row
+        .get("kdf_iterations")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(600_000);
+    let kdf_memory: Option<i32> = row
+        .get("kdf_memory")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let kdf_parallelism: Option<i32> = row
+        .get("kdf_parallelism")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
 
     let valid = if let Some(salt) = password_salt {
         crypto::verify_password(
@@ -1126,7 +1162,10 @@ pub async fn verify_password(
         )
         .await
     } else {
-        constant_time_eq(stored_hash.as_bytes(), payload.master_password_hash.as_bytes())
+        constant_time_eq(
+            stored_hash.as_bytes(),
+            payload.master_password_hash.as_bytes(),
+        )
     };
 
     if !valid {
@@ -1141,11 +1180,15 @@ pub async fn send_verification_email(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SendVerificationEmailRequest>,
 ) -> Result<Json<Value>, AppError> {
-    use chrono::{Duration, Utc};
-    use jsonwebtoken::{encode, EncodingKey, Header};
     use crate::models::user::RegisterVerifyClaims;
+    use chrono::{Duration, Utc};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
-    log::info!("Send verification email: name={:?}, email={}", payload.name, payload.email);
+    log::info!(
+        "Send verification email: name={:?}, email={}",
+        payload.name,
+        payload.email
+    );
 
     let jwt_keys = state.jwt_keys.clone();
 
@@ -1163,7 +1206,8 @@ pub async fn send_verification_email(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(jwt_keys.access_secret.as_ref()),
-    ).map_err(|_| AppError::Internal)?;
+    )
+    .map_err(|_| AppError::Internal)?;
 
     // Return token as JSON to skip email verification
     // This makes the client go directly to password entry instead of "check your email" screen
@@ -1191,7 +1235,7 @@ pub async fn kdf_upgrade(
         user.kdf_memory,
         user.kdf_parallelism
     );
-    
+
     let needs_upgrade = match user.kdf_type {
         KDF_TYPE_PBKDF2 => user.kdf_iterations < crypto::PBKDF2_ITERATIONS_DEFAULT,
         KDF_TYPE_ARGON2ID => {
@@ -1206,7 +1250,7 @@ pub async fn kdf_upgrade(
         log::info!("[KDF] kdf_upgrade: no upgrade needed for user {}", user.id);
         return Ok(());
     }
-    
+
     log::info!(
         "[KDF] kdf_upgrade: upgrading KDF for user {} from {} to recommended values",
         user.id,

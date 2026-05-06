@@ -5,13 +5,8 @@ fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Optio
 where
     D: Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?.and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }))
+    Ok(Option::<String>::deserialize(deserializer)?
+        .and_then(|s| if s.is_empty() { None } else { Some(s) }))
 }
 
 #[derive(Deserialize, Debug)]
@@ -34,9 +29,10 @@ pub struct ImportCipher {
     pub reprompt: Option<i32>,
     #[serde(rename = "lastKnownRevisionDate")]
     pub _last_known_revision_date: Option<String>,
+    #[serde(default)]
+    pub archived_date: Option<String>,
     pub encrypted_for: String,
 }
-
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +78,7 @@ mod tests {
             "passwordHistory": null,
             "reprompt": null,
             "lastKnownRevisionDate": null,
+            "archivedDate": null,
             "encryptedFor": ""
         });
 
