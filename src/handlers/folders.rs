@@ -1,5 +1,6 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 use worker::query;
@@ -54,6 +55,70 @@ pub async fn create_folder(
 }
 
 #[worker::send]
+pub async fn get_folders(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let folders_db: Vec<Folder> = db
+        .prepare("SELECT * FROM folders WHERE user_id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .all()
+        .await?
+        .results()?;
+
+    let folders: Vec<FolderResponse> = folders_db.into_iter().map(|f| f.into()).collect();
+
+    Ok(Json(json!({
+        "data": folders,
+        "object": "list",
+        "continuationToken": null
+    })))
+}
+
+#[worker::send]
+pub async fn get_folder(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<FolderResponse>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let folder_db: Folder = db
+        .prepare("SELECT * FROM folders WHERE id = ?1 AND user_id = ?2")
+        .bind(&[id.clone().into(), claims.sub.clone().into()])?
+        .first(None)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("Folder does not exist or belongs to another user".to_string())
+        })?;
+
+    Ok(Json(folder_db.into()))
+}
+
+#[worker::send]
+pub async fn post_folder(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateFolderRequest>,
+) -> Result<Json<FolderResponse>, AppError> {
+    update_folder(claims, State(state), Path(id), Json(payload)).await
+}
+
+#[worker::send]
+pub async fn delete_folder_post(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<()>, AppError> {
+    delete_folder(claims, State(state), Path(id)).await
+}
+
+#[worker::send]
 pub async fn delete_folder(
     claims: Claims,
     State(state): State<Arc<AppState>>,
@@ -61,6 +126,18 @@ pub async fn delete_folder(
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+
+    let folder: Option<Folder> = db
+        .prepare("SELECT * FROM folders WHERE id = ?1 AND user_id = ?2")
+        .bind(&[id.clone().into(), claims.sub.clone().into()])?
+        .first(None)
+        .await?;
+
+    if folder.is_none() {
+        return Err(AppError::NotFound(
+            "Folder does not exist or belongs to another user".to_string(),
+        ));
+    }
 
     query!(
         &db,

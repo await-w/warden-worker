@@ -10,7 +10,7 @@ use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
 use crate::handlers::{
-    accounts, ciphers, compat, config, css, devices, folders, icons, identity, import, sends,
+    accounts, ciphers, compat, config, css, devices, folders, hibp, icons, identity, import, sends,
     settings, sync, two_factor, usage, webauthn,
 };
 use crate::jwt_manager::JwtKeys;
@@ -152,6 +152,17 @@ pub fn api_router_with_keys(
         )
         .route("/api/accounts/email", put(accounts::change_email))
         .route("/api/accounts/kdf", post(accounts::post_kdf))
+        .route("/api/accounts/tasks", get(accounts::get_tasks))
+        .route("/api/accounts/delete", post(accounts::post_delete_account))
+        .route("/api/accounts", delete(accounts::delete_account))
+        .route(
+            "/api/accounts/delete-recover",
+            post(accounts::post_delete_recover),
+        )
+        .route(
+            "/api/accounts/delete-recover-token",
+            post(accounts::post_delete_recover_token),
+        )
         .route("/api/two-factor", get(two_factor::two_factor_status))
         .route(
             "/api/two-factor/get-authenticator",
@@ -244,12 +255,25 @@ pub fn api_router_with_keys(
         .route("/api/ciphers/create", post(ciphers::create_cipher))
         .route(
             "/api/ciphers",
-            post(ciphers::post_ciphers).delete(ciphers::hard_delete_ciphers_delete),
+            get(ciphers::get_ciphers)
+                .post(ciphers::post_ciphers)
+                .delete(ciphers::hard_delete_ciphers_delete),
         )
         .route("/api/ciphers/import", post(import::import_data))
         .route(
             "/api/ciphers/{id}",
-            put(ciphers::update_cipher).delete(ciphers::hard_delete_cipher),
+            get(ciphers::get_cipher)
+                .post(ciphers::post_cipher)
+                .put(ciphers::update_cipher)
+                .delete(ciphers::hard_delete_cipher),
+        )
+        .route(
+            "/api/ciphers/{id}/details",
+            get(ciphers::get_cipher_details),
+        )
+        .route(
+            "/api/ciphers/{id}/partial",
+            post(ciphers::post_cipher_partial).put(ciphers::put_cipher_partial),
         )
         .route(
             "/api/ciphers/{id}/delete",
@@ -269,9 +293,21 @@ pub fn api_router_with_keys(
         .route("/api/ciphers/archive", put(ciphers::archive_ciphers))
         .route("/api/ciphers/unarchive", put(ciphers::unarchive_ciphers))
         // Folders CRUD
-        .route("/api/folders", post(folders::create_folder))
-        .route("/api/folders/{id}", put(folders::update_folder))
-        .route("/api/folders/{id}", delete(folders::delete_folder))
+        .route(
+            "/api/folders",
+            get(folders::get_folders).post(folders::create_folder),
+        )
+        .route(
+            "/api/folders/{id}",
+            get(folders::get_folder)
+                .post(folders::post_folder)
+                .put(folders::update_folder)
+                .delete(folders::delete_folder),
+        )
+        .route(
+            "/api/folders/{id}/delete",
+            post(folders::delete_folder_post),
+        )
         .route(
             "/api/settings/domains",
             get(settings::get_domains)
@@ -282,6 +318,7 @@ pub fn api_router_with_keys(
         .route("/api/alive", get(config::alive))
         .route("/api/now", get(config::now))
         .route("/api/version", get(config::version))
+        .route("/api/hibp/breach", get(hibp::hibp_breach))
         .route(
             "/accounts/webauthn/assertion-options",
             get(webauthn::identity_assertion_options).post(webauthn::identity_assertion_options),

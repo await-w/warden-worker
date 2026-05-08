@@ -5,6 +5,7 @@ pub mod config;
 pub mod css;
 pub mod devices;
 pub mod folders;
+pub mod hibp;
 pub mod icons;
 pub mod identity;
 pub mod import;

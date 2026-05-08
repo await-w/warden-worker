@@ -1030,7 +1030,9 @@ pub struct VerifyOtpRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretVerificationRequest {
-    pub master_password_hash: String,
+    #[serde(alias = "MasterPasswordHash")]
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
 }
 
 #[worker::send]
@@ -1114,63 +1116,12 @@ pub async fn verify_password(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    let master_password_hash = payload
+        .master_password_hash
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Missing masterPasswordHash".to_string()))?;
 
-    let user_row: Option<Value> = db
-        .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
-        .bind(&[claims.sub.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?;
-
-    let Some(row) = user_row else {
-        return Err(AppError::NotFound("User not found".to_string()));
-    };
-
-    let stored_hash = row
-        .get("master_password_hash")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-    let kdf_type: i32 = row
-        .get("kdf_type")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(0);
-    let kdf_iterations: i32 = row
-        .get("kdf_iterations")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(600_000);
-    let kdf_memory: Option<i32> = row
-        .get("kdf_memory")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-    let kdf_parallelism: Option<i32> = row
-        .get("kdf_parallelism")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-
-    let valid = if let Some(salt) = password_salt {
-        crypto::verify_password(
-            &payload.master_password_hash,
-            salt,
-            stored_hash,
-            kdf_type,
-            kdf_iterations,
-            kdf_memory,
-            kdf_parallelism,
-        )
-        .await
-    } else {
-        constant_time_eq(
-            stored_hash.as_bytes(),
-            payload.master_password_hash.as_bytes(),
-        )
-    };
-
-    if !valid {
-        return Err(AppError::Unauthorized("Invalid password".to_string()));
-    }
+    verify_user_password(&db, &claims.sub, master_password_hash).await?;
 
     Ok(Json(json!({})))
 }
@@ -1319,6 +1270,209 @@ pub async fn kdf_upgrade(
     );
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRecoverData {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRecoverTokenData {
+    pub user_id: String,
+    pub token: String,
+}
+
+#[worker::send]
+pub async fn post_delete_recover(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<DeleteRecoverData>,
+) -> Result<Json<Value>, AppError> {
+    if notify::is_email_webhook_configured(&state.env) {
+        let email = data.email.trim().to_lowercase();
+        if !email.is_empty() {
+            let db = db::get_db(&state.env)?;
+            let user: Option<Value> = db
+                .prepare("SELECT id FROM users WHERE email = ?1")
+                .bind(&[email.into()])?
+                .first(None)
+                .await
+                .map_err(|_| AppError::Database)?;
+
+            if let Some(user) = user {
+                if let Some(user_id) = user.get("id").and_then(|v| v.as_str()) {
+                    log::info!("Delete recover requested for user {user_id}");
+                }
+            }
+        }
+
+        Ok(Json(json!({})))
+    } else {
+        Err(AppError::BadRequest(
+            "Please contact the administrator to delete your account".to_string(),
+        ))
+    }
+}
+
+#[worker::send]
+pub async fn post_delete_recover_token(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<DeleteRecoverTokenData>,
+) -> Result<Json<Value>, AppError> {
+    let jwt_keys = state.jwt_keys.clone();
+    let claims = crate::auth::decode_delete(&data.token, &jwt_keys.access_secret)?;
+
+    if claims.sub != data.user_id {
+        return Err(AppError::Unauthorized("Invalid claim".to_string()));
+    }
+
+    let db = db::get_db(&state.env)?;
+    let user: Option<Value> = db
+        .prepare("SELECT id FROM users WHERE id = ?1")
+        .bind(&[data.user_id.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    if user.is_none() {
+        return Err(AppError::NotFound("User doesn't exist".to_string()));
+    }
+
+    cascade_delete_user_data(&db, &data.user_id).await?;
+
+    Ok(Json(json!({})))
+}
+
+#[worker::send]
+pub async fn post_delete_account(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SecretVerificationRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    validate_password_or_otp(&db, &claims.sub, &payload).await?;
+    cascade_delete_user_data(&db, &claims.sub).await?;
+    Ok(Json(json!({})))
+}
+
+#[worker::send]
+pub async fn delete_account(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SecretVerificationRequest>,
+) -> Result<Json<Value>, AppError> {
+    post_delete_account(claims, State(state), Json(payload)).await
+}
+
+async fn validate_password_or_otp(
+    db: &worker::D1Database,
+    user_id: &str,
+    payload: &SecretVerificationRequest,
+) -> Result<(), AppError> {
+    match (
+        payload.master_password_hash.as_deref(),
+        payload.otp.as_deref(),
+    ) {
+        (Some(master_password_hash), None) => {
+            verify_user_password(db, user_id, master_password_hash).await
+        }
+        (None, Some(otp)) => {
+            two_factor::validate_protected_action_otp(db, user_id, otp, true).await
+        }
+        _ => Err(AppError::BadRequest("No validation provided".to_string())),
+    }
+}
+
+async fn verify_user_password(
+    db: &worker::D1Database,
+    user_id: &str,
+    password_hash: &str,
+) -> Result<(), AppError> {
+    let user_row: Option<Value> = db
+        .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
+        .bind(&[user_id.into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    let Some(row) = user_row else {
+        return Err(AppError::NotFound("User not found".to_string()));
+    };
+
+    let stored_hash = row
+        .get("master_password_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let password_salt = row.get("password_salt").and_then(|v| v.as_str());
+    let kdf_type: i32 = row
+        .get("kdf_type")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(0);
+    let kdf_iterations: i32 = row
+        .get("kdf_iterations")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(600_000);
+    let kdf_memory: Option<i32> = row
+        .get("kdf_memory")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let kdf_parallelism: Option<i32> = row
+        .get("kdf_parallelism")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    let valid = if let Some(salt) = password_salt {
+        crypto::verify_password(
+            password_hash,
+            salt,
+            stored_hash,
+            kdf_type,
+            kdf_iterations,
+            kdf_memory,
+            kdf_parallelism,
+        )
+        .await
+    } else {
+        constant_time_eq(stored_hash.as_bytes(), password_hash.as_bytes())
+    };
+
+    if !valid {
+        return Err(AppError::Unauthorized("Invalid password".to_string()));
+    }
+
+    Ok(())
+}
+
+async fn cascade_delete_user_data(db: &worker::D1Database, user_id: &str) -> Result<(), AppError> {
+    db.prepare("DELETE FROM users WHERE id = ?1")
+        .bind(&[user_id.into()])?
+        .run()
+        .await
+        .map_err(|e| {
+            log::error!("Failed to cascade delete user {user_id}: {e:?}");
+            AppError::Database
+        })?;
+
+    log::info!("User {user_id} and all associated data deleted");
+    Ok(())
+}
+
+#[worker::send]
+pub async fn get_tasks(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    Ok(Json(json!({
+        "data": [],
+        "object": "list"
+    })))
 }
 
 #[cfg(test)]

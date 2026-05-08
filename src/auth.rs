@@ -106,3 +106,18 @@ impl Claims {
         Ok(())
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BasicJwtClaims {
+    pub nbf: usize,
+    pub exp: usize,
+    pub iss: String,
+    pub sub: String,
+}
+
+pub fn decode_delete(token: &str, jwt_secret: &str) -> Result<BasicJwtClaims, AppError> {
+    let decoding_key = DecodingKey::from_secret(jwt_secret.as_ref());
+    decode::<BasicJwtClaims>(token, &decoding_key, &Validation::default())
+        .map(|d| d.claims)
+        .map_err(|_| AppError::Unauthorized("Invalid delete token".to_string()))
+}

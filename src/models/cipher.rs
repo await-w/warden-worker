@@ -68,7 +68,9 @@ where
 
 // Custom deserialization function for optional non-empty strings
 // Converts empty strings to None to handle newer Bitwarden clients
-fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub fn deserialize_optional_nonempty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -150,7 +152,7 @@ impl Into<Cipher> for CipherDBModel {
             created_at: self.created_at,
             updated_at: self.updated_at,
             object: default_object(),
-            organization_use_totp: false,
+            organization_use_totp: true,
             edit: true,
             view_password: true,
             collection_ids: None,
@@ -164,101 +166,150 @@ impl Serialize for Cipher {
         S: Serializer,
     {
         let mut response_map = Map::new();
+        let data_obj = self.data.as_object();
+        let empty_data = Map::new();
+        let data_obj = data_obj.unwrap_or(&empty_data);
+
+        let name = data_obj.get("name").cloned().unwrap_or(Value::Null);
+        let notes = data_obj.get("notes").cloned().unwrap_or(Value::Null);
+        let fields = array_or_empty(data_obj.get("fields"));
+        let password_history = array_or_empty(data_obj.get("passwordHistory"));
+        let reprompt = data_obj
+            .get("reprompt")
+            .and_then(Value::as_i64)
+            .filter(|v| *v == 0 || *v == 1)
+            .unwrap_or(0);
+
+        let mut login = Value::Null;
+        let mut secure_note = Value::Null;
+        let mut card = Value::Null;
+        let mut identity = Value::Null;
+        let mut ssh_key = Value::Null;
+
+        let type_data = match self.r#type {
+            1 => {
+                let mut value = data_obj.get("login").cloned().unwrap_or(Value::Null);
+                normalize_login(&mut value);
+                login = value.clone();
+                value
+            }
+            2 => {
+                let mut value = data_obj.get("secureNote").cloned().unwrap_or(Value::Null);
+                normalize_secure_note(&mut value);
+                secure_note = value.clone();
+                value
+            }
+            3 => {
+                let value = data_obj.get("card").cloned().unwrap_or(Value::Null);
+                card = value.clone();
+                value
+            }
+            4 => {
+                let value = data_obj.get("identity").cloned().unwrap_or(Value::Null);
+                identity = value.clone();
+                value
+            }
+            5 => {
+                let value = data_obj.get("sshKey").cloned().unwrap_or(Value::Null);
+                ssh_key = value.clone();
+                value
+            }
+            _ => Value::Null,
+        };
+
+        let mut response_data = match type_data {
+            Value::Object(map) => Value::Object(map),
+            _ => Value::Object(Map::new()),
+        };
+
+        if let Value::Object(ref mut map) = response_data {
+            map.insert("fields".to_string(), fields.clone());
+            map.insert("name".to_string(), name.clone());
+            map.insert("notes".to_string(), notes.clone());
+            map.insert("passwordHistory".to_string(), password_history.clone());
+        }
 
         response_map.insert("object".to_string(), json!(self.object));
         response_map.insert("id".to_string(), json!(self.id));
-        if self.user_id.is_some() {
-            response_map.insert("userId".to_string(), json!(self.user_id));
-        }
-        response_map.insert("organizationId".to_string(), json!(self.organization_id));
-        response_map.insert("folderId".to_string(), json!(self.folder_id));
         response_map.insert("type".to_string(), json!(self.r#type));
-        response_map.insert("favorite".to_string(), json!(self.favorite));
-        response_map.insert("edit".to_string(), json!(self.edit));
-        response_map.insert(
-            "permissions".to_string(),
-            json!({ "delete": self.edit, "restore": self.edit }),
-        );
-        response_map.insert("viewPassword".to_string(), json!(self.view_password));
+        response_map.insert("creationDate".to_string(), json!(self.created_at));
+        response_map.insert("revisionDate".to_string(), json!(self.updated_at));
+        response_map.insert("deletedDate".to_string(), json!(self.deleted_at));
+        response_map.insert("reprompt".to_string(), json!(reprompt));
+        response_map.insert("organizationId".to_string(), json!(self.organization_id));
+        response_map.insert("key".to_string(), Value::Null);
+        response_map.insert("attachments".to_string(), Value::Null);
         response_map.insert(
             "organizationUseTotp".to_string(),
             json!(self.organization_use_totp),
         );
-        response_map.insert("collectionIds".to_string(), json!(self.collection_ids));
-        response_map.insert("revisionDate".to_string(), json!(self.updated_at));
-        response_map.insert("creationDate".to_string(), json!(self.created_at));
-        response_map.insert("deletedDate".to_string(), json!(self.deleted_at));
+        response_map.insert(
+            "collectionIds".to_string(),
+            json!(self.collection_ids.clone().unwrap_or_default()),
+        );
+        response_map.insert("name".to_string(), name);
+        response_map.insert("notes".to_string(), notes);
+        response_map.insert("fields".to_string(), fields);
+        response_map.insert("data".to_string(), response_data);
+        response_map.insert("passwordHistory".to_string(), password_history);
+        response_map.insert("login".to_string(), login);
+        response_map.insert("secureNote".to_string(), secure_note);
+        response_map.insert("card".to_string(), card);
+        response_map.insert("identity".to_string(), identity);
+        response_map.insert("sshKey".to_string(), ssh_key);
+        response_map.insert("folderId".to_string(), json!(self.folder_id));
+        response_map.insert("favorite".to_string(), json!(self.favorite));
         response_map.insert("archivedDate".to_string(), json!(self.archived_at));
-
-        if let Some(data_obj) = self.data.as_object() {
-            let data_clone = data_obj.clone();
-
-            response_map.insert(
-                "name".to_string(),
-                data_clone.get("name").cloned().unwrap_or(Value::Null),
-            );
-            response_map.insert(
-                "notes".to_string(),
-                data_clone.get("notes").cloned().unwrap_or(Value::Null),
-            );
-            response_map.insert(
-                "fields".to_string(),
-                data_clone.get("fields").cloned().unwrap_or(Value::Null),
-            );
-            response_map.insert(
-                "passwordHistory".to_string(),
-                data_clone
-                    .get("passwordHistory")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
-            response_map.insert(
-                "reprompt".to_string(),
-                data_clone
-                    .get("reprompt")
-                    .cloned()
-                    .unwrap_or(Value::Number(serde_json::Number::from_f64(0.0).unwrap())),
-            );
-
-            let mut login = Value::Null;
-            let mut secure_note = Value::Null;
-            let mut card = Value::Null;
-            let mut identity = Value::Null;
-
-            match self.r#type {
-                1 => login = data_clone.get("login").cloned().unwrap_or(Value::Null),
-                2 => secure_note = data_clone.get("secureNote").cloned().unwrap_or(Value::Null),
-                3 => card = data_clone.get("card").cloned().unwrap_or(Value::Null),
-                4 => identity = data_clone.get("identity").cloned().unwrap_or(Value::Null),
-                _ => {}
-            }
-
-            response_map.insert("login".to_string(), login);
-            response_map.insert("secureNote".to_string(), secure_note);
-            response_map.insert("card".to_string(), card);
-            response_map.insert("identity".to_string(), identity);
-        } else {
-            response_map.insert("name".to_string(), Value::Null);
-            response_map.insert("notes".to_string(), Value::Null);
-            response_map.insert("fields".to_string(), Value::Null);
-            response_map.insert("passwordHistory".to_string(), Value::Null);
-            response_map.insert("reprompt".to_string(), Value::Null);
-            response_map.insert("login".to_string(), Value::Null);
-            response_map.insert("secureNote".to_string(), Value::Null);
-            response_map.insert("card".to_string(), Value::Null);
-            response_map.insert("identity".to_string(), Value::Null);
-        }
+        response_map.insert("edit".to_string(), json!(self.edit));
+        response_map.insert("viewPassword".to_string(), json!(self.view_password));
+        response_map.insert(
+            "permissions".to_string(),
+            json!({ "delete": self.edit, "restore": self.edit }),
+        );
 
         Value::Object(response_map).serialize(serializer)
     }
 }
 
 fn default_object() -> String {
-    "cipher".to_string()
+    "cipherDetails".to_string()
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn array_or_empty(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Array(_)) => value.cloned().unwrap_or(Value::Array(Vec::new())),
+        _ => Value::Array(Vec::new()),
+    }
+}
+
+fn normalize_login(login: &mut Value) {
+    let Value::Object(map) = login else {
+        return;
+    };
+
+    let first_uri = map
+        .get("uris")
+        .and_then(Value::as_array)
+        .and_then(|uris| uris.first())
+        .and_then(|uri| uri.get("uri"))
+        .cloned();
+
+    map.insert("uri".to_string(), first_uri.unwrap_or(Value::Null));
+}
+
+fn normalize_secure_note(secure_note: &mut Value) {
+    let has_numeric_type = secure_note
+        .as_object()
+        .and_then(|map| map.get("type"))
+        .is_some_and(Value::is_number);
+
+    if !has_numeric_type {
+        *secure_note = json!({ "type": 0 });
+    }
 }
 
 #[cfg(test)]
@@ -284,8 +335,8 @@ mod tests {
             archived_at: None,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             updated_at: "2026-01-01T00:00:00.000Z".to_string(),
-            object: "cipher".to_string(),
-            organization_use_totp: false,
+            object: "cipherDetails".to_string(),
+            organization_use_totp: true,
             edit: true,
             view_password: true,
             collection_ids: None,
@@ -309,6 +360,16 @@ mod tests {
             "permissions.restore must exist and be true when edit=true"
         );
         assert_eq!(value.get("archivedDate"), Some(&Value::Null));
+        assert_eq!(value.get("object"), Some(&json!("cipherDetails")));
+        assert_eq!(value.get("collectionIds"), Some(&json!([])));
+        assert_eq!(value.get("fields"), Some(&json!([])));
+        assert_eq!(value.pointer("/data/name"), Some(&json!("Example")));
+        assert_eq!(value.pointer("/data/fields"), Some(&json!([])));
+        assert_eq!(value.pointer("/login/uri"), Some(&Value::Null));
+        assert!(
+            value.get("userId").is_none(),
+            "vaultwarden cipherDetails responses do not expose userId"
+        );
     }
 
     #[test]
