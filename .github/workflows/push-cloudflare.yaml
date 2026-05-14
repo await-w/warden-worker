@@ -16,6 +16,8 @@ env:
     D1_DATABASE_NAME: vaultsql
     R2_BUCKET_NAME: warden-send-files
     WORKER_NAME: warden-worker
+    WRANGLER_VERSION: 4.73.0
+    WORKER_BUILD_VERSION: 0.8.1
 
 jobs:
     preflight:
@@ -139,7 +141,7 @@ jobs:
                   echo "  ✓ User > Memberships > Read"
 
             - name: Setup Wrangler
-              run: npm install -g wrangler@4.73.0
+              run: npm install -g wrangler@${{ env.WRANGLER_VERSION }}
 
             - name: Check R2 Bucket
               id: check_r2
@@ -174,7 +176,7 @@ jobs:
                   persist-credentials: false
 
             - name: Setup Wrangler
-              run: npm install -g wrangler@4.73.0
+              run: npm install -g wrangler@${{ env.WRANGLER_VERSION }}
 
             - name: Setup D1 Database (create if not exists)
               id: setup_d1
@@ -290,7 +292,7 @@ jobs:
               run: cargo clean
 
             - name: Install worker-build
-              run: cargo install worker-build --force
+              run: cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}" --locked --force
 
             - name: Update wrangler.jsonc with database ID
               run: |
@@ -501,7 +503,7 @@ jobs:
               with:
                   apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
                   accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  wranglerVersion: "4.73.0"
+                  wranglerVersion: ${{ env.WRANGLER_VERSION }}
 
             - name: Deploy to Cloudflare (first deployment)
               if: steps.check_worker.outputs.worker_exists != 'true'
@@ -510,7 +512,7 @@ jobs:
               with:
                   apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
                   accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  wranglerVersion: "4.73.0"
+                  wranglerVersion: ${{ env.WRANGLER_VERSION }}
 
             - name: Deployment Summary
               run: |
