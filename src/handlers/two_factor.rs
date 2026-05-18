@@ -185,10 +185,8 @@ pub async fn two_factor_status(
     }
 
     let email_enabled = two_factor::is_email_2fa_enabled(&db, &claims.sub).await?;
-    if email_enabled {
-        if notify::is_email_webhook_configured(&state.env) {
-            providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
-        }
+    if email_enabled && notify::is_email_webhook_configured(&state.env) {
+        providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
     }
 
     let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &claims.sub).await?;
@@ -862,7 +860,13 @@ pub async fn send_email_login(
         }
 
         Some(user_id)
-    } else if let Some(device_identifier) = &payload.device_identifier {
+    } else {
+        let Some(device_identifier) = &payload.device_identifier else {
+            return Err(AppError::BadRequest(
+                "No device identifier has been submitted.".to_string(),
+            ));
+        };
+
         let result: Option<serde_json::Value> = db
             .prepare("SELECT user_id FROM devices WHERE device_identifier = ?1 ORDER BY updated_at DESC LIMIT 1")
             .bind(&[device_identifier.into()])?
@@ -874,8 +878,6 @@ pub async fn send_email_login(
             r.get("user_id")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
         })
-    } else {
-        None
     };
 
     let Some(user_id) = user_id else {

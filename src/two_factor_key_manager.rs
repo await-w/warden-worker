@@ -79,20 +79,4 @@ impl TwoFactorKeyManager {
         log::info!("Two-factor encryption key generated and stored in database");
         Ok(())
     }
-
-    pub async fn rotate_key(db: &D1Database) -> Result<TwoFactorKey, AppError> {
-        let now = Utc::now().to_rfc3339();
-
-        let key_b64 = generate_random_key()?;
-
-        db.prepare("UPDATE two_factor_keys SET key_b64 = ?1, updated_at = ?2 WHERE id = ?3")
-            .bind(&[key_b64.clone().into(), now.into(), TWO_FACTOR_KEY_ID.into()])
-            .map_err(|_| AppError::Database)?
-            .run()
-            .await
-            .map_err(|_| AppError::Database)?;
-
-        log::info!("Two-factor encryption key rotated in database");
-        Ok(TwoFactorKey { key_b64 })
-    }
 }

@@ -59,10 +59,10 @@ pub async fn import_data(
     run_batch(&db, &mut folder_stmts).await?;
 
     for relationship in payload.folder_relationships {
-        if let Some(cipher) = payload.ciphers.get_mut(relationship.key) {
-            if let Some(folder) = payload.folders.get(relationship.value) {
-                cipher.folder_id = Some(folder.id.clone());
-            }
+        if let Some(cipher) = payload.ciphers.get_mut(relationship.key)
+            && let Some(folder) = payload.folders.get(relationship.value)
+        {
+            cipher.folder_id = Some(folder.id.clone());
         }
     }
 

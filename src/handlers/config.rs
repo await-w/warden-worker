@@ -51,6 +51,18 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
 }
 
 #[worker::send]
+pub async fn apple_app_site_association(State(_state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "webcredentials": {
+            "apps": [
+                "LTZ2PFU5D6.com.8bit.bitwarden",
+                "LTZ2PFU5D6.com.8bit.bitwarden.beta"
+            ]
+        }
+    }))
+}
+
+#[worker::send]
 pub async fn now(State(_state): State<Arc<AppState>>) -> Json<String> {
     Json(Utc::now().to_rfc3339())
 }

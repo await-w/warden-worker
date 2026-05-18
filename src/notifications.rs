@@ -104,10 +104,10 @@ impl DurableObject for NotificationsHub {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
-        if let WebSocketIncomingMessage::String(text) = message {
-            if is_signalr_messagepack_handshake(&text) {
-                ws.send_with_bytes(INITIAL_RESPONSE)?;
-            }
+        if let WebSocketIncomingMessage::String(text) = message
+            && is_signalr_messagepack_handshake(&text)
+        {
+            ws.send_with_bytes(INITIAL_RESPONSE)?;
         }
         Ok(())
     }

@@ -143,6 +143,7 @@
 			"/send-verify",
 			"/notifications/*",
 			"/demo.html",
+			"/.well-known/apple-app-site-association",
 			"/icons/*"
 		]
 	}

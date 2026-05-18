@@ -199,10 +199,10 @@ pub fn uuid_from_access_id(access_id: &str) -> Option<String> {
 
 pub fn send_to_json(send: &SendDBModel) -> Value {
     let mut data_value: Value = serde_json::from_str(&send.data).unwrap_or(Value::Null);
-    if let Some(size) = data_value.get("size").and_then(|v| v.as_i64()) {
-        if let Some(obj) = data_value.as_object_mut() {
-            obj.insert("size".to_string(), Value::String(size.to_string()));
-        }
+    if let Some(size) = data_value.get("size").and_then(|v| v.as_i64())
+        && let Some(obj) = data_value.as_object_mut()
+    {
+        obj.insert("size".to_string(), Value::String(size.to_string()));
     }
 
     let mut result = json!({
@@ -231,12 +231,12 @@ pub fn send_to_json(send: &SendDBModel) -> Value {
         "object": "send",
     });
 
-    if let Some(ref password_hash) = send.password_hash {
-        if let Ok(decoded) = general_purpose::STANDARD.decode(password_hash) {
-            let password_b64 = general_purpose::URL_SAFE_NO_PAD.encode(decoded);
-            if let Some(obj) = result.as_object_mut() {
-                obj.insert("password".to_string(), Value::String(password_b64));
-            }
+    if let Some(ref password_hash) = send.password_hash
+        && let Ok(decoded) = general_purpose::STANDARD.decode(password_hash)
+    {
+        let password_b64 = general_purpose::URL_SAFE_NO_PAD.encode(decoded);
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("password".to_string(), Value::String(password_b64));
         }
     }
 
@@ -245,10 +245,10 @@ pub fn send_to_json(send: &SendDBModel) -> Value {
 
 pub fn send_to_json_access(send: &SendDBModel, creator_identifier: Option<String>) -> Value {
     let mut data_value: Value = serde_json::from_str(&send.data).unwrap_or(Value::Null);
-    if let Some(size) = data_value.get("size").and_then(|v| v.as_i64()) {
-        if let Some(obj) = data_value.as_object_mut() {
-            obj.insert("size".to_string(), Value::String(size.to_string()));
-        }
+    if let Some(size) = data_value.get("size").and_then(|v| v.as_i64())
+        && let Some(obj) = data_value.as_object_mut()
+    {
+        obj.insert("size".to_string(), Value::String(size.to_string()));
     }
 
     json!({

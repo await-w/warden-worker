@@ -305,17 +305,17 @@ pub fn generate_salt() -> String {
     let mut salt = [0u8; 32];
     let global = js_sys::global();
 
-    if let Ok(crypto_val) = js_sys::Reflect::get(&global, &JsValue::from_str("crypto")) {
-        if let Ok(crypto) = crypto_val.dyn_into::<web_sys::Crypto>() {
-            let array = Uint8Array::new_with_length(32);
-            if crypto
-                .get_random_values_with_array_buffer_view(&array)
-                .is_ok()
-            {
-                let mut vec = vec![0u8; 32];
-                array.copy_to(&mut vec);
-                return general_purpose::STANDARD.encode(&vec);
-            }
+    if let Ok(crypto_val) = js_sys::Reflect::get(&global, &JsValue::from_str("crypto"))
+        && let Ok(crypto) = crypto_val.dyn_into::<web_sys::Crypto>()
+    {
+        let array = Uint8Array::new_with_length(32);
+        if crypto
+            .get_random_values_with_array_buffer_view(&array)
+            .is_ok()
+        {
+            let mut vec = vec![0u8; 32];
+            array.copy_to(&mut vec);
+            return general_purpose::STANDARD.encode(&vec);
         }
     }
 

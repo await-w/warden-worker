@@ -1,5 +1,5 @@
+use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use data_encoding::BASE32;
@@ -148,14 +148,14 @@ pub fn encrypt_secret_with_optional_key(
         ));
     }
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|_| AppError::BadRequest("Invalid two-factor encryption key".to_string()))?;
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ct = cipher
         .encrypt(
-            nonce,
+            (&nonce_bytes[..]).into(),
             Payload {
                 msg: secret_encoded.as_bytes(),
                 aad: user_id.as_bytes(),
@@ -202,11 +202,11 @@ pub fn decrypt_secret_with_optional_key(
         return Err(AppError::Internal);
     }
     let (nonce_bytes, ct) = blob.split_at(12);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|_| AppError::BadRequest("Invalid two-factor encryption key".to_string()))?;
     let pt = cipher
         .decrypt(
-            nonce,
+            nonce_bytes.into(),
             Payload {
                 msg: ct,
                 aad: user_id.as_bytes(),
@@ -218,7 +218,7 @@ pub fn decrypt_secret_with_optional_key(
             )
         })?;
 
-    Ok(String::from_utf8(pt).map_err(|_| AppError::Internal)?)
+    String::from_utf8(pt).map_err(|_| AppError::Internal)
 }
 
 pub async fn encrypt_secret_with_db_key(
@@ -228,15 +228,6 @@ pub async fn encrypt_secret_with_db_key(
 ) -> Result<String, AppError> {
     let key = crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(db).await?;
     encrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_encoded)
-}
-
-pub async fn decrypt_secret_with_db_key(
-    db: &D1Database,
-    user_id: &str,
-    secret_enc: &str,
-) -> Result<String, AppError> {
-    let key = crate::two_factor_key_manager::TwoFactorKeyManager::get_or_create_key(db).await?;
-    decrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_enc)
 }
 
 pub fn encrypt_secret_with_key(
@@ -574,10 +565,10 @@ pub async fn get_or_create_recovery_code(
         .await
         .map_err(|_| AppError::Database)?;
 
-    if let Some(code) = existing {
-        if !code.is_empty() {
-            return Ok(code);
-        }
+    if let Some(code) = existing
+        && !code.is_empty()
+    {
+        return Ok(code);
     }
 
     let new_code = generate_recovery_code();

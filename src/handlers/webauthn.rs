@@ -765,7 +765,8 @@ pub async fn get_webauthn(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
     payload.validate(&db, &claims.sub).await?;
-    Ok(Json(webauthn_response(&db, &claims.sub).await?))
+    let response = webauthn_response(&db, &claims.sub).await?;
+    Ok(Json(response))
 }
 
 #[worker::send]
@@ -845,7 +846,8 @@ pub async fn put_webauthn(
     .await?;
     webauthn::set_webauthn_two_factor_enabled(&db, &claims.sub, true).await?;
 
-    Ok(Json(webauthn_response_u2f(&db, &claims.sub).await?))
+    let response = webauthn_response_u2f(&db, &claims.sub).await?;
+    Ok(Json(response))
 }
 
 #[worker::send]
@@ -866,7 +868,8 @@ pub async fn delete_webauthn(
     if !webauthn::has_webauthn_credentials(&db, &claims.sub).await? {
         webauthn::set_webauthn_two_factor_enabled(&db, &claims.sub, false).await?;
     }
-    Ok(Json(webauthn_response_u2f(&db, &claims.sub).await?))
+    let response = webauthn_response_u2f(&db, &claims.sub).await?;
+    Ok(Json(response))
 }
 
 #[worker::send]

@@ -45,6 +45,10 @@ pub fn api_router_with_keys(
 
     Router::new()
         .route("/demo.html", get(demo_html))
+        .route(
+            "/.well-known/apple-app-site-association",
+            get(config::apple_app_site_association),
+        )
         .route("/css/vaultwarden.css", get(css::vaultwarden_css))
         .route("/icons/{*path}", get(icons::get_icon))
         // Turnstile send-access verification

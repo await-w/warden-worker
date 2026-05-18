@@ -155,45 +155,35 @@ struct SendAccessPassClaims {
 }
 
 /// Create a signed JWT cookie value valid for `SEND_ACCESS_COOKIE_TTL_MINUTES`.
-fn generate_send_access_cookie(
-    state: &Arc<AppState>,
-) -> impl std::future::Future<Output = Result<String, AppError>> {
-    async move {
-        let jwt_keys = state.jwt_keys.clone();
-        let now = Utc::now();
-        let claims = SendAccessPassClaims {
-            aud: "send_access".to_string(),
-            iat: now.timestamp() as usize,
-            exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp()
-                as usize,
-        };
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
-        )?;
-        Ok(token)
-    }
+async fn generate_send_access_cookie(state: &Arc<AppState>) -> Result<String, AppError> {
+    let jwt_keys = state.jwt_keys.clone();
+    let now = Utc::now();
+    let claims = SendAccessPassClaims {
+        aud: "send_access".to_string(),
+        iat: now.timestamp() as usize,
+        exp: (now + chrono::Duration::minutes(SEND_ACCESS_COOKIE_TTL_MINUTES)).timestamp() as usize,
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+    )?;
+    Ok(token)
 }
 
 /// Validate the signed cookie; returns `Ok(())` if valid.
-fn validate_send_access_cookie(
-    state: &Arc<AppState>,
-    token: &str,
-) -> impl std::future::Future<Output = Result<(), AppError>> {
-    async move {
-        let jwt_keys = state.jwt_keys.clone();
-        let mut validation = jsonwebtoken::Validation::default();
-        validation.set_audience(&["send_access"]);
-        validation.set_required_spec_claims(&["exp", "aud"]);
-        jsonwebtoken::decode::<SendAccessPassClaims>(
-            token,
-            &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
-            &validation,
-        )
-        .map_err(|_| AppError::Unauthorized("Invalid or expired send access pass".to_string()))?;
-        Ok(())
-    }
+async fn validate_send_access_cookie(state: &Arc<AppState>, token: &str) -> Result<(), AppError> {
+    let jwt_keys = state.jwt_keys.clone();
+    let mut validation = jsonwebtoken::Validation::default();
+    validation.set_audience(&["send_access"]);
+    validation.set_required_spec_claims(&["exp", "aud"]);
+    jsonwebtoken::decode::<SendAccessPassClaims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid or expired send access pass".to_string()))?;
+    Ok(())
 }
 
 /// Extract the `cf_send_pass` cookie from request headers.
@@ -504,10 +494,10 @@ fn validate_send_access(send: &SendDBModel) -> Result<(), AppError> {
         return Err(AppError::NotFound("Send not found".to_string()));
     }
 
-    if let Some(max_access_count) = send.max_access_count {
-        if send.access_count >= max_access_count {
-            return Err(AppError::NotFound("Send not found".to_string()));
-        }
+    if let Some(max_access_count) = send.max_access_count
+        && send.access_count >= max_access_count
+    {
+        return Err(AppError::NotFound("Send not found".to_string()));
     }
 
     let now = Utc::now();
@@ -789,7 +779,6 @@ pub async fn post_send(
             .unwrap_or(false)
     );
 
-    let payload = payload;
     let name = payload.name.clone();
     let notes = payload.notes.clone();
     let password = payload.password.clone();
@@ -931,7 +920,6 @@ pub async fn put_send(
             .unwrap_or(false)
     );
 
-    let payload = payload;
     let name = payload.name.clone();
     let notes = payload.notes.clone();
     let max_access_count = payload.max_access_count;
@@ -1498,47 +1486,43 @@ struct SendDownloadClaims {
     exp: usize,
 }
 
-fn generate_download_token(
+async fn generate_download_token(
     state: &Arc<AppState>,
     send_id: &str,
     file_id: &str,
-) -> impl std::future::Future<Output = Result<String, AppError>> {
-    async move {
-        let jwt_keys = state.jwt_keys.clone();
-        let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
-        let claims = SendDownloadClaims {
-            sub: format!("{send_id}/{file_id}"),
-            exp,
-        };
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
-        )?;
-        Ok(token)
-    }
+) -> Result<String, AppError> {
+    let jwt_keys = state.jwt_keys.clone();
+    let exp = (Utc::now() + chrono::Duration::minutes(5)).timestamp() as usize;
+    let claims = SendDownloadClaims {
+        sub: format!("{send_id}/{file_id}"),
+        exp,
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+    )?;
+    Ok(token)
 }
 
-fn validate_download_token(
+async fn validate_download_token(
     state: &Arc<AppState>,
     token: &str,
     send_id: &str,
     file_id: &str,
-) -> impl std::future::Future<Output = Result<(), AppError>> {
-    async move {
-        let jwt_keys = state.jwt_keys.clone();
-        let data = jsonwebtoken::decode::<SendDownloadClaims>(
-            token,
-            &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
-            &jsonwebtoken::Validation::default(),
-        )
-        .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
+) -> Result<(), AppError> {
+    let jwt_keys = state.jwt_keys.clone();
+    let data = jsonwebtoken::decode::<SendDownloadClaims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(jwt_keys.access_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
 
-        if data.claims.sub != format!("{send_id}/{file_id}") {
-            return Err(AppError::Unauthorized("Invalid token".to_string()));
-        }
-        Ok(())
+    if data.claims.sub != format!("{send_id}/{file_id}") {
+        return Err(AppError::Unauthorized("Invalid token".to_string()));
     }
+    Ok(())
 }
 
 #[worker::send]

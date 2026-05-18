@@ -67,3 +67,11 @@ console_log = "1.0.0"
 pbkdf2 = "0.12.2"
 hmac = "0.12.1"
 futures = "0.3"
+
+[lints.rust]
+rust_2024_compatibility = "warn"
+unused = "warn"
+
+[lints.clippy]
+complexity = "warn"
+style = "warn"

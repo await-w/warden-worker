@@ -87,31 +87,4 @@ impl JwtKeyManager {
         log::info!("JWT keys generated and stored in database");
         Ok(())
     }
-
-    pub async fn rotate_keys(db: &D1Database) -> Result<JwtKeys, AppError> {
-        let now = Utc::now().to_rfc3339();
-
-        let access_secret = generate_random_secret()?;
-        let refresh_secret = generate_random_secret()?;
-
-        db.prepare(
-            "UPDATE jwt_keys SET access_secret = ?1, refresh_secret = ?2, updated_at = ?3 WHERE id = ?4"
-        )
-        .bind(&[
-            access_secret.clone().into(),
-            refresh_secret.clone().into(),
-            now.into(),
-            JWT_KEYS_ID.into(),
-        ])
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await
-        .map_err(|_| AppError::Database)?;
-
-        log::info!("JWT keys rotated in database");
-        Ok(JwtKeys {
-            access_secret,
-            refresh_secret,
-        })
-    }
 }

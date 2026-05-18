@@ -86,10 +86,10 @@ impl Dispatcher {
             return Ok(());
         }
 
-        if notification.kind == NotificationKind::Event {
-            if let Some(ref mut ctx) = notification.context {
-                check_and_update_ua(ctx, env).await;
-            }
+        if notification.kind == NotificationKind::Event
+            && let Some(ref mut ctx) = notification.context
+        {
+            check_and_update_ua(ctx, env).await;
         }
 
         log::info!(

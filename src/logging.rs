@@ -45,15 +45,13 @@ impl Log for ModuleLogger {
 
         let module_levels = self.module_levels.read();
 
-        if let Ok(ml) = module_levels {
-            if let Some((module, _)) = ml
+        if let Ok(ml) = module_levels
+            && let Some((module, _)) = ml
                 .iter()
                 .find(|(module, _)| target.starts_with(*module) || target == **module)
-            {
-                if let Some(module_level) = ml.get(module) {
-                    return level <= *module_level;
-                }
-            }
+            && let Some(module_level) = ml.get(module)
+        {
+            return level <= *module_level;
         }
 
         level <= global_level

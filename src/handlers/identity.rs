@@ -295,16 +295,16 @@ async fn generate_tokens_and_response(
         "Object": "userDecryptionOptions"
     });
 
-    if let Some(option) = webauthn_prf_option {
-        if let Some(obj) = user_decryption_options.as_object_mut() {
-            obj.insert(
-                "WebAuthnPrfOption".to_string(),
-                json!({
-                    "EncryptedPrivateKey": option.encrypted_private_key,
-                    "EncryptedUserKey": option.encrypted_user_key
-                }),
-            );
-        }
+    if let Some(option) = webauthn_prf_option
+        && let Some(obj) = user_decryption_options.as_object_mut()
+    {
+        obj.insert(
+            "WebAuthnPrfOption".to_string(),
+            json!({
+                "EncryptedPrivateKey": option.encrypted_private_key,
+                "EncryptedUserKey": option.encrypted_user_key
+            }),
+        );
     }
 
     Ok(json!({
@@ -367,15 +367,6 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn generate_remember_token(
-    device_uuid: &str,
-    user_uuid: &str,
-    jwt_secret: &str,
-) -> Result<String, AppError> {
-    let claims = jwt::generate_2fa_remember_claims(device_uuid.to_string(), user_uuid.to_string());
-    jwt::encode_2fa_remember(&claims, jwt_secret)
-}
-
 fn verify_remember_token(
     token: &str,
     device_uuid: &str,
@@ -417,10 +408,10 @@ fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            if k.trim() == name {
-                return Some(v.trim().to_string());
-            }
+        if let Some((k, v)) = part.split_once('=')
+            && k.trim() == name
+        {
+            return Some(v.trim().to_string());
         }
     }
     None
@@ -1347,10 +1338,10 @@ pub async fn token(
                 );
             }
 
-            if let Some(token) = remember_token_to_return {
-                if let Some(obj) = response.as_object_mut() {
-                    obj.insert("TwoFactorToken".to_string(), Value::String(token));
-                }
+            if let Some(token) = remember_token_to_return
+                && let Some(obj) = response.as_object_mut()
+            {
+                obj.insert("TwoFactorToken".to_string(), Value::String(token));
             }
 
             let access_token_to_set = response

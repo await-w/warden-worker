@@ -45,7 +45,7 @@ fn validate_kdf(
     kdf_parallelism: Option<i32>,
 ) -> Result<(Option<i32>, Option<i32>), AppError> {
     crypto::validate_kdf_params(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)
-        .map_err(|e| AppError::BadRequest(e))?;
+        .map_err(AppError::BadRequest)?;
 
     // 返回标准化的参数
     Ok(crypto::normalize_kdf_params(
@@ -253,7 +253,8 @@ pub async fn post_profile(
         .await
         .map_err(|_| AppError::Database)?;
 
-    profile(claims, State(state)).await
+    let response = profile(claims, State(state)).await?;
+    Ok(response)
 }
 
 #[worker::send]
@@ -262,13 +263,13 @@ pub async fn put_avatar(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AvatarData>,
 ) -> Result<Json<Value>, AppError> {
-    if let Some(color) = payload.avatar_color.as_deref() {
-        if color.len() != 7 {
-            return Err(AppError::BadRequest(
-                "The field AvatarColor must be a HTML/Hex color code with a length of 7 characters"
-                    .to_string(),
-            ));
-        }
+    if let Some(color) = payload.avatar_color.as_deref()
+        && color.len() != 7
+    {
+        return Err(AppError::BadRequest(
+            "The field AvatarColor must be a HTML/Hex color code with a length of 7 characters"
+                .to_string(),
+        ));
     }
 
     let db = db::get_db(&state.env)?;
@@ -285,7 +286,8 @@ pub async fn put_avatar(
         .await
         .map_err(|_| AppError::Database)?;
 
-    profile(claims, State(state)).await
+    let response = profile(claims, State(state)).await?;
+    Ok(response)
 }
 
 #[worker::send]
@@ -1301,10 +1303,10 @@ pub async fn post_delete_recover(
                 .await
                 .map_err(|_| AppError::Database)?;
 
-            if let Some(user) = user {
-                if let Some(user_id) = user.get("id").and_then(|v| v.as_str()) {
-                    log::info!("Delete recover requested for user {user_id}");
-                }
+            if let Some(user) = user
+                && let Some(user_id) = user.get("id").and_then(|v| v.as_str())
+            {
+                log::info!("Delete recover requested for user {user_id}");
             }
         }
 

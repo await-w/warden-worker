@@ -849,12 +849,12 @@ pub async fn put_auth_request(
             "AuthRequest doesn't exist".to_string(),
         ));
     }
-    if let Some(claim_device_identifier) = claims.device.as_deref() {
-        if claim_device_identifier != approver_device_identifier {
-            return Err(AppError::BadRequest(
-                "AuthRequest doesn't exist".to_string(),
-            ));
-        }
+    if let Some(claim_device_identifier) = claims.device.as_deref()
+        && claim_device_identifier != approver_device_identifier
+    {
+        return Err(AppError::BadRequest(
+            "AuthRequest doesn't exist".to_string(),
+        ));
     }
 
     let approver_device_type = infer_device_type(&headers).unwrap_or(14) as i32;

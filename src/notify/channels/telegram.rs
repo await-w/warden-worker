@@ -1,9 +1,9 @@
 use serde_json::json;
 use worker::{Env, Fetch, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
-use crate::notify::types::{ChannelType, Notification};
+use crate::notify::types::Notification;
 
-use super::r#trait::ChannelError;
+use super::ChannelError;
 
 const TELEGRAM_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
 const TELEGRAM_CHAT_ID: &str = "TELEGRAM_CHAT_ID";
@@ -21,10 +21,6 @@ impl TelegramChannel {
             return None;
         }
         Some(Self { bot_token, chat_id })
-    }
-
-    pub fn channel_type(&self) -> ChannelType {
-        ChannelType::Telegram
     }
 
     pub async fn send(&self, notification: &Notification) -> Result<(), ChannelError> {

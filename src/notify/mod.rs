@@ -111,8 +111,10 @@ pub async fn publish_auth_request(
         (None, None, None)
     };
 
-    let mut meta = RequestMeta::default();
-    meta.ip = ip;
+    let meta = RequestMeta {
+        ip,
+        ..Default::default()
+    };
 
     let ctx = NotifyContext {
         user_id: Some(user_id.to_string()),

@@ -660,15 +660,15 @@ pub fn rp_id_from_headers(headers: &HeaderMap) -> String {
 }
 
 pub fn origin_from_headers(headers: &HeaderMap) -> String {
-    if let Some(origin) = header_first_token(headers, "origin") {
-        if let Some(normalized) = normalize_origin(&origin) {
-            return normalized;
-        }
+    if let Some(origin) = header_first_token(headers, "origin")
+        && let Some(normalized) = normalize_origin(&origin)
+    {
+        return normalized;
     }
-    if let Some(referer) = header_first_token(headers, "referer") {
-        if let Some(normalized) = normalize_origin(&referer) {
-            return normalized;
-        }
+    if let Some(referer) = header_first_token(headers, "referer")
+        && let Some(normalized) = normalize_origin(&referer)
+    {
+        return normalized;
     }
 
     let host = header_first_token(headers, "x-forwarded-host")
@@ -687,10 +687,11 @@ pub fn origin_from_headers(headers: &HeaderMap) -> String {
         })
         .to_ascii_lowercase();
     let mut host = host;
-    if !host.contains(':') && !host.ends_with(']') {
-        if let Some(port) = header_first_token(headers, "x-forwarded-port") {
-            host = format!("{host}:{port}");
-        }
+    if !host.contains(':')
+        && !host.ends_with(']')
+        && let Some(port) = header_first_token(headers, "x-forwarded-port")
+    {
+        host = format!("{host}:{port}");
     }
     let origin = format!("{proto}://{host}");
     normalize_origin(&origin).unwrap_or(origin)
@@ -1193,10 +1194,10 @@ fn random_challenge_b64url() -> String {
 
 fn normalize_rp_id(host: &str) -> String {
     let host = host.trim().to_lowercase();
-    if host.starts_with('[') {
-        if let Some(end) = host.find(']') {
-            return host[1..end].to_string();
-        }
+    if host.starts_with('[')
+        && let Some(end) = host.find(']')
+    {
+        return host[1..end].to_string();
     }
     host.split(':').next().unwrap_or("localhost").to_string()
 }
@@ -1270,19 +1271,20 @@ fn strip_default_port(authority: &str, scheme: &str) -> String {
         if let Some(end) = authority.find(']') {
             let host = &authority[..=end];
             let suffix = &authority[end + 1..];
-            if let Some(default_port) = default_port {
-                if suffix == format!(":{default_port}") {
-                    return host.to_string();
-                }
+            if let Some(default_port) = default_port
+                && suffix == format!(":{default_port}")
+            {
+                return host.to_string();
             }
         }
         return authority;
     }
 
-    if let (Some(default_port), Some((host, port))) = (default_port, authority.rsplit_once(':')) {
-        if !host.contains(':') && port == default_port {
-            return host.to_string();
-        }
+    if let (Some(default_port), Some((host, port))) = (default_port, authority.rsplit_once(':'))
+        && !host.contains(':')
+        && port == default_port
+    {
+        return host.to_string();
     }
 
     authority
@@ -1290,7 +1292,7 @@ fn strip_default_port(authority: &str, scheme: &str) -> String {
 
 fn verify_rp_id_hash(rp_id: &str, rp_id_hash: &[u8; 32]) -> Result<(), AppError> {
     let expected = Sha256::digest(rp_id.as_bytes());
-    if expected.as_slice() == rp_id_hash {
+    if expected[..] == rp_id_hash[..] {
         Ok(())
     } else {
         Err(AppError::BadRequest("WebAuthn rpId mismatch".to_string()))
@@ -1309,7 +1311,7 @@ fn decode_b64_any(input: &str) -> Result<Vec<u8>, AppError> {
         return Ok(v);
     }
     let mut padded = s.to_string();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     if let Ok(v) = general_purpose::URL_SAFE.decode(&padded) {
@@ -1733,12 +1735,12 @@ async fn upsert_credential(cg: CredentialGroup<'_>) -> Result<(), AppError> {
         .first(Some("credential_id_b64url"))
         .await
         .map_err(|_| AppError::Database)?;
-    if let Some(existing) = slot_existing {
-        if existing != credential_id_b64url {
-            return Err(AppError::BadRequest(
-                "WebAuthn key slot is already occupied".to_string(),
-            ));
-        }
+    if let Some(existing) = slot_existing
+        && existing != credential_id_b64url
+    {
+        return Err(AppError::BadRequest(
+            "WebAuthn key slot is already occupied".to_string(),
+        ));
     }
     db.prepare(
         "INSERT INTO two_factor_webauthn (

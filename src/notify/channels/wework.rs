@@ -1,9 +1,9 @@
 use serde_json::json;
 use worker::{Env, Fetch, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
-use crate::notify::types::{ChannelType, Notification};
+use crate::notify::types::Notification;
 
-use super::r#trait::ChannelError;
+use super::ChannelError;
 
 const WEBHOOK_SECRET_NAME: &str = "WEWORK_WEBHOOK_URL";
 
@@ -18,10 +18,6 @@ impl WeWorkChannel {
             return None;
         }
         Some(Self { webhook_url })
-    }
-
-    pub fn channel_type(&self) -> ChannelType {
-        ChannelType::WeWork
     }
 
     pub async fn send(&self, notification: &Notification) -> Result<(), ChannelError> {

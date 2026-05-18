@@ -16,7 +16,7 @@ fn decode_b64url(input: &str) -> Result<Vec<u8>, AppError> {
         return Ok(v);
     }
     let mut padded = input.to_string();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     general_purpose::URL_SAFE
@@ -83,10 +83,10 @@ pub fn decode_hs256<T: DeserializeOwned>(token: &str, secret: &str) -> Result<T,
     if now >= exp {
         return Err(AppError::Unauthorized("Invalid token".to_string()));
     }
-    if let Some(nbf) = payload_json.get("nbf").and_then(|v| v.as_i64()) {
-        if now < nbf {
-            return Err(AppError::Unauthorized("Invalid token".to_string()));
-        }
+    if let Some(nbf) = payload_json.get("nbf").and_then(|v| v.as_i64())
+        && now < nbf
+    {
+        return Err(AppError::Unauthorized("Invalid token".to_string()));
     }
 
     serde_json::from_value(payload_json)

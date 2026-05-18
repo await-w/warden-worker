@@ -328,12 +328,10 @@ pub async fn vaultwarden_css(State(state): State<Arc<AppState>>) -> Response {
         );
     }
 
-    if load_user_css {
-        if let Some(user_css) = env_text(env, "VW_CSS_USER") {
-            css.push_str("\n/* ==== User custom CSS (VW_CSS_USER) ==== */\n");
-            css.push_str(&user_css);
-            css.push('\n');
-        }
+    if load_user_css && let Some(user_css) = env_text(env, "VW_CSS_USER") {
+        css.push_str("\n/* ==== User custom CSS (VW_CSS_USER) ==== */\n");
+        css.push_str(&user_css);
+        css.push('\n');
     }
 
     let mut response = Response::new(axum::body::Body::from(css));

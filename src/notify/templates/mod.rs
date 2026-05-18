@@ -15,7 +15,7 @@ pub fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     let mut out = s[..max].to_string();
-    out.push_str("…");
+    out.push('…');
     out
 }
 

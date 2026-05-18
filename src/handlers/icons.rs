@@ -37,12 +37,12 @@ pub async fn get_icon(
     *response.status_mut() =
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    if let Ok(Some(content_type)) = upstream_response.headers().get("content-type") {
-        if let Ok(header_value) = axum::http::HeaderValue::from_str(&content_type) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_TYPE, header_value);
-        }
+    if let Ok(Some(content_type)) = upstream_response.headers().get("content-type")
+        && let Ok(header_value) = axum::http::HeaderValue::from_str(&content_type)
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, header_value);
     }
 
     response.headers_mut().insert(

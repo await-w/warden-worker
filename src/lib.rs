@@ -65,10 +65,10 @@ pub async fn main(
         .map_err(|e| worker::Error::RustError(format!("Failed to convert request: {}", e)))?;
 
     let mut inject = |k: &'static str, v: Option<String>| {
-        if let Some(v) = v {
-            if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
-                http_req.headers_mut().insert(k, hv);
-            }
+        if let Some(v) = v
+            && let Ok(hv) = axum::http::HeaderValue::from_str(&v)
+        {
+            http_req.headers_mut().insert(k, hv);
         }
     };
     inject("X-CF-City", city);

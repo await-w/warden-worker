@@ -4,8 +4,6 @@ use axum::{
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::AppError;
@@ -34,26 +32,20 @@ impl FromRequestParts<Arc<AppState>> for Claims {
     fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<AppState>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send>> {
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|auth_header| auth_header.to_str().ok())
-            .and_then(|auth_value| {
-                if auth_value.starts_with("Bearer ") {
-                    Some(auth_value[7..].to_owned())
-                } else {
-                    None
-                }
-            })
+            .and_then(|auth_value| auth_value.strip_prefix("Bearer ").map(str::to_owned))
             .or_else(|| {
                 let raw = parts.headers.get(header::COOKIE)?.to_str().ok()?;
                 for part in raw.split(';') {
                     let part = part.trim();
-                    if let Some((k, v)) = part.split_once('=') {
-                        if k.trim() == "bw_access_token" {
-                            return Some(v.trim().to_string());
-                        }
+                    if let Some((k, v)) = part.split_once('=')
+                        && k.trim() == "bw_access_token"
+                    {
+                        return Some(v.trim().to_string());
                     }
                 }
                 None
@@ -71,7 +63,7 @@ impl FromRequestParts<Arc<AppState>> for Claims {
             )),
         };
 
-        Box::pin(std::future::ready(result))
+        std::future::ready(result)
     }
 }
 
