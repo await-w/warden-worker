@@ -17,7 +17,6 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 - **消息通知**：支持企业微信 Webhook 推送，覆盖登录/失败、密码库变更等 10+ 种事件，支持 GeoIP 显示 IP 归属地
 - **邮箱二步验证**：通过 Webhook/Telegram 发送验证码邮件，无需配置 SMTP 服务器
 - 性能优化：加密算法使用 CF 提供的函数，避免了 Rust 标准库的加密性能问题
-- 强制使用Argon2id算法，避免CPU超时
 
 ## 自动部署（GitHub Actions）（推荐）
 
