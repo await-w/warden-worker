@@ -10,8 +10,8 @@ use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
 use crate::handlers::{
-    accounts, ciphers, compat, config, css, devices, folders, hibp, icons, identity, import, sends,
-    settings, sync, two_factor, usage, webauthn,
+    accounts, ciphers, compat, config, css, devices, events, folders, hibp, icons, identity, import,
+    sends, settings, sync, two_factor, usage, webauthn,
 };
 use crate::jwt_manager::JwtKeys;
 use crate::two_factor_key_manager::TwoFactorKey;
@@ -62,6 +62,10 @@ pub fn api_router_with_keys(
         )
         .route("/api/accounts/prelogin", post(accounts::prelogin))
         .route("/api/accounts/prelogin/password", post(accounts::prelogin))
+        .route(
+            "/identity/accounts/register",
+            post(accounts::register),
+        )
         .route(
             "/identity/accounts/register/finish",
             post(accounts::register),
@@ -152,9 +156,9 @@ pub fn api_router_with_keys(
         )
         .route(
             "/api/accounts/password",
-            put(accounts::change_master_password),
+            post(accounts::change_master_password),
         )
-        .route("/api/accounts/email", put(accounts::change_email))
+        .route("/api/accounts/email", post(accounts::change_email))
         .route("/api/accounts/kdf", post(accounts::post_kdf))
         .route("/api/accounts/tasks", get(accounts::get_tasks))
         .route("/api/accounts/delete", post(accounts::post_delete_account))
@@ -166,6 +170,28 @@ pub fn api_router_with_keys(
         .route(
             "/api/accounts/delete-recover-token",
             post(accounts::post_delete_recover_token),
+        )
+        .route("/api/accounts/keys", post(accounts::post_keys))
+        .route("/api/accounts/api-key", post(accounts::post_api_key))
+        .route(
+            "/api/accounts/rotate-api-key",
+            post(accounts::rotate_api_key),
+        )
+        .route(
+            "/api/accounts/verify-email",
+            post(accounts::post_verify_email),
+        )
+        .route(
+            "/api/accounts/verify-email-token",
+            post(accounts::post_verify_email_token),
+        )
+        .route(
+            "/api/accounts/email-token",
+            post(accounts::post_email_token),
+        )
+        .route(
+            "/api/accounts/set-password",
+            post(accounts::post_set_password),
         )
         .route("/api/two-factor", get(two_factor::two_factor_status))
         .route(
@@ -265,6 +291,10 @@ pub fn api_router_with_keys(
         )
         .route("/api/ciphers/import", post(import::import_data))
         .route(
+            "/api/ciphers/move",
+            post(ciphers::move_ciphers).put(ciphers::move_ciphers_put),
+        )
+        .route(
             "/api/ciphers/{id}",
             get(ciphers::get_cipher)
                 .post(ciphers::post_cipher)
@@ -323,6 +353,7 @@ pub fn api_router_with_keys(
         .route("/api/now", get(config::now))
         .route("/api/version", get(config::version))
         .route("/api/hibp/breach", get(hibp::hibp_breach))
+        .route("/events/collect", post(events::post_events_collect))
         .route(
             "/accounts/webauthn/assertion-options",
             get(webauthn::identity_assertion_options).post(webauthn::identity_assertion_options),

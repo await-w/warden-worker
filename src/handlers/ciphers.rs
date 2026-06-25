@@ -771,6 +771,97 @@ pub async fn hard_delete_ciphers_delete(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MoveCipherData {
+    #[serde(
+        default,
+        deserialize_with = "crate::models::cipher::deserialize_optional_nonempty_string"
+    )]
+    pub folder_id: Option<String>,
+    pub ids: Vec<String>,
+}
+
+#[worker::send]
+pub async fn move_ciphers(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<MoveCipherData>,
+) -> Result<Json<()>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    if let Some(folder_id) = &payload.folder_id {
+        let folder_exists: Option<Value> = db
+            .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
+            .bind(&[folder_id.clone().into(), claims.sub.clone().into()])?
+            .first(None)
+            .await
+            .map_err(|_| AppError::Database)?;
+        if folder_exists.is_none() {
+            return Err(AppError::NotFound("Folder not found".to_string()));
+        }
+    }
+
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let placeholders = payload
+        .ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE ciphers SET folder_id = ?1, updated_at = ?2 WHERE user_id = ?3 AND id IN ({})",
+        placeholders
+    );
+
+    let mut params = vec![
+        payload
+            .folder_id
+            .clone()
+            .map(|s| s.into())
+            .unwrap_or_else(|| worker::wasm_bindgen::JsValue::NULL),
+        now.into(),
+        claims.sub.clone().into(),
+    ];
+    for id in &payload.ids {
+        params.push(id.clone().into());
+    }
+
+    db.prepare(&sql)
+        .bind(&params)?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    let meta = notify::extract_request_meta(&headers);
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::CipherUpdate,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            detail: Some(format!("Action: Batch Move ({} items)", payload.ids.len())),
+            meta,
+            ..Default::default()
+        },
+    );
+
+    Ok(Json(()))
+}
+
+#[worker::send]
+pub async fn move_ciphers_put(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<MoveCipherData>,
+) -> Result<Json<()>, AppError> {
+    move_ciphers(claims, State(state), headers, Json(payload)).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartialCipherData {
     #[serde(
         default,

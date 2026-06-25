@@ -556,7 +556,10 @@ pub async fn register(
         AppError::Database
     })?;
 
-    Ok(Json(json!({})))
+    Ok(Json(json!({
+        "object": "register",
+        "captchaBypassToken": ""
+    })))
 }
 
 #[worker::send]
@@ -1474,6 +1477,287 @@ pub async fn get_tasks(
     Ok(Json(json!({
         "data": [],
         "object": "list"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeysData {
+    pub encrypted_private_key: String,
+    pub public_key: String,
+}
+
+#[worker::send]
+pub async fn post_keys(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<KeysData>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    let now = Utc::now().to_rfc3339();
+
+    db.prepare(
+        "UPDATE users SET private_key = ?1, public_key = ?2, updated_at = ?3 WHERE id = ?4",
+    )
+    .bind(&[
+        payload.encrypted_private_key.clone().into(),
+        payload.public_key.clone().into(),
+        now.into(),
+        claims.sub.clone().into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    Ok(Json(json!({
+        "privateKey": payload.encrypted_private_key,
+        "publicKey": payload.public_key,
+        "object": "keys"
+    })))
+}
+
+#[worker::send]
+pub async fn post_api_key(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SecretVerificationRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    validate_password_or_otp(&db, &claims.sub, &payload).await?;
+
+    let api_key = Uuid::new_v4().to_string().replace('-', "");
+    let now = Utc::now().to_rfc3339();
+
+    db.prepare("UPDATE users SET api_key = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&[api_key.clone().into(), now.into(), claims.sub.clone().into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    Ok(Json(json!({
+        "apiKey": api_key,
+        "revisionDate": chrono::Utc::now().timestamp_millis(),
+        "object": "apiKey"
+    })))
+}
+
+#[worker::send]
+pub async fn rotate_api_key(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SecretVerificationRequest>,
+) -> Result<Json<Value>, AppError> {
+    post_api_key(claims, State(state), Json(payload)).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyEmailTokenRequest {
+    pub token: String,
+}
+
+#[worker::send]
+pub async fn post_verify_email_token(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VerifyEmailTokenRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    use crate::models::user::RegisterVerifyClaims;
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+
+    let decoding_key = DecodingKey::from_secret(state.jwt_keys.access_secret.as_ref());
+    let token_data = decode::<RegisterVerifyClaims>(
+        &payload.token,
+        &decoding_key,
+        &Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
+
+    let email = token_data.claims.sub.to_lowercase();
+    if email != claims.email.to_lowercase() {
+        return Err(AppError::Unauthorized("Email does not match".to_string()));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    db.prepare("UPDATE users SET email_verified = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&[1.into(), now.into(), claims.sub.clone().into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    Ok(Json(json!({})))
+}
+
+#[worker::send]
+pub async fn post_verify_email(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let now = Utc::now().to_rfc3339();
+    db.prepare("UPDATE users SET email_verified = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&[1.into(), now.into(), claims.sub.clone().into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailTokenRequest {
+    pub new_email: String,
+}
+
+#[worker::send]
+pub async fn post_email_token(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<EmailTokenRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let new_email = payload.new_email.to_lowercase();
+
+    let existing: Option<Value> = db
+        .prepare("SELECT id FROM users WHERE email = ?1 AND id != ?2")
+        .bind(&[new_email.clone().into(), claims.sub.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    if existing.is_some() {
+        return Err(AppError::BadRequest("Email already in use".to_string()));
+    }
+
+    use crate::models::user::RegisterVerifyClaims;
+    use chrono::Duration;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    let now = Utc::now();
+    let exp = (now + Duration::hours(1)).timestamp() as usize;
+    let token_claims = RegisterVerifyClaims {
+        sub: new_email.clone(),
+        name: None,
+        exp,
+    };
+    let token = encode(
+        &Header::default(),
+        &token_claims,
+        &EncodingKey::from_secret(state.jwt_keys.access_secret.as_ref()),
+    )
+    .map_err(|_| AppError::Internal)?;
+
+    Ok(Json(json!({ "token": token })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPasswordRequest {
+    pub key: String,
+    #[serde(default)]
+    pub keys: Option<KeyData>,
+    pub master_password_hash: String,
+    pub master_password_hint: Option<String>,
+    #[serde(default)]
+    pub kdf: Option<i32>,
+    #[serde(default)]
+    pub kdf_iterations: Option<i32>,
+    #[serde(default)]
+    pub kdf_memory: Option<i32>,
+    #[serde(default)]
+    pub kdf_parallelism: Option<i32>,
+}
+
+#[worker::send]
+pub async fn post_set_password(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetPasswordRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let user: Option<Value> = db
+        .prepare("SELECT private_key FROM users WHERE id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    if let Some(user) = user {
+        if let Some(private_key) = user.get("private_key").and_then(|v| v.as_str()) {
+            if !private_key.is_empty() {
+                return Err(AppError::BadRequest(
+                    "Account already initialized, cannot set password".to_string(),
+                ));
+            }
+        }
+    }
+
+    let kdf_type = payload.kdf.unwrap_or(KDF_TYPE_ARGON2ID);
+    let kdf_iterations = payload.kdf_iterations.unwrap_or(3);
+    let kdf_memory = payload.kdf_memory.or(Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB));
+    let kdf_parallelism = payload.kdf_parallelism.or(Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
+    let (kdf_memory, kdf_parallelism) =
+        validate_kdf(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)?;
+
+    let password_salt = crypto::generate_salt();
+    let master_password_hash = crypto::hash_password(
+        &payload.master_password_hash,
+        &password_salt,
+        kdf_type,
+        kdf_iterations,
+        kdf_memory,
+        kdf_parallelism,
+    )
+    .await
+    .map_err(|_| AppError::Internal)?;
+    let master_password_hint = clean_password_hint(payload.master_password_hint);
+
+    let private_key = payload
+        .keys
+        .as_ref()
+        .map(|k| k.encrypted_private_key.clone())
+        .unwrap_or_default();
+    let public_key = payload
+        .keys
+        .as_ref()
+        .map(|k| k.public_key.clone())
+        .unwrap_or_default();
+
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE users SET master_password_hash = ?1, master_password_hint = ?2, key = ?3, private_key = ?4, public_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, password_salt = ?10, updated_at = ?11 WHERE id = ?12",
+    )
+    .bind(&[
+        master_password_hash.into(),
+        to_js_val(master_password_hint),
+        payload.key.into(),
+        private_key.into(),
+        public_key.into(),
+        kdf_type.into(),
+        kdf_iterations.into(),
+        to_js_val(kdf_memory),
+        to_js_val(kdf_parallelism),
+        to_js_val(Some(password_salt)),
+        now.into(),
+        claims.sub.clone().into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    Ok(Json(json!({
+        "object": "set-password",
+        "captchaBypassToken": ""
     })))
 }
 

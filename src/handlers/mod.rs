@@ -4,6 +4,7 @@ pub mod compat;
 pub mod config;
 pub mod css;
 pub mod devices;
+pub mod events;
 pub mod folders;
 pub mod hibp;
 pub mod icons;

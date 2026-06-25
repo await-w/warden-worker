@@ -177,28 +177,39 @@ pub async fn two_factor_status(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
 
-    let mut providers: Vec<i32> = Vec::new();
+    let mut providers: Vec<serde_json::Value> = Vec::new();
 
     let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
     if authenticator_enabled {
-        providers.push(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR);
+        providers.push(json!({
+            "enabled": true,
+            "type": two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR,
+            "object": "twoFactorProvider"
+        }));
     }
 
     let email_enabled = two_factor::is_email_2fa_enabled(&db, &claims.sub).await?;
     if email_enabled && notify::is_email_webhook_configured(&state.env) {
-        providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
+        providers.push(json!({
+            "enabled": true,
+            "type": two_factor::TWO_FACTOR_PROVIDER_EMAIL,
+            "object": "twoFactorProvider"
+        }));
     }
 
     let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &claims.sub).await?;
     if webauthn_enabled && webauthn::is_webauthn_2fa_supported(&headers) {
-        providers.push(webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN);
+        providers.push(json!({
+            "enabled": true,
+            "type": webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN,
+            "object": "twoFactorProvider"
+        }));
     }
 
-    let enabled = !providers.is_empty();
-
     Ok(Json(json!({
-        "enabled": enabled,
-        "providers": providers
+        "data": providers,
+        "object": "list",
+        "continuationToken": null
     })))
 }
 
