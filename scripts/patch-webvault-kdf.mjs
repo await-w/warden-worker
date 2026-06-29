@@ -31,6 +31,10 @@ function createGlobalRegex(regex) {
   return new RegExp(regex.source, flags);
 }
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function collectRuleMatches(content, regex) {
   const globalRegex = createGlobalRegex(regex);
   const hits = [];
@@ -48,7 +52,9 @@ function collectRuleMatches(content, regex) {
   return hits;
 }
 
-const webVaultAppDir = path.resolve("static", "web-vault", "app");
+const webVaultAppDir = path.resolve(
+  process.env.WEB_VAULT_APP_DIR ?? path.join("static", "web-vault", "app"),
+);
 if (!fs.existsSync(webVaultAppDir)) {
   logError(`Directory not found: ${webVaultAppDir}`);
   process.exit(1);
@@ -82,52 +88,91 @@ if (targets.length === 0) {
   process.exit(1);
 }
 
-const patches = [
-  {
-    name: "default-kdf-config",
-    search: /const (\w+)=new Q\(Q\.ITERATIONS\.defaultValue\);/g,
-    replace:
-      "const $1=new ee(ee.ITERATIONS.defaultValue,ee.MEMORY.defaultValue,ee.PARALLELISM.defaultValue);",
-  },
-  {
-    name: "kdf-form-default",
-    search: /kdf:new a\.MJ\(I\.ao\.PBKDF2_SHA256,\[a\.k0\.required\]\)/g,
-    replace: "kdf:new a.MJ(I.ao.Argon2id,[a.k0.required])",
-  },
-  {
-    name: "argon2-register-defaults",
-    search: /this\.kdfMemory=s\.memory,this\.kdfParallelism=s\.parallelism/g,
-    replace: "this.kdfMemory=null!=s.memory?s.memory:64,this.kdfParallelism=null!=s.parallelism?s.parallelism:4",
-  },
-  {
-    name: "register-request-kdf-params",
-    search:
-      /new zi\(e,t\.newServerMasterKeyHash,t\.newPasswordHint,i,s,t\.kdfConfig\.kdfType,t\.kdfConfig\.iterations\)/g,
-    replace:
-      "new zi(e,t.newServerMasterKeyHash,t.newPasswordHint,i,s,t.kdfConfig.kdfType,t.kdfConfig.iterations,null!=t.kdfConfig.memory?t.kdfConfig.memory:64,null!=t.kdfConfig.parallelism?t.kdfConfig.parallelism:4)",
-  },
-];
+function buildPatches(content) {
+  const patches = [];
+  const pbkdf2Class =
+    /class ([\w$]+)\{constructor\(e\)\{this\.kdfType=([\w$]+)\.PBKDF2_SHA256,this\.iterations=null!=e\?e:\1\.ITERATIONS\.defaultValue/.exec(
+      content,
+    );
+  const argon2Class =
+    /class ([\w$]+)\{constructor\(e,t,i\)\{this\.kdfType=([\w$]+)\.Argon2id,this\.iterations=null!=e\?e:\1\.ITERATIONS\.defaultValue/.exec(
+      content,
+    );
+
+  if (pbkdf2Class && argon2Class && pbkdf2Class[2] === argon2Class[2]) {
+    const pbkdf2Name = escapeRegex(pbkdf2Class[1]);
+    const argon2Name = argon2Class[1];
+    patches.push({
+      name: "default-kdf-config",
+      search: new RegExp(
+        `const ([\\w$]+)=new ${pbkdf2Name}\\(${pbkdf2Name}\\.ITERATIONS\\.defaultValue\\);`,
+        "g",
+      ),
+      replace: (_match, configName) =>
+        `const ${configName}=new ${argon2Name}(${argon2Name}.ITERATIONS.defaultValue,${argon2Name}.MEMORY.defaultValue,${argon2Name}.PARALLELISM.defaultValue);`,
+      replacementDescription: `replace the detected PBKDF2 default with ${argon2Name} Argon2id defaults`,
+    });
+  } else {
+    log("Could not detect matching PBKDF2/Argon2id class symbols in this file.");
+  }
+
+  patches.push(
+    {
+      name: "kdf-form-default",
+      search:
+        /kdf:new ([\w$]+)\.MJ\(([\w$]+)\.ao\.PBKDF2_SHA256,\[\1\.k0\.required\]\)/g,
+      replace: (_match, formSymbol, kdfSymbol) =>
+        `kdf:new ${formSymbol}.MJ(${kdfSymbol}.ao.Argon2id,[${formSymbol}.k0.required])`,
+      replacementDescription: "replace the registration form PBKDF2 default with Argon2id",
+    },
+    {
+      name: "argon2-register-defaults",
+      search:
+        /this\.kdf=([\w$]+)\.ao\.Argon2id,this\.kdfIterations=([\w$]+)\.iterations,this\.kdfMemory=\2\.memory,this\.kdfParallelism=\2\.parallelism/g,
+      replace: (_match, kdfSymbol, kdfConfig) =>
+        `this.kdf=${kdfSymbol}.ao.Argon2id,this.kdfIterations=${kdfConfig}.iterations,this.kdfMemory=null!=${kdfConfig}.memory?${kdfConfig}.memory:64,this.kdfParallelism=null!=${kdfConfig}.parallelism?${kdfConfig}.parallelism:4`,
+      replacementDescription: "add Argon2id memory and parallelism fallbacks",
+    },
+    {
+      name: "register-request-kdf-params",
+      search:
+        /new ([\w$]+)\(([^,()]+),([\w$]+)\.newServerMasterKeyHash,\3\.newPasswordHint,([^,()]+),([^,()]+),\3\.kdfConfig\.kdfType,\3\.kdfConfig\.iterations\)/g,
+      replace: (_match, requestClass, email, state, userKey, asymmetricKeys) =>
+        `new ${requestClass}(${email},${state}.newServerMasterKeyHash,${state}.newPasswordHint,${userKey},${asymmetricKeys},${state}.kdfConfig.kdfType,${state}.kdfConfig.iterations,null!=${state}.kdfConfig.memory?${state}.kdfConfig.memory:64,null!=${state}.kdfConfig.parallelism?${state}.kdfConfig.parallelism:4)`,
+      replacementDescription: "include Argon2id memory and parallelism in the register request",
+    },
+  );
+
+  return patches;
+}
 
 const functionalSignals = [
   {
+    name: "default-kdf-config-argon2id",
+    search:
+      /const [\w$]+=new ([\w$]+)\(\1\.ITERATIONS\.defaultValue,\1\.MEMORY\.defaultValue,\1\.PARALLELISM\.defaultValue\);/,
+  },
+  {
     name: "form-default-argon2id",
-    search: /kdf:new [^,]+\.MJ\([^,]+\.ao\.Argon2id,\[[^\]]+\.required\]\)/,
+    search:
+      /kdf:new ([\w$]+)\.MJ\(([\w$]+)\.ao\.Argon2id,\[\1\.k0\.required\]\)/,
   },
   {
     name: "register-default-memory-parallelism",
-    search: /kdfMemory=null!=s\.memory\?s\.memory:64,this\.kdfParallelism=null!=s\.parallelism\?s\.parallelism:4/,
+    search:
+      /kdf=([\w$]+)\.ao\.Argon2id,this\.kdfIterations=([\w$]+)\.iterations,this\.kdfMemory=null!=\2\.memory\?\2\.memory:64,this\.kdfParallelism=null!=\2\.parallelism\?\2\.parallelism:4/,
   },
   {
     name: "request-carries-kdf-memory-parallelism",
-    search: /kdfConfig\.memory|kdfConfig\.parallelism/,
+    search:
+      /kdfConfig\.iterations,null!=([\w$]+)\.kdfConfig\.memory\?\1\.kdfConfig\.memory:64,null!=\1\.kdfConfig\.parallelism\?\1\.kdfConfig\.parallelism:4/,
   },
 ];
 
-function collectSignalHits(files) {
+function collectSignalHits(fileContents) {
   const hitMap = new Map(functionalSignals.map((signal) => [signal.name, false]));
   const hitFiles = new Map(functionalSignals.map((signal) => [signal.name, []]));
-  for (const file of files) {
-    const content = fs.readFileSync(file, "utf8");
+  for (const [file, content] of fileContents) {
     const rel = normalizePath(file);
     log(`Signal scan file: ${rel}`);
     for (const signal of functionalSignals) {
@@ -153,13 +198,18 @@ function allSignalsSatisfied(hitMap) {
 }
 
 let totalReplacements = 0;
+const originalContents = new Map(
+  targets.map((file) => [file, fs.readFileSync(file, "utf8")]),
+);
+const patchedContents = new Map(originalContents);
+const changedFiles = new Set();
 for (const file of targets) {
-  let content = fs.readFileSync(file, "utf8");
+  let content = originalContents.get(file);
   let fileReplacements = 0;
   const rel = normalizePath(file);
   log(`Start patch scan: ${rel}`);
 
-  for (const patch of patches) {
+  for (const patch of buildPatches(content)) {
     const matches = collectRuleMatches(content, patch.search);
     if (matches.length > 0) {
       log(
@@ -172,7 +222,7 @@ for (const file of targets) {
           `  [${patch.name} #${i + 1}] index=${hit.index} | before="${preview(hit.before)}" | matched="${preview(hit.matched)}" | after="${preview(hit.after)}"`,
         );
         log(
-          `  [${patch.name} #${i + 1}] replacement="${preview(patch.replace)}"`,
+          `  [${patch.name} #${i + 1}] replacement="${preview(patch.replacementDescription ?? patch.replace)}"`,
         );
       }
       if (matches.length > MAX_LOGGED_MATCHES_PER_RULE) {
@@ -187,22 +237,23 @@ for (const file of targets) {
     const before = content;
     content = content.replace(createGlobalRegex(patch.search), patch.replace);
     if (content !== before) {
-      fileReplacements++;
+      fileReplacements += matches.length;
       log(`Rule applied: ${patch.name} in ${rel}`);
     }
   }
 
   if (fileReplacements > 0) {
-    fs.writeFileSync(file, content, "utf8");
+    patchedContents.set(file, content);
+    changedFiles.add(file);
     totalReplacements += fileReplacements;
-    log(`Patched ${rel} (${fileReplacements} rule(s) hit)`);
+    log(`Prepared ${rel} (${fileReplacements} replacement(s))`);
   } else {
     log(`No changes for file: ${rel}`);
   }
 }
 
 if (totalReplacements === 0) {
-  const { hitMap, hitFiles } = collectSignalHits(targets);
+  const { hitMap, hitFiles } = collectSignalHits(originalContents);
   for (const signal of functionalSignals) {
     const files = hitFiles.get(signal.name);
     if (files.length > 0) {
@@ -226,7 +277,8 @@ if (totalReplacements === 0) {
   process.exit(1);
 }
 
-const { hitMap: signalHitsAfterPatchMap, hitFiles: signalHitsAfterPatchFiles } = collectSignalHits(targets);
+const { hitMap: signalHitsAfterPatchMap, hitFiles: signalHitsAfterPatchFiles } =
+  collectSignalHits(patchedContents);
 for (const signal of functionalSignals) {
   const files = signalHitsAfterPatchFiles.get(signal.name);
   if (files.length > 0) {
@@ -245,4 +297,9 @@ if (!allSignalsSatisfied(signalHitsAfterPatchMap)) {
   process.exit(1);
 }
 
-log(`Done. Total rule hits: ${totalReplacements}`);
+for (const file of changedFiles) {
+  fs.writeFileSync(file, patchedContents.get(file), "utf8");
+  log(`Patched ${normalizePath(file)}`);
+}
+
+log(`Done. Total replacements: ${totalReplacements}`);
