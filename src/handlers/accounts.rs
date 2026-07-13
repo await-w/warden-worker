@@ -449,6 +449,21 @@ pub async fn register(
 
     reject_registration_if_user_exists(&db).await?;
 
+    let email = payload.email.trim().to_lowercase();
+    if !payload.current_format_is_valid(&email) {
+        return Err(AppError::UnprocessableEntity(
+            "Unexpected RegisterData format".to_string(),
+        ));
+    }
+
+    let registration_kdf = payload.kdf();
+    let kdf_type = registration_kdf.kdf;
+    let kdf_iterations = registration_kdf.kdf_iterations;
+    let kdf_memory = registration_kdf.kdf_memory;
+    let kdf_parallelism = registration_kdf.kdf_parallelism;
+    let master_password_hash = payload.master_password_hash().to_string();
+    let user_symmetric_key = payload.user_symmetric_key().to_string();
+
     // Check if email is in ALLOWED_EMAILS list
     let allowed_emails = state
         .env
@@ -460,12 +475,11 @@ pub async fn register(
         .ok_or_else(|| AppError::Internal)?;
     if allowed_emails
         .split(",")
-        .all(|email| email.trim().to_lowercase() != payload.email.to_lowercase())
+        .all(|allowed| allowed.trim().to_lowercase() != email)
     {
         return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
     }
     let now = Utc::now().to_rfc3339();
-    let email = payload.email.to_lowercase();
 
     let jwt_keys = state.jwt_keys.clone();
     let name_from_token = if let Some(token) = payload.email_verification_token.as_ref() {
@@ -485,14 +499,10 @@ pub async fn register(
         .or_else(|| payload.name.filter(|n| !n.trim().is_empty()))
         .unwrap_or_else(|| email.clone());
 
-    let (kdf_memory, kdf_parallelism) = validate_kdf(
-        payload.kdf,
-        payload.kdf_iterations,
-        payload.kdf_memory,
-        payload.kdf_parallelism,
-    )?;
+    let (kdf_memory, kdf_parallelism) =
+        validate_kdf(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)?;
 
-    let server_password = password::hash_password(&payload.master_password_hash, None).await?;
+    let server_password = password::hash_password(&master_password_hash, None).await?;
     let master_password_hint = clean_password_hint(payload.master_password_hint);
 
     let user = User {
@@ -503,11 +513,11 @@ pub async fn register(
         avatar_color: None,
         master_password_hash: server_password.hash,
         master_password_hint,
-        key: payload.user_symmetric_key,
+        key: user_symmetric_key,
         private_key: payload.user_asymmetric_keys.encrypted_private_key,
         public_key: payload.user_asymmetric_keys.public_key,
-        kdf_type: payload.kdf,
-        kdf_iterations: payload.kdf_iterations,
+        kdf_type,
+        kdf_iterations,
         kdf_memory,
         kdf_parallelism,
         security_stamp: Uuid::new_v4().to_string(),

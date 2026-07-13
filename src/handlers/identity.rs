@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use worker::wasm_bindgen::JsValue;
 
+use super::sends;
 use crate::background::BackgroundExecutor;
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
@@ -167,7 +168,9 @@ pub struct TokenRequest {
     #[serde(rename = "scope")]
     _scope: Option<String>,
     #[serde(rename = "client_id")]
-    _client_id: Option<String>,
+    client_id: Option<String>,
+    send_id: Option<String>,
+    password_hash_b64: Option<String>,
     #[serde(
         rename = "deviceIdentifier",
         alias = "device_identifier",
@@ -658,6 +661,32 @@ pub async fn token(
 ) -> Result<Response, AppError> {
     let db = db::get_db(&state.env)?;
     match payload.grant_type.as_str() {
+        "send_access" => {
+            if payload.client_id.as_deref().is_none_or(str::is_empty) {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_request",
+                        "error_description": "client_id cannot be blank"
+                    })),
+                )
+                    .into_response());
+            }
+            let Some(access_id) = payload.send_id.as_deref().filter(|value| !value.is_empty())
+            else {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_request",
+                        "error_description": "send_id cannot be blank"
+                    })),
+                )
+                    .into_response());
+            };
+
+            sends::issue_send_access_token(&state, &headers, access_id, payload.password_hash_b64)
+                .await
+        }
         "password" => {
             let username = payload
                 .username

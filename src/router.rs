@@ -249,7 +249,15 @@ pub fn api_router_with_keys(
         )
         .route("/api/sends", get(sends::get_sends).post(sends::post_send))
         .route("/api/sends/file/v2", post(sends::post_send_file_v2))
-        .route("/api/sends/access/{access_id}", post(sends::post_access))
+        .route("/api/sends/access", post(sends::post_access))
+        .route(
+            "/api/sends/access/{access_id}",
+            post(sends::post_access_legacy),
+        )
+        .route(
+            "/api/sends/access/file/{file_id}",
+            post(sends::post_access_file),
+        )
         .route(
             "/api/sends/{send_id}",
             get(sends::get_send)
@@ -262,7 +270,7 @@ pub fn api_router_with_keys(
         )
         .route(
             "/api/sends/{send_id}/access/file/{file_id}",
-            post(sends::post_access_file),
+            post(sends::post_access_file_legacy),
         )
         .route("/api/sends/{send_id}/{file_id}", get(sends::download_send))
         .route(

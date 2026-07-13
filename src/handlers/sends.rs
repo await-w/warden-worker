@@ -3,7 +3,7 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::HeaderMap,
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
@@ -31,6 +31,8 @@ use crate::{
 
 const SEND_FILES_BUCKET_BINDING: &str = "SEND_FILES_BUCKET";
 const SEND_ACCESS_RATE_LIMITER_BINDING: &str = "SEND_ACCESS_LIMITER";
+const SEND_ACCESS_TOKEN_ISSUER: &str = "warden-worker|send";
+const SEND_ACCESS_TOKEN_TTL_MINUTES: i64 = 2;
 
 /// Cookie name for Turnstile send-access pass (HttpOnly, signed JWT for backend)
 const SEND_ACCESS_COOKIE: &str = "cf_send_pass";
@@ -152,6 +154,14 @@ struct SendAccessPassClaims {
     aud: String,
     exp: usize,
     iat: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SendAccessTokenClaims {
+    nbf: usize,
+    exp: usize,
+    iss: String,
+    sub: String,
 }
 
 /// Create a signed JWT cookie value valid for `SEND_ACCESS_COOKIE_TTL_MINUTES`.
@@ -433,6 +443,15 @@ fn extract_send_payload_data(mut data: SendData) -> Result<(i32, String, Value),
     Ok((send_type, data.key, payload))
 }
 
+fn reject_unsupported_email_verification(data: &SendData) -> Result<(), AppError> {
+    if data.emails.is_some() {
+        return Err(AppError::BadRequest(
+            "Sends with email verification are not supported".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn get_send_by_id(
     db: &worker::D1Database,
     send_id: &str,
@@ -537,6 +556,160 @@ fn validate_send_password(send: &SendDBModel, password: Option<String>) -> Resul
     }
     log::debug!(target: targets::AUTH, "send.password_check.ok send_id={}", send.id);
     Ok(())
+}
+
+fn send_access_token_error(
+    status: StatusCode,
+    error: &'static str,
+    error_type: &'static str,
+    description: &'static str,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "kind": "expected_server",
+            "error": error,
+            "error_description": description,
+            "send_access_error_type": error_type,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn issue_send_access_token(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    access_id: &str,
+    password_hash_b64: Option<String>,
+) -> Result<Response, AppError> {
+    require_send_access_pass(state, headers).await?;
+
+    let client_ip = request_client_ip(headers);
+    enforce_send_access_rate_limit(
+        state,
+        format!(
+            "send_token:{}:{}",
+            access_id,
+            client_ip.as_deref().unwrap_or("unknown")
+        ),
+    )
+    .await?;
+
+    let Some(send_id) = uuid_from_access_id(access_id) else {
+        return Ok(send_access_token_error(
+            StatusCode::NOT_FOUND,
+            "invalid_grant",
+            "send_id_invalid",
+            "Invalid Send identifier",
+        ));
+    };
+
+    let db = db::get_db(&state.env)?;
+    let Some(send) = get_send_by_id(&db, &send_id).await? else {
+        return Ok(send_access_token_error(
+            StatusCode::NOT_FOUND,
+            "invalid_grant",
+            "send_id_invalid",
+            "Invalid Send identifier",
+        ));
+    };
+
+    if validate_send_access(&send).is_err() {
+        return Ok(send_access_token_error(
+            StatusCode::NOT_FOUND,
+            "invalid_grant",
+            "send_id_invalid",
+            "Send is unavailable",
+        ));
+    }
+
+    if let Some(stored_hash_b64) = send.password_hash.as_deref() {
+        let Some(stored_salt_b64) = send.password_salt.as_deref() else {
+            log::error!(target: targets::AUTH, "send.token.error send_id={} reason=missing_salt", send.id);
+            return Err(AppError::Internal);
+        };
+        let Some(password_hash_b64) = password_hash_b64 else {
+            return Ok(send_access_token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "password_hash_b64_required",
+                "Password is required",
+            ));
+        };
+        let candidate = hash_password(&password_hash_b64, stored_salt_b64)?;
+        if !constant_time_eq(stored_hash_b64.as_bytes(), candidate.as_bytes()) {
+            log::warn!(
+                target: targets::AUTH,
+                "send.token.denied send_id={} reason=password_mismatch ip={}",
+                send.id,
+                client_ip.as_deref().unwrap_or("unknown")
+            );
+            return Ok(send_access_token_error(
+                StatusCode::NOT_FOUND,
+                "invalid_grant",
+                "password_hash_b64_invalid",
+                "Invalid password",
+            ));
+        }
+    }
+
+    update_send_access_count(&db, &send.id, 1).await?;
+
+    let now = Utc::now();
+    let expires_in = chrono::Duration::minutes(SEND_ACCESS_TOKEN_TTL_MINUTES);
+    let claims = SendAccessTokenClaims {
+        nbf: now.timestamp() as usize,
+        exp: (now + expires_in).timestamp() as usize,
+        iss: SEND_ACCESS_TOKEN_ISSUER.to_string(),
+        sub: send.id.clone(),
+    };
+    let access_token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(state.jwt_keys.access_secret.as_bytes()),
+    )?;
+
+    log::info!(
+        target: targets::AUTH,
+        "send.token.success send_id={} ip={}",
+        send.id,
+        client_ip.as_deref().unwrap_or("unknown")
+    );
+
+    Ok(Json(json!({
+        "access_token": access_token,
+        "expires_in": expires_in.num_seconds(),
+        "token_type": "Bearer",
+        "scope": "api.send.access",
+    }))
+    .into_response())
+}
+
+fn send_id_from_access_token(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<String, AppError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("No access token provided".to_string()))?;
+
+    let token_data = jsonwebtoken::decode::<SendAccessTokenClaims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(state.jwt_keys.access_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid Send access token".to_string()))?;
+
+    if token_data.claims.iss != SEND_ACCESS_TOKEN_ISSUER {
+        return Err(AppError::Unauthorized(
+            "Invalid Send access token".to_string(),
+        ));
+    }
+
+    Ok(token_data.claims.sub)
 }
 
 #[worker::send]
@@ -759,6 +932,7 @@ pub async fn post_send(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    reject_unsupported_email_verification(&payload)?;
 
     if payload.r#type == SEND_TYPE_FILE {
         return Err(AppError::BadRequest(
@@ -897,6 +1071,7 @@ pub async fn put_send(
 
     let payload: SendData = serde_json::from_value(raw_payload)
         .map_err(|_| AppError::BadRequest("Invalid send payload".to_string()))?;
+    reject_unsupported_email_verification(&payload)?;
 
     let existing = get_send_by_id_and_user(&db, &send_id, &claims.sub)
         .await?
@@ -1084,6 +1259,7 @@ pub async fn post_send_file_v2(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    reject_unsupported_email_verification(&payload)?;
 
     if payload.r#type != SEND_TYPE_FILE {
         return Err(AppError::BadRequest(
@@ -1354,6 +1530,22 @@ pub async fn post_send_file_v2_data(
 pub async fn post_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let send_id = send_id_from_access_token(&state, &headers)?;
+    let db = db::get_db(&state.env)?;
+    let send = get_send_by_id(&db, &send_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
+    let creator_identifier = get_creator_identifier(&db, &send).await?;
+
+    log::info!(target: targets::AUTH, "send.access_token.success send_id={} type={}", send.id, send.r#type);
+    Ok(Json(send_to_json_access(&send, creator_identifier)))
+}
+
+#[worker::send]
+pub async fn post_access_legacy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(access_id): Path<String>,
     Json(payload): Json<SendAccessData>,
 ) -> Result<Json<Value>, AppError> {
@@ -1407,6 +1599,39 @@ pub async fn post_access(
 
 #[worker::send]
 pub async fn post_access_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let send_id = send_id_from_access_token(&state, &headers)?;
+    let db = db::get_db(&state.env)?;
+    let send = get_send_by_id(&db, &send_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
+
+    let file_exists: Option<i64> = db
+        .prepare("SELECT 1 AS ok FROM send_files WHERE id = ?1 AND send_id = ?2 LIMIT 1")
+        .bind(&[file_id.clone().into(), send.id.clone().into()])?
+        .first(Some("ok"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    if file_exists.is_none() {
+        return Err(AppError::NotFound("Send not found".to_string()));
+    }
+
+    let token = generate_download_token(&state, &send.id, &file_id).await?;
+    let url = format!("/api/sends/{}/{file_id}?t={token}", send.id);
+
+    log::info!(target: targets::AUTH, "send.access_file_token.success send_id={} file_id={}", send.id, file_id);
+    Ok(Json(json!({
+        "object": "send-fileDownload",
+        "id": file_id,
+        "url": url
+    })))
+}
+
+#[worker::send]
+pub async fn post_access_file_legacy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((send_id, file_id)): Path<(String, String)>,

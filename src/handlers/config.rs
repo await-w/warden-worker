@@ -44,7 +44,8 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
             "unauth-ui-refresh": true,
             "enable-pm-flight-recorder": true,
             "mobile-error-reporting": true,
-            "pm-19148-innovation-archive": true
+            "pm-19148-innovation-archive": true,
+            "pm-26340-linux-biometrics-v2": true
         },
         "object": "config",
     }))

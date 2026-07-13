@@ -1017,6 +1017,7 @@ pub async fn verify_passwordless_login_assertion(
     fn app_error_message(err: AppError) -> String {
         match err {
             AppError::BadRequest(msg) => msg,
+            AppError::UnprocessableEntity(msg) => msg,
             AppError::Unauthorized(msg) => msg,
             AppError::NotFound(msg) => msg,
             AppError::Database => "database error".to_string(),

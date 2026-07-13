@@ -122,6 +122,7 @@ pub struct SendData {
     #[serde(default)]
     pub disabled: bool,
     pub hide_email: Option<bool>,
+    pub emails: Option<String>,
     pub name: String,
     pub notes: Option<String>,
     pub text: Option<Value>,
@@ -224,7 +225,7 @@ pub fn send_to_json(send: &SendDBModel) -> Value {
             SEND_AUTH_TYPE_NONE
         },
         "disabled": send.disabled,
-        "hideEmail": send.hide_email,
+        "hideEmail": send.hide_email.unwrap_or(false),
         "revisionDate": send.updated_at,
         "expirationDate": send.expiration_date,
         "deletionDate": send.deletion_date,
@@ -306,6 +307,15 @@ mod tests {
         assert_eq!(
             value.get("authType").and_then(|v| v.as_i64()),
             Some(SEND_AUTH_TYPE_NONE as i64)
+        );
+    }
+
+    #[test]
+    fn send_to_json_emits_non_null_hide_email() {
+        let value = send_to_json(&base_send(None));
+        assert_eq!(
+            value.get("hideEmail").and_then(|v| v.as_bool()),
+            Some(false)
         );
     }
 }
