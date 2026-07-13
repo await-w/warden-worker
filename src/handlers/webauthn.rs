@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, header},
 };
-use constant_time_eq::constant_time_eq;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -11,7 +10,8 @@ use std::sync::Arc;
 use crate::logging::targets;
 use crate::notify::{NotifyContext, NotifyEvent, extract_request_meta};
 use crate::{
-    auth::Claims, db, error::AppError, jwt, notify, router::AppState, two_factor, webauthn,
+    auth::Claims, db, error::AppError, jwt, notify, password, router::AppState, two_factor,
+    webauthn,
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -26,60 +26,7 @@ impl SecretVerificationData {
     async fn validate(&self, db: &worker::D1Database, user_id: &str) -> Result<(), AppError> {
         match (&self.master_password_hash, &self.otp) {
             (Some(master_password_hash), None) => {
-                // 查询用户的密码哈希、salt 和 KDF 参数
-                let result: Option<serde_json::Value> = db
-                    .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
-                    .bind(&[user_id.into()])?
-                    .first(None)
-                    .await
-                    .map_err(|_| AppError::Database)?;
-
-                let Some(row) = result else {
-                    return Err(AppError::NotFound("User not found".to_string()));
-                };
-
-                let stored_hash = row
-                    .get("master_password_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-                let kdf_type: i32 = row
-                    .get("kdf_type")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32)
-                    .unwrap_or(0);
-                let kdf_iterations: i32 = row
-                    .get("kdf_iterations")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32)
-                    .unwrap_or(600_000);
-                let kdf_memory: Option<i32> = row
-                    .get("kdf_memory")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-                let kdf_parallelism: Option<i32> = row
-                    .get("kdf_parallelism")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-
-                // 根据 KDF 类型验证密码
-                let password_valid = if let Some(salt) = password_salt {
-                    crate::crypto::verify_password(
-                        master_password_hash,
-                        salt,
-                        stored_hash,
-                        kdf_type,
-                        kdf_iterations,
-                        kdf_memory,
-                        kdf_parallelism,
-                    )
-                    .await
-                } else {
-                    // 直接比较哈希值
-                    constant_time_eq(stored_hash.as_bytes(), master_password_hash.as_bytes())
-                };
-
-                if !password_valid {
+                if !password::verify_user_password(db, user_id, master_password_hash).await? {
                     return Err(AppError::Unauthorized("Invalid credentials".to_string()));
                 }
                 Ok(())

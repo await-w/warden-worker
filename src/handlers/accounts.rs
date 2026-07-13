@@ -1,7 +1,6 @@
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Json, extract::State};
 use chrono::Utc;
-use constant_time_eq::constant_time_eq;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,17 +11,21 @@ use worker::{Delay, query};
 
 use crate::{
     auth::Claims,
-    crypto::{self, KDF_TYPE_ARGON2ID, KDF_TYPE_PBKDF2},
+    crypto::{self, KDF_TYPE_ARGON2ID},
     db,
     error::AppError,
     models::user::{KeyData, PreloginResponse, RegisterRequest, RegisterVerifyClaims, User},
     notify::{self, NotifyContext, NotifyEvent},
+    password,
     router::AppState,
     two_factor,
 };
 
 const PROTECTED_ACTION_OTP_SIZE: u8 = 6;
 const PROTECTED_ACTION_OTP_REQUEST_COOLDOWN_SECONDS: i64 = 30;
+const SINGLE_USER_REGISTRATION_MESSAGE: &str =
+    "Registration is closed because this vault already has an account";
+const SINGLE_USER_TRIGGER_ERROR: &str = "single-user vault already has an account";
 
 fn clean_password_hint(password_hint: Option<String>) -> Option<String> {
     match password_hint {
@@ -106,8 +109,10 @@ pub struct UnlockData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeKdfRequest {
+    #[allow(dead_code)]
     #[serde(alias = "newMasterPasswordHash", alias = "NewMasterPasswordHash")]
     pub new_master_password_hash: String,
+    #[allow(dead_code)]
     #[serde(alias = "Key")]
     pub key: String,
     #[serde(
@@ -442,6 +447,8 @@ pub async fn register(
 
     let db = db::get_db(&state.env)?;
 
+    reject_registration_if_user_exists(&db).await?;
+
     // Check if email is in ALLOWED_EMAILS list
     let allowed_emails = state
         .env
@@ -478,12 +485,6 @@ pub async fn register(
         .or_else(|| payload.name.filter(|n| !n.trim().is_empty()))
         .unwrap_or_else(|| email.clone());
 
-    if payload.kdf != KDF_TYPE_ARGON2ID {
-        return Err(AppError::BadRequest(
-            "Registration requires Argon2id (kdfType=1)".to_string(),
-        ));
-    }
-
     let (kdf_memory, kdf_parallelism) = validate_kdf(
         payload.kdf,
         payload.kdf_iterations,
@@ -491,17 +492,7 @@ pub async fn register(
         payload.kdf_parallelism,
     )?;
 
-    let password_salt = crypto::generate_salt();
-    let master_password_hash = crypto::hash_password(
-        &payload.master_password_hash,
-        &password_salt,
-        payload.kdf,
-        payload.kdf_iterations,
-        payload.kdf_memory,
-        payload.kdf_parallelism,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let server_password = password::hash_password(&payload.master_password_hash, None).await?;
     let master_password_hint = clean_password_hint(payload.master_password_hint);
 
     let user = User {
@@ -510,7 +501,7 @@ pub async fn register(
         email,
         email_verified: true,
         avatar_color: None,
-        master_password_hash,
+        master_password_hash: server_password.hash,
         master_password_hint,
         key: payload.user_symmetric_key,
         private_key: payload.user_asymmetric_keys.encrypted_private_key,
@@ -520,15 +511,16 @@ pub async fn register(
         kdf_memory,
         kdf_parallelism,
         security_stamp: Uuid::new_v4().to_string(),
-        password_salt: Some(password_salt),
+        password_salt: Some(server_password.salt),
+        password_iterations: Some(server_password.iterations),
         created_at: now.clone(),
         updated_at: now,
     };
 
     query!(
         &db,
-        "INSERT INTO users (id, name, email, email_verified, avatar_color, master_password_hash, master_password_hint, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, password_salt, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT INTO users (id, name, email, email_verified, avatar_color, master_password_hash, master_password_hint, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, password_salt, password_iterations, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
          user.id,
          user.name,
          user.email,
@@ -545,21 +537,54 @@ pub async fn register(
          user.kdf_parallelism,
          user.security_stamp,
          user.password_salt,
+         user.password_iterations,
          user.created_at,
          user.updated_at
-    ).map_err(|_|{
+    )
+    .map_err(|error| {
+        log::error!("Failed to prepare user registration insert: {error:?}");
         AppError::Database
     })?
     .run()
     .await
-    .map_err(|_|{
-        AppError::Database
+    .map_err(|error| {
+        let error_message = error.to_string();
+        log::error!("Failed to insert registered user: {error:?}");
+        if is_single_user_registration_conflict(&error_message) {
+            AppError::BadRequest(SINGLE_USER_REGISTRATION_MESSAGE.to_string())
+        } else {
+            AppError::Database
+        }
     })?;
 
     Ok(Json(json!({
         "object": "register",
         "captchaBypassToken": ""
     })))
+}
+
+async fn reject_registration_if_user_exists(db: &worker::D1Database) -> Result<(), AppError> {
+    let existing_user: Option<Value> = db
+        .prepare("SELECT 1 AS user_exists FROM users LIMIT 1")
+        .first(None)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to check whether registration is available: {error:?}");
+            AppError::Database
+        })?;
+
+    if existing_user.is_some() {
+        return Err(AppError::BadRequest(
+            SINGLE_USER_REGISTRATION_MESSAGE.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_single_user_registration_conflict(error: &str) -> bool {
+    error.contains(SINGLE_USER_TRIGGER_ERROR)
+        || error.contains("UNIQUE constraint failed: users.email")
 }
 
 #[worker::send]
@@ -589,27 +614,7 @@ pub async fn change_master_password(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
     let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
 
-    // 验证旧密码
-    let password_valid = if let Some(salt) = &user.password_salt {
-        crypto::verify_password(
-            &payload.master_password_hash,
-            salt,
-            &user.master_password_hash,
-            user.kdf_type,
-            user.kdf_iterations,
-            user.kdf_memory,
-            user.kdf_parallelism,
-        )
-        .await
-    } else {
-        // 旧格式：直接比较哈希值
-        constant_time_eq(
-            user.master_password_hash.as_bytes(),
-            payload.master_password_hash.as_bytes(),
-        )
-    };
-
-    if !password_valid {
+    if !password::verify_user_password(&db, &user.id, &payload.master_password_hash).await? {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
@@ -633,23 +638,15 @@ pub async fn change_master_password(
     let (kdf_memory, kdf_parallelism) =
         validate_kdf(kdf_type, kdf_iterations, kdf_memory_in, kdf_parallelism_in)?;
 
-    let password_salt = crypto::generate_salt();
-    let new_master_password_hash = crypto::hash_password(
-        &payload.new_master_password_hash,
-        &password_salt,
-        kdf_type,
-        kdf_iterations,
-        kdf_memory_in,
-        kdf_parallelism_in,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let existing_salt = user.password_iterations.and(user.password_salt.as_deref());
+    let server_password =
+        password::hash_password(&payload.new_master_password_hash, existing_salt).await?;
 
     db.prepare(
-        "UPDATE users SET master_password_hash = ?1, master_password_hint = ?2, key = ?3, private_key = ?4, public_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, security_stamp = ?10, updated_at = ?11, password_salt = ?12 WHERE id = ?13",
+        "UPDATE users SET master_password_hash = ?1, master_password_hint = ?2, key = ?3, private_key = ?4, public_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, security_stamp = ?10, updated_at = ?11, password_salt = ?12, password_iterations = ?13 WHERE id = ?14",
     )
     .bind(&[
-        new_master_password_hash.into(),
+        server_password.hash.into(),
         to_js_val(master_password_hint),
         payload.user_symmetric_key.into(),
         private_key.into(),
@@ -660,7 +657,8 @@ pub async fn change_master_password(
         to_js_val(kdf_parallelism),
         security_stamp.into(),
         now.into(),
-        to_js_val(Some(password_salt)),
+        server_password.salt.into(),
+        server_password.iterations.into(),
         claims.sub.clone().into(),
     ])?
     .run()
@@ -714,24 +712,7 @@ pub async fn change_email(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
     let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
 
-    if let Some(salt) = &user.password_salt {
-        let password_valid = crypto::verify_password(
-            &payload.master_password_hash,
-            salt,
-            &user.master_password_hash,
-            user.kdf_type,
-            user.kdf_iterations,
-            user.kdf_memory,
-            user.kdf_parallelism,
-        )
-        .await;
-        if !password_valid {
-            return Err(AppError::Unauthorized("Invalid credentials".to_string()));
-        }
-    } else if !constant_time_eq(
-        user.master_password_hash.as_bytes(),
-        payload.master_password_hash.as_bytes(),
-    ) {
+    if !password::verify_user_password(&db, &user.id, &payload.master_password_hash).await? {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
@@ -744,25 +725,17 @@ pub async fn change_email(
     let (kdf_memory, kdf_parallelism) =
         validate_kdf(kdf_type, kdf_iterations, kdf_memory_in, kdf_parallelism_in)?;
 
-    let password_salt = crypto::generate_salt();
-    let new_master_password_hash = crypto::hash_password(
-        &payload.new_master_password_hash,
-        &password_salt,
-        kdf_type,
-        kdf_iterations,
-        kdf_memory_in,
-        kdf_parallelism_in,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let existing_salt = user.password_iterations.and(user.password_salt.as_deref());
+    let server_password =
+        password::hash_password(&payload.new_master_password_hash, existing_salt).await?;
 
     db.prepare(
-        "UPDATE users SET email = ?1, email_verified = ?2, master_password_hash = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10, password_salt = ?11 WHERE id = ?12",
+        "UPDATE users SET email = ?1, email_verified = ?2, master_password_hash = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10, password_salt = ?11, password_iterations = ?12 WHERE id = ?13",
     )
     .bind(&[
         new_email.clone().into(),
         true.into(),
-        new_master_password_hash.into(),
+        server_password.hash.into(),
         payload.user_symmetric_key.into(),
         kdf_type.into(),
         kdf_iterations.into(),
@@ -770,7 +743,8 @@ pub async fn change_email(
         to_js_val(kdf_parallelism),
         security_stamp.into(),
         now.into(),
-        to_js_val(Some(password_salt)),
+        server_password.salt.into(),
+        server_password.iterations.into(),
         claims.sub.clone().into(),
     ])?
     .run()
@@ -822,26 +796,7 @@ pub async fn post_kdf(
         ChangeKdfPayload::Flat(p) => &p.master_password_hash,
     };
 
-    // 验证旧密码
-    let password_valid = if let Some(salt) = &user.password_salt {
-        crypto::verify_password(
-            provided_old_hash,
-            salt,
-            &user.master_password_hash,
-            user.kdf_type,
-            user.kdf_iterations,
-            user.kdf_memory,
-            user.kdf_parallelism,
-        )
-        .await
-    } else {
-        constant_time_eq(
-            user.master_password_hash.as_bytes(),
-            provided_old_hash.as_bytes(),
-        )
-    };
-
-    if !password_valid {
+    if !password::verify_user_password(&db, &user.id, provided_old_hash).await? {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
@@ -854,11 +809,6 @@ pub async fn post_kdf(
         kdf_parallelism_in,
     ) = match &payload {
         ChangeKdfPayload::Vw(p) => {
-            let _ = (
-                &p.authentication_data.master_password_authentication_hash,
-                &p.unlock_data.master_key_wrapped_user_key,
-            );
-
             if p.authentication_data.kdf != p.unlock_data.kdf {
                 return Err(AppError::BadRequest(
                     "KDF settings must be equal for authentication and unlock".to_string(),
@@ -874,8 +824,8 @@ pub async fn post_kdf(
             }
 
             (
-                &p.new_master_password_hash,
-                &p.key,
+                &p.authentication_data.master_password_authentication_hash,
+                &p.unlock_data.master_key_wrapped_user_key,
                 p.unlock_data.kdf.kdf,
                 p.unlock_data.kdf.kdf_iterations,
                 p.unlock_data.kdf.kdf_memory,
@@ -898,23 +848,14 @@ pub async fn post_kdf(
     let now = Utc::now().to_rfc3339();
     let security_stamp = Uuid::new_v4().to_string();
 
-    let password_salt = crypto::generate_salt();
-    let hashed_new_password = crypto::hash_password(
-        new_master_password_hash,
-        &password_salt,
-        kdf_type,
-        kdf_iterations,
-        kdf_memory_in,
-        kdf_parallelism_in,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let existing_salt = user.password_iterations.and(user.password_salt.as_deref());
+    let server_password = password::hash_password(new_master_password_hash, existing_salt).await?;
 
     db.prepare(
-        "UPDATE users SET master_password_hash = ?1, key = ?2, kdf_type = ?3, kdf_iterations = ?4, kdf_memory = ?5, kdf_parallelism = ?6, security_stamp = ?7, updated_at = ?8, password_salt = ?9 WHERE id = ?10",
+        "UPDATE users SET master_password_hash = ?1, key = ?2, kdf_type = ?3, kdf_iterations = ?4, kdf_memory = ?5, kdf_parallelism = ?6, security_stamp = ?7, updated_at = ?8, password_salt = ?9, password_iterations = ?10 WHERE id = ?11",
     )
     .bind(&[
-        hashed_new_password.into(),
+        server_password.hash.into(),
         key.to_string().into(),
         kdf_type.into(),
         kdf_iterations.into(),
@@ -922,7 +863,8 @@ pub async fn post_kdf(
         to_js_val(kdf_parallelism),
         security_stamp.into(),
         now.into(),
-        to_js_val(Some(password_salt)),
+        server_password.salt.into(),
+        server_password.iterations.into(),
         claims.sub.clone().into(),
     ])?
     .run()
@@ -1170,113 +1112,6 @@ pub async fn send_verification_email(
     Ok(Json(json!(token)))
 }
 
-/// KDF 升级函数（参照 vaultwarden 实现）
-/// 当用户的 KDF 参数低于推荐值时，自动升级
-pub async fn kdf_upgrade(
-    db: &worker::D1Database,
-    user: &mut User,
-    password_hash: &str,
-) -> Result<(), AppError> {
-    let kdf_name = match user.kdf_type {
-        crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
-        crypto::KDF_TYPE_ARGON2ID => "Argon2id",
-        _ => "Unknown",
-    };
-    log::info!(
-        "[KDF] kdf_upgrade check: user_id={}, kdf_type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
-        user.id,
-        user.kdf_type,
-        kdf_name,
-        user.kdf_iterations,
-        user.kdf_memory,
-        user.kdf_parallelism
-    );
-
-    let needs_upgrade = match user.kdf_type {
-        KDF_TYPE_PBKDF2 => user.kdf_iterations < crypto::PBKDF2_ITERATIONS_DEFAULT,
-        KDF_TYPE_ARGON2ID => {
-            user.kdf_iterations < crypto::ARGON2ID_ITERATIONS_DEFAULT
-                || user.kdf_memory.unwrap_or(0) < crypto::ARGON2ID_MEMORY_DEFAULT_MB
-                || user.kdf_parallelism.unwrap_or(0) < crypto::ARGON2ID_PARALLELISM_DEFAULT
-        }
-        _ => false,
-    };
-
-    if !needs_upgrade {
-        log::info!("[KDF] kdf_upgrade: no upgrade needed for user {}", user.id);
-        return Ok(());
-    }
-
-    log::info!(
-        "[KDF] kdf_upgrade: upgrading KDF for user {} from {} to recommended values",
-        user.id,
-        kdf_name
-    );
-
-    // 确定升级后的参数
-    let (new_iterations, new_memory, new_parallelism) = match user.kdf_type {
-        KDF_TYPE_PBKDF2 => (crypto::PBKDF2_ITERATIONS_DEFAULT, None, None),
-        KDF_TYPE_ARGON2ID => (
-            crypto::ARGON2ID_ITERATIONS_DEFAULT.max(user.kdf_iterations),
-            Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB.max(user.kdf_memory.unwrap_or(0))),
-            Some(crypto::ARGON2ID_PARALLELISM_DEFAULT.max(user.kdf_parallelism.unwrap_or(0))),
-        ),
-        _ => return Ok(()),
-    };
-
-    // 重新哈希密码
-    let password_salt = match &user.password_salt {
-        Some(salt) => salt.clone(),
-        None => return Ok(()), // 没有 salt 无法升级
-    };
-
-    let new_hash = crypto::hash_password(
-        password_hash,
-        &password_salt,
-        user.kdf_type,
-        new_iterations,
-        new_memory,
-        new_parallelism,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
-
-    // 更新数据库
-    let now = Utc::now().to_rfc3339();
-    db.prepare(
-        "UPDATE users SET master_password_hash = ?1, kdf_iterations = ?2, kdf_memory = ?3, kdf_parallelism = ?4, updated_at = ?5 WHERE id = ?6",
-    )
-    .bind(&[
-        new_hash.clone().into(),
-        new_iterations.into(),
-        to_js_val(new_memory),
-        to_js_val(new_parallelism),
-        now.into(),
-        user.id.clone().into(),
-    ])?
-    .run()
-    .await
-    .map_err(|_| AppError::Database)?;
-
-    // 更新内存中的用户对象
-    user.master_password_hash = new_hash;
-    user.kdf_iterations = new_iterations;
-    user.kdf_memory = new_memory;
-    user.kdf_parallelism = new_parallelism;
-
-    log::info!(
-        "[KDF] kdf_upgrade SUCCESS: user_id={}, kdf_type={} ({}), new_iterations={}, new_memory={:?}, new_parallelism={:?}",
-        user.id,
-        user.kdf_type,
-        kdf_name,
-        user.kdf_iterations,
-        user.kdf_memory,
-        user.kdf_parallelism
-    );
-
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteRecoverData {
@@ -1395,57 +1230,7 @@ async fn verify_user_password(
     user_id: &str,
     password_hash: &str,
 ) -> Result<(), AppError> {
-    let user_row: Option<Value> = db
-        .prepare("SELECT master_password_hash, password_salt, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE id = ?1")
-        .bind(&[user_id.into()])?
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?;
-
-    let Some(row) = user_row else {
-        return Err(AppError::NotFound("User not found".to_string()));
-    };
-
-    let stored_hash = row
-        .get("master_password_hash")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let password_salt = row.get("password_salt").and_then(|v| v.as_str());
-    let kdf_type: i32 = row
-        .get("kdf_type")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(0);
-    let kdf_iterations: i32 = row
-        .get("kdf_iterations")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(600_000);
-    let kdf_memory: Option<i32> = row
-        .get("kdf_memory")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-    let kdf_parallelism: Option<i32> = row
-        .get("kdf_parallelism")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-
-    let valid = if let Some(salt) = password_salt {
-        crypto::verify_password(
-            password_hash,
-            salt,
-            stored_hash,
-            kdf_type,
-            kdf_iterations,
-            kdf_memory,
-            kdf_parallelism,
-        )
-        .await
-    } else {
-        constant_time_eq(stored_hash.as_bytes(), password_hash.as_bytes())
-    };
-
-    if !valid {
+    if !password::verify_user_password(db, user_id, password_hash).await? {
         return Err(AppError::Unauthorized("Invalid password".to_string()));
     }
 
@@ -1497,18 +1282,16 @@ pub async fn post_keys(
     claims.verify_security_stamp(&db).await?;
     let now = Utc::now().to_rfc3339();
 
-    db.prepare(
-        "UPDATE users SET private_key = ?1, public_key = ?2, updated_at = ?3 WHERE id = ?4",
-    )
-    .bind(&[
-        payload.encrypted_private_key.clone().into(),
-        payload.public_key.clone().into(),
-        now.into(),
-        claims.sub.clone().into(),
-    ])?
-    .run()
-    .await
-    .map_err(|_| AppError::Database)?;
+    db.prepare("UPDATE users SET private_key = ?1, public_key = ?2, updated_at = ?3 WHERE id = ?4")
+        .bind(&[
+            payload.encrypted_private_key.clone().into(),
+            payload.public_key.clone().into(),
+            now.into(),
+            claims.sub.clone().into(),
+        ])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
 
     Ok(Json(json!({
         "privateKey": payload.encrypted_private_key,
@@ -1531,7 +1314,11 @@ pub async fn post_api_key(
     let now = Utc::now().to_rfc3339();
 
     db.prepare("UPDATE users SET api_key = ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[api_key.clone().into(), now.into(), claims.sub.clone().into()])?
+        .bind(&[
+            api_key.clone().into(),
+            now.into(),
+            claims.sub.clone().into(),
+        ])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
@@ -1571,12 +1358,9 @@ pub async fn post_verify_email_token(
     use jsonwebtoken::{DecodingKey, Validation, decode};
 
     let decoding_key = DecodingKey::from_secret(state.jwt_keys.access_secret.as_ref());
-    let token_data = decode::<RegisterVerifyClaims>(
-        &payload.token,
-        &decoding_key,
-        &Validation::default(),
-    )
-    .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
+    let token_data =
+        decode::<RegisterVerifyClaims>(&payload.token, &decoding_key, &Validation::default())
+            .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
 
     let email = token_data.claims.sub.to_lowercase();
     if email != claims.email.to_lowercase() {
@@ -1692,34 +1476,27 @@ pub async fn post_set_password(
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
-    if let Some(user) = user {
-        if let Some(private_key) = user.get("private_key").and_then(|v| v.as_str()) {
-            if !private_key.is_empty() {
-                return Err(AppError::BadRequest(
-                    "Account already initialized, cannot set password".to_string(),
-                ));
-            }
-        }
+    if let Some(user) = user
+        && let Some(private_key) = user.get("private_key").and_then(|v| v.as_str())
+        && !private_key.is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "Account already initialized, cannot set password".to_string(),
+        ));
     }
 
     let kdf_type = payload.kdf.unwrap_or(KDF_TYPE_ARGON2ID);
     let kdf_iterations = payload.kdf_iterations.unwrap_or(3);
-    let kdf_memory = payload.kdf_memory.or(Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB));
-    let kdf_parallelism = payload.kdf_parallelism.or(Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
+    let kdf_memory = payload
+        .kdf_memory
+        .or(Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB));
+    let kdf_parallelism = payload
+        .kdf_parallelism
+        .or(Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
     let (kdf_memory, kdf_parallelism) =
         validate_kdf(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)?;
 
-    let password_salt = crypto::generate_salt();
-    let master_password_hash = crypto::hash_password(
-        &payload.master_password_hash,
-        &password_salt,
-        kdf_type,
-        kdf_iterations,
-        kdf_memory,
-        kdf_parallelism,
-    )
-    .await
-    .map_err(|_| AppError::Internal)?;
+    let server_password = password::hash_password(&payload.master_password_hash, None).await?;
     let master_password_hint = clean_password_hint(payload.master_password_hint);
 
     let private_key = payload
@@ -1735,10 +1512,10 @@ pub async fn post_set_password(
 
     let now = Utc::now().to_rfc3339();
     db.prepare(
-        "UPDATE users SET master_password_hash = ?1, master_password_hint = ?2, key = ?3, private_key = ?4, public_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, password_salt = ?10, updated_at = ?11 WHERE id = ?12",
+        "UPDATE users SET master_password_hash = ?1, master_password_hint = ?2, key = ?3, private_key = ?4, public_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, password_salt = ?10, password_iterations = ?11, updated_at = ?12 WHERE id = ?13",
     )
     .bind(&[
-        master_password_hash.into(),
+        server_password.hash.into(),
         to_js_val(master_password_hint),
         payload.key.into(),
         private_key.into(),
@@ -1747,7 +1524,8 @@ pub async fn post_set_password(
         kdf_iterations.into(),
         to_js_val(kdf_memory),
         to_js_val(kdf_parallelism),
-        to_js_val(Some(password_salt)),
+        server_password.salt.into(),
+        server_password.iterations.into(),
         now.into(),
         claims.sub.clone().into(),
     ])?
@@ -1821,5 +1599,16 @@ mod tests {
         let (m, p) = normalize_kdf_for_response(crypto::KDF_TYPE_ARGON2ID, 3, None, None);
         assert_eq!(m, Some(crypto::ARGON2ID_MEMORY_DEFAULT_MB));
         assert_eq!(p, Some(crypto::ARGON2ID_PARALLELISM_DEFAULT));
+    }
+
+    #[test]
+    fn detects_single_user_registration_conflicts() {
+        assert!(is_single_user_registration_conflict(
+            "D1_ERROR: single-user vault already has an account"
+        ));
+        assert!(is_single_user_registration_conflict(
+            "UNIQUE constraint failed: users.email"
+        ));
+        assert!(!is_single_user_registration_conflict("database is locked"));
     }
 }

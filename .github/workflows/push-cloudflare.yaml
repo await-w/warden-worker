@@ -30,6 +30,9 @@ jobs:
               with:
                   persist-credentials: false
 
+            - name: Validate HeavyDo routing
+              run: node --test tests/heavy_do_routing.test.mjs
+
             - name: Check required secrets
               run: |
                   missing_secrets=""
@@ -236,7 +239,7 @@ jobs:
                   echo "database_id=$db_id" >> $GITHUB_OUTPUT
 
             - name: Initialize D1 Database Schema (only for new databases)
-              if: needs.setup-infrastructure.outputs.d1_is_new == 'true'
+              if: steps.setup_d1.outputs.is_new == 'true'
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
                   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -244,6 +247,25 @@ jobs:
                   echo "Initializing new D1 database schema..."
                   wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --file=./sql/schema.sql --remote
                   echo "Database schema initialized successfully."
+
+            - name: Migrate existing database
+              if: steps.setup_d1.outputs.is_new != 'true'
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+              run: |
+                  echo "Checking password_iterations migration..."
+                  column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('users') WHERE name = 'password_iterations'" | jq -r '.[0].results[0].column_count // 0')
+                  if [ "$column_count" = "0" ]; then
+                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_add_password_iterations.sql
+                      echo "Password verifier migration applied."
+                  else
+                      echo "Password verifier migration already applied."
+                  fi
+
+                  echo "Ensuring single-user registration constraint..."
+                  wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_enforce_single_user.sql
+                  echo "Single-user registration constraint is active."
 
             - name: Create R2 Bucket (only if not exists)
               if: needs.preflight.outputs.r2_bucket_exists != 'true'

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS users (
     kdf_parallelism INTEGER DEFAULT 4,
     security_stamp TEXT,
     password_salt TEXT,
+    password_iterations INTEGER NOT NULL DEFAULT 600000,
     totp_recover TEXT,
     equivalent_domains TEXT NOT NULL DEFAULT '[]',
     excluded_globals TEXT NOT NULL DEFAULT '[]',
@@ -43,6 +44,13 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TRIGGER IF NOT EXISTS users_single_user_before_insert
+BEFORE INSERT ON users
+WHEN EXISTS (SELECT 1 FROM users)
+BEGIN
+    SELECT RAISE(ABORT, 'single-user vault already has an account');
+END;
 
 CREATE TABLE IF NOT EXISTS folders (
     id TEXT PRIMARY KEY NOT NULL,

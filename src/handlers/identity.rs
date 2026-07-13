@@ -16,7 +16,7 @@ use crate::background::BackgroundExecutor;
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 use crate::{
-    auth::Claims, crypto, db, error::AppError, jwt, logging::targets, models::user::User,
+    auth::Claims, crypto, db, error::AppError, jwt, logging::targets, models::user::User, password,
     two_factor, webauthn,
 };
 
@@ -696,8 +696,7 @@ pub async fn token(
                     return Err(AppError::Unauthorized("Invalid credentials".to_string()));
                 }
             };
-            let mut user: User =
-                serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
+            let user: User = serde_json::from_value(user_val).map_err(|_| AppError::Internal)?;
 
             // If this is an auth-request login (trusted device), skip master password check
             // and verify the auth-request access code instead.
@@ -832,41 +831,8 @@ pub async fn token(
                 return Ok(Json(response).into_response());
             }
 
-            let password_valid = if let Some(salt) = &user.password_salt {
-                let kdf_name = match user.kdf_type {
-                    crypto::KDF_TYPE_PBKDF2 => "PBKDF2",
-                    crypto::KDF_TYPE_ARGON2ID => "Argon2id",
-                    _ => "Unknown",
-                };
-                log::info!(
-                    "[KDF] Login verification for user {}: kdf_type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
-                    user.id,
-                    user.kdf_type,
-                    kdf_name,
-                    user.kdf_iterations,
-                    user.kdf_memory,
-                    user.kdf_parallelism
-                );
-                crypto::verify_password(
-                    &password_hash,
-                    salt,
-                    &user.master_password_hash,
-                    user.kdf_type,
-                    user.kdf_iterations,
-                    user.kdf_memory,
-                    user.kdf_parallelism,
-                )
-                .await
-            } else {
-                log::info!(
-                    "[KDF] Login verification for user {}: using legacy hash comparison (no salt)",
-                    user.id
-                );
-                constant_time_eq(
-                    user.master_password_hash.as_bytes(),
-                    password_hash.as_bytes(),
-                )
-            };
+            let password_valid =
+                password::verify_user_password(&db, &user.id, &password_hash).await?;
 
             if !password_valid {
                 notify::notify_background(
@@ -884,13 +850,6 @@ pub async fn token(
                     },
                 );
                 return Err(AppError::Unauthorized("Invalid credentials".to_string()));
-            }
-
-            // KDF 升级（参照 vaultwarden 实现）
-            if let Err(e) =
-                crate::handlers::accounts::kdf_upgrade(&db, &mut user, &password_hash).await
-            {
-                log::warn!(target: targets::AUTH, "KDF upgrade failed for user {}: {:?}", user.id, e);
             }
 
             let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user.id).await?;

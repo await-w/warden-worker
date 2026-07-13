@@ -16,6 +16,7 @@ mod logging;
 mod models;
 mod notifications;
 mod notify;
+mod password;
 mod router;
 mod two_factor;
 mod two_factor_key_manager;

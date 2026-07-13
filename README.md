@@ -201,6 +201,17 @@ wrangler deploy
 ### 6. 升级
 > 如果你曾经部署过旧版本并准备升级，建议在客户端 **导出密码库**  → **重新部署本项目（全新初始化数据库）** → **再导入密码库（可显著降低迁移/兼容成本）**。
 
+从旧版本升级到包含 Vaultwarden 兼容服务端密码哈希的版本时，GitHub Actions 会自动检测并添加 `password_iterations` 列。手动部署需要先执行：
+
+```bash
+wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_add_password_iterations.sql
+wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_enforce_single_user.sql
+```
+
+密码迁移不会立即改写现有密码哈希。旧记录会在用户下一次成功输入主密码时自动迁移为独立的 PBKDF2-HMAC-SHA256（600,000 次迭代、64 字节随机 salt）；客户端 KDF 设置保持不变。单用户迁移会阻止继续向 `users` 表插入记录，但不会删除或修改已有用户。注册接口也会在检测到首个用户后立即返回错误，不再执行耗时的密码哈希。
+
+服务端 PBKDF2 使用 Rust/Wasm 实现，以避开 Workers Web Crypto 单次最多 100,000 次迭代的限制。所有创建或验证服务端密码哈希的接口（注册、登录、主密码/邮箱/KDF 修改、密码确认、账号删除、设置密码，以及可能验证主密码的双因素和 WebAuthn 接口）都由 `HEAVY_DO` 承载：Free 计划的入口 Worker 只负责轻量路由，实际 600,000 次 PBKDF2 在每次调用默认具有 30 秒 CPU 上限的 Durable Object 内执行。本项目定位为个人单用户密码库，所有重计算路由共用一个固定名称为 `personal-vault` 的 `HeavyDo` 实例，不按用户或请求创建额外实例；代价是同时发生的重计算会短暂串行，但个人使用场景下可以接受。Free 计划仍需遵守 Durable Objects 的每日请求量和 duration 配额；限制详情参见 [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/) 与 [pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)。
+
 ## 客户端使用建议
 
 - 官方安卓如果之前指向过其它自托管地址，建议“删除账号/清缓存后重新添加服务器”，避免 remember token 跨服务端复用导致登录失败。

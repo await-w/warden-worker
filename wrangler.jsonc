@@ -130,7 +130,7 @@
 	},
 	// 构建配置（等价于 [build]）
 	"build": {
-		"command": "node ./scripts/patch-webvault-kdf.mjs && node ./scripts/patch-webvault-turnstile.mjs && worker-build --release"
+		"command": "node ./scripts/patch-webvault-turnstile.mjs && worker-build --release"
 	},
 	"assets": {
 		"directory": "./static/web-vault",

@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose};
 use constant_time_eq::constant_time_eq;
-use js_sys::{Array, Object, Reflect, Uint8Array};
+#[cfg(target_arch = "wasm32")]
+use js_sys::Uint8Array;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::CryptoKey;
 
 // KDF 类型常量
 pub const KDF_TYPE_PBKDF2: i32 = 0;
@@ -14,18 +14,8 @@ pub const PBKDF2_ITERATIONS_DEFAULT: i32 = 600_000;
 pub const PBKDF2_ITERATIONS_MIN: i32 = 100_000;
 pub const ARGON2ID_MEMORY_DEFAULT_MB: i32 = 64;
 pub const ARGON2ID_PARALLELISM_DEFAULT: i32 = 4;
-pub const ARGON2ID_ITERATIONS_DEFAULT: i32 = 3;
-
-async fn get_subtle_crypto() -> Result<web_sys::SubtleCrypto, String> {
-    let global = js_sys::global();
-    let crypto_val = js_sys::Reflect::get(&global, &JsValue::from_str("crypto"))
-        .map_err(|e| format!("Failed to get crypto: {:?}", e))?;
-    let crypto = crypto_val
-        .dyn_into::<web_sys::Crypto>()
-        .map_err(|_| "Failed to cast to Crypto".to_string())?;
-
-    Ok(crypto.subtle())
-}
+pub const PASSWORD_ITERATIONS_DEFAULT: i32 = 600_000;
+const PASSWORD_SALT_LEN: usize = 64;
 
 /// 使用 PBKDF2-HMAC-SHA256 哈希密码
 ///
@@ -41,174 +31,21 @@ pub async fn hash_password_pbkdf2(
     salt: &str,
     iterations: i32,
 ) -> Result<String, String> {
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
+
     let salt_bytes = general_purpose::STANDARD
         .decode(salt)
         .map_err(|e| format!("Invalid salt: {}", e))?;
-
-    let subtle = get_subtle_crypto().await?;
-
-    // Encode password to bytes
-    let enc =
-        web_sys::TextEncoder::new().map_err(|_| "Failed to create TextEncoder".to_string())?;
-    let password_vec = enc.encode_with_input(password);
-    let password_bytes = Uint8Array::from(&password_vec[..]);
-
-    // Import password as key
-    let key_usages = Array::of1(&JsValue::from_str("deriveBits"));
-
-    let key_promise = subtle
-        .import_key_with_str("raw", &password_bytes, "PBKDF2", false, &key_usages)
-        .map_err(|e| format!("ImportKey failed: {:?}", e))?;
-
-    let key_val = JsFuture::from(key_promise)
-        .await
-        .map_err(|e| format!("ImportKey promise failed: {:?}", e))?;
-    let key = key_val
-        .dyn_into::<CryptoKey>()
-        .map_err(|_| "ImportKey result is not a CryptoKey".to_string())?;
-
-    // Derive bits
-    let params = Object::new();
-    Reflect::set(&params, &"name".into(), &"PBKDF2".into())
-        .map_err(|e| format!("Failed to set params name: {:?}", e))?;
-    Reflect::set(&params, &"salt".into(), &Uint8Array::from(&salt_bytes[..]))
-        .map_err(|e| format!("Failed to set params salt: {:?}", e))?;
-    Reflect::set(
-        &params,
-        &"iterations".into(),
-        &JsValue::from(iterations as u32),
-    )
-    .map_err(|e| format!("Failed to set params iterations: {:?}", e))?;
-    Reflect::set(&params, &"hash".into(), &"SHA-256".into())
-        .map_err(|e| format!("Failed to set params hash: {:?}", e))?;
-
-    let derive_promise = subtle
-        .derive_bits_with_object(
-            &params, &key, 256, // 256 bits
-        )
-        .map_err(|e| format!("DeriveBits failed: {:?}", e))?;
-
-    let derived_bits_val = JsFuture::from(derive_promise)
-        .await
-        .map_err(|e| format!("DeriveBits promise failed: {:?}", e))?;
-
-    let derived_array = Uint8Array::new(&derived_bits_val);
-    let mut derived_vec = vec![0u8; derived_array.length() as usize];
-    derived_array.copy_to(&mut derived_vec);
-
-    Ok(general_purpose::STANDARD.encode(&derived_vec))
-}
-
-/// 使用 Argon2id 哈希密码
-///
-/// # 参数
-/// * `password` - 密码字符串
-/// * `salt` - Base64 编码的盐值
-/// * `iterations` - 迭代次数 (time cost)
-/// * `memory` - 内存使用量 (MB)
-/// * `parallelism` - 并行度
-///
-/// # 返回
-/// Base64 编码的哈希值 (PHC 格式)
-pub fn hash_password_argon2id(
-    password: &str,
-    salt: &str,
-    iterations: i32,
-    memory: i32,
-    parallelism: i32,
-) -> Result<String, String> {
-    use argon2::{
-        Argon2, Params,
-        password_hash::{PasswordHasher, SaltString},
-    };
-
-    // 解码 salt
-    let salt_bytes = general_purpose::STANDARD
-        .decode(salt)
-        .map_err(|e| format!("Invalid salt: {}", e))?;
-
-    // 转换为 SaltString (需要 Base64 编码)
-    let salt_string = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| format!("Failed to encode salt: {:?}", e))?;
-
-    // 构建 Argon2 参数
-    let params = Params::new(
-        (memory as u32) * 1024, // 转换为 KB
-        iterations as u32,
-        parallelism as u32,
-        Some(32), // output length
-    )
-    .map_err(|e| format!("Invalid Argon2 params: {:?}", e))?;
-
-    // 创建 Argon2id 实例
-    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-
-    // 哈希密码
-    let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| format!("Argon2 hash failed: {:?}", e))?;
-
-    // 返回 PHC 格式字符串 ($argon2id$v=19$m=65540,t=3,p=4$...)
-    Ok(password_hash.to_string())
-}
-
-/// 根据 KDF 类型哈希密码
-///
-/// # 参数
-/// * `password` - 密码字符串
-/// * `salt` - Base64 编码的盐值
-/// * `kdf_type` - KDF 类型 (0=PBKDF2, 1=Argon2id)
-/// * `iterations` - 迭代次数
-/// * `memory` - 内存使用量 (Argon2id 专用，MB)
-/// * `parallelism` - 并行度 (Argon2id 专用)
-///
-/// # 返回
-/// Base64 编码的哈希值 (PBKDF2) 或 PHC 格式字符串 (Argon2id)
-pub async fn hash_password(
-    password: &str,
-    salt: &str,
-    kdf_type: i32,
-    iterations: i32,
-    memory: Option<i32>,
-    parallelism: Option<i32>,
-) -> Result<String, String> {
-    let kdf_name = match kdf_type {
-        KDF_TYPE_PBKDF2 => "PBKDF2",
-        KDF_TYPE_ARGON2ID => "Argon2id",
-        _ => "Unknown",
-    };
-    log::info!(
-        "[KDF] hash_password: type={} ({}), iterations={}, memory={:?}, parallelism={:?}",
-        kdf_type,
-        kdf_name,
-        iterations,
-        memory,
-        parallelism
-    );
-
-    match kdf_type {
-        KDF_TYPE_PBKDF2 => {
-            log::debug!("[KDF] Hashing with PBKDF2, {} iterations", iterations);
-            hash_password_pbkdf2(password, salt, iterations).await
-        }
-        KDF_TYPE_ARGON2ID => {
-            let memory =
-                memory.ok_or_else(|| "Missing memory parameter for Argon2id".to_string())?;
-            let parallelism = parallelism
-                .ok_or_else(|| "Missing parallelism parameter for Argon2id".to_string())?;
-            log::debug!(
-                "[KDF] Hashing with Argon2id, iterations={}, memory={}MB, parallelism={}",
-                iterations,
-                memory,
-                parallelism
-            );
-            hash_password_argon2id(password, salt, iterations, memory, parallelism)
-        }
-        _ => {
-            log::error!("[KDF] Invalid KDF type: {}", kdf_type);
-            Err(format!("Invalid KDF type: {}", kdf_type))
-        }
+    let iterations = u32::try_from(iterations)
+        .map_err(|_| "PBKDF2 iterations must be greater than zero".to_string())?;
+    if iterations == 0 {
+        return Err("PBKDF2 iterations must be greater than zero".to_string());
     }
+
+    let mut derived = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_bytes, iterations, &mut derived);
+    Ok(general_purpose::STANDARD.encode(derived))
 }
 
 /// 验证 PBKDF2 密码
@@ -300,27 +137,58 @@ pub async fn verify_password(
     }
 }
 
-/// 生成随机盐值 (32 字节)
-pub fn generate_salt() -> String {
-    let mut salt = [0u8; 32];
-    let global = js_sys::global();
-
-    if let Ok(crypto_val) = js_sys::Reflect::get(&global, &JsValue::from_str("crypto"))
-        && let Ok(crypto) = crypto_val.dyn_into::<web_sys::Crypto>()
+fn generate_salt_bytes<const N: usize>() -> String {
+    let mut salt = [0u8; N];
+    #[cfg(target_arch = "wasm32")]
     {
-        let array = Uint8Array::new_with_length(32);
-        if crypto
-            .get_random_values_with_array_buffer_view(&array)
-            .is_ok()
+        let global = js_sys::global();
+
+        if let Ok(crypto_val) = js_sys::Reflect::get(&global, &JsValue::from_str("crypto"))
+            && let Ok(crypto) = crypto_val.dyn_into::<web_sys::Crypto>()
         {
-            let mut vec = vec![0u8; 32];
-            array.copy_to(&mut vec);
-            return general_purpose::STANDARD.encode(&vec);
+            let array = Uint8Array::new_with_length(N as u32);
+            if crypto
+                .get_random_values_with_array_buffer_view(&array)
+                .is_ok()
+            {
+                let mut vec = vec![0u8; N];
+                array.copy_to(&mut vec);
+                return general_purpose::STANDARD.encode(&vec);
+            }
         }
     }
 
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
     general_purpose::STANDARD.encode(salt)
+}
+
+/// 生成与 Vaultwarden 一致的 64 字节服务端密码盐。
+pub fn generate_password_salt() -> String {
+    generate_salt_bytes::<PASSWORD_SALT_LEN>()
+}
+
+/// 使用 Vaultwarden 的服务端密码验证算法：PBKDF2-HMAC-SHA256，输出 32 字节。
+pub async fn hash_server_password(
+    password_hash: &str,
+    salt: &str,
+    iterations: i32,
+) -> Result<String, String> {
+    hash_password_pbkdf2(password_hash, salt, iterations).await
+}
+
+pub async fn verify_server_password(
+    password_hash: &str,
+    salt: &str,
+    stored_hash: &str,
+    iterations: i32,
+) -> bool {
+    match hash_server_password(password_hash, salt, iterations).await {
+        Ok(candidate) => constant_time_eq(candidate.as_bytes(), stored_hash.as_bytes()),
+        Err(error) => {
+            log::warn!("Failed to calculate server password hash: {error}");
+            false
+        }
+    }
 }
 
 /// 验证 KDF 参数
@@ -437,5 +305,22 @@ mod tests {
         let (mem, par) = normalize_kdf_params(KDF_TYPE_ARGON2ID, 0, None, None);
         assert_eq!(mem, Some(ARGON2ID_MEMORY_DEFAULT_MB));
         assert_eq!(par, Some(ARGON2ID_PARALLELISM_DEFAULT));
+    }
+
+    #[test]
+    fn server_password_hash_matches_pbkdf2_sha256_vector() {
+        let salt = general_purpose::STANDARD.encode(b"salt");
+        let hash = futures::executor::block_on(hash_server_password("password", &salt, 1))
+            .expect("PBKDF2 vector should hash");
+        assert_eq!(hash, "Eg+2z/z4syxD5yJSVsT4N6hlSMkszDVICAWYfLcL4Xs=");
+    }
+
+    #[test]
+    fn server_password_salt_is_64_bytes() {
+        let salt = generate_password_salt();
+        let decoded = general_purpose::STANDARD
+            .decode(salt)
+            .expect("password salt should be valid base64");
+        assert_eq!(decoded.len(), 64);
     }
 }

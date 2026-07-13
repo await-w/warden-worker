@@ -10,8 +10,8 @@ use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
 use crate::handlers::{
-    accounts, ciphers, compat, config, css, devices, events, folders, hibp, icons, identity, import,
-    sends, settings, sync, two_factor, usage, webauthn,
+    accounts, ciphers, compat, config, css, devices, events, folders, hibp, icons, identity,
+    import, sends, settings, sync, two_factor, usage, webauthn,
 };
 use crate::jwt_manager::JwtKeys;
 use crate::two_factor_key_manager::TwoFactorKey;
@@ -62,10 +62,7 @@ pub fn api_router_with_keys(
         )
         .route("/api/accounts/prelogin", post(accounts::prelogin))
         .route("/api/accounts/prelogin/password", post(accounts::prelogin))
-        .route(
-            "/identity/accounts/register",
-            post(accounts::register),
-        )
+        .route("/identity/accounts/register", post(accounts::register))
         .route(
             "/identity/accounts/register/finish",
             post(accounts::register),
