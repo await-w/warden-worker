@@ -102,6 +102,7 @@ async fn create_cipher_inner(
         organization_id: cipher_data_req.organization_id.clone(),
         r#type: cipher_data_req.r#type,
         data: data_value,
+        key: cipher_data_req.key.clone(),
         favorite: cipher_data_req.favorite,
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: None,
@@ -123,13 +124,14 @@ async fn create_cipher_inner(
 
     query!(
         &db,
-        "INSERT INTO ciphers (id, user_id, organization_id, type, data, favorite, folder_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO ciphers (id, user_id, organization_id, type, data, key, favorite, folder_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
          cipher.id,
          cipher.user_id,
          cipher.organization_id,
          cipher.r#type,
          data,
+         cipher.key,
          cipher.favorite,
          cipher.folder_id,
          cipher.created_at,
@@ -246,6 +248,7 @@ pub async fn update_cipher(
         organization_id: cipher_data_req.organization_id.clone(),
         r#type: cipher_data_req.r#type,
         data: data_value,
+        key: cipher_data_req.key.clone(),
         favorite: cipher_data_req.favorite,
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: existing_cipher.deleted_at,
@@ -263,10 +266,11 @@ pub async fn update_cipher(
 
     query!(
         &db,
-        "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6 WHERE id = ?7 AND user_id = ?8",
+        "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, key = ?4, favorite = ?5, folder_id = ?6, updated_at = ?7 WHERE id = ?8 AND user_id = ?9",
         cipher.organization_id,
         cipher.r#type,
         data,
+        cipher.key,
         cipher.favorite,
         cipher.folder_id,
         cipher.updated_at,

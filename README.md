@@ -205,8 +205,11 @@ wrangler deploy
 
 ```bash
 wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_add_password_iterations.sql
+wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_cipher_key.sql
 wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_enforce_single_user.sql
 ```
+
+`20260716_add_cipher_key.sql` 为密码项增加独立加密密钥列，使 2026.6.1 及更新版本的 Bitwarden 客户端可以正常创建和同步密码项。该迁移不会修改已有密码项；升级 Worker 前必须先应用，否则新建或更新密码项会因缺少数据库列而失败。
 
 密码迁移不会立即改写现有密码哈希。旧记录会在用户下一次成功输入主密码时自动迁移为独立的 PBKDF2-HMAC-SHA256（600,000 次迭代、64 字节随机 salt）；客户端 KDF 设置保持不变。单用户迁移会阻止继续向 `users` 表插入记录，但不会删除或修改已有用户。注册接口也会在检测到首个用户后立即返回错误，不再执行耗时的密码哈希。
 

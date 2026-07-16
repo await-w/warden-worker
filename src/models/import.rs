@@ -17,6 +17,8 @@ pub struct ImportCipher {
     #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub folder_id: Option<String>,
     pub organization_id: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
     pub name: String,
     pub notes: Option<String>,
     pub favorite: bool,
@@ -67,6 +69,7 @@ mod tests {
         let body = json!({
             "type": 1,
             "organizationId": null,
+            "key": "2.cipher-key",
             "name": "n",
             "notes": null,
             "favorite": false,
@@ -84,5 +87,6 @@ mod tests {
 
         let cipher: ImportCipher = serde_json::from_value(body).expect("deserialize");
         assert_eq!(cipher.folder_id, None);
+        assert_eq!(cipher.key.as_deref(), Some("2.cipher-key"));
     }
 }

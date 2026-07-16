@@ -66,7 +66,7 @@ pub async fn import_data(
         }
     }
 
-    let cipher_query = "INSERT OR IGNORE INTO ciphers (id, user_id, organization_id, type, data, favorite, folder_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+    let cipher_query = "INSERT OR IGNORE INTO ciphers (id, user_id, organization_id, type, data, key, favorite, folder_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
     let archive_query = "INSERT INTO archives (user_id, cipher_id, archived_at)
         VALUES (?1, ?2, ?3)
         ON CONFLICT(user_id, cipher_id) DO UPDATE SET archived_at = excluded.archived_at";
@@ -110,6 +110,7 @@ pub async fn import_data(
             to_js_val(import_cipher.organization_id),
             import_cipher.r#type.into(),
             data.into(),
+            to_js_val(import_cipher.key),
             import_cipher.favorite.into(),
             to_js_val(import_cipher.folder_id),
             now.clone().into(),

@@ -263,6 +263,15 @@ jobs:
                       echo "Password verifier migration already applied."
                   fi
 
+                  echo "Checking cipher key migration..."
+                  cipher_key_column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('ciphers') WHERE name = 'key'" | jq -r '.[0].results[0].column_count // 0')
+                  if [ "$cipher_key_column_count" = "0" ]; then
+                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260716_add_cipher_key.sql
+                      echo "Cipher key migration applied."
+                  else
+                      echo "Cipher key migration already applied."
+                  fi
+
                   echo "Ensuring single-user registration constraint..."
                   wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_enforce_single_user.sql
                   echo "Single-user registration constraint is active."

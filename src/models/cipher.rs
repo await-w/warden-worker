@@ -91,6 +91,8 @@ pub struct Cipher {
     #[serde(rename = "type")]
     pub r#type: i32,
     pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(deserialize_with = "deserialize_bool_from_int")]
     pub favorite: bool,
     #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
@@ -125,6 +127,8 @@ pub struct CipherDBModel {
     pub organization_id: Option<String>,
     pub r#type: i32,
     pub data: String,
+    #[serde(default)]
+    pub key: Option<String>,
     pub favorite: i32,
     pub folder_id: Option<String>,
     pub deleted_at: Option<String>,
@@ -142,6 +146,7 @@ impl From<CipherDBModel> for Cipher {
             organization_id: val.organization_id,
             r#type: val.r#type,
             data: serde_json::from_str(&val.data).unwrap_or_default(),
+            key: val.key,
             favorite: !matches!(val.favorite, 0),
             folder_id: val.folder_id,
             deleted_at: val.deleted_at,
@@ -234,7 +239,7 @@ impl Serialize for Cipher {
         response_map.insert("deletedDate".to_string(), json!(self.deleted_at));
         response_map.insert("reprompt".to_string(), json!(reprompt));
         response_map.insert("organizationId".to_string(), json!(self.organization_id));
-        response_map.insert("key".to_string(), Value::Null);
+        response_map.insert("key".to_string(), json!(self.key));
         response_map.insert("attachments".to_string(), Value::Null);
         response_map.insert(
             "organizationUseTotp".to_string(),
@@ -311,7 +316,7 @@ fn normalize_secure_note(secure_note: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cipher, CreateCipherRequest};
+    use super::{Cipher, CipherDBModel, CipherRequestFlat, CreateCipherRequest};
     use serde_json::{Value, json};
 
     #[test]
@@ -326,6 +331,7 @@ mod tests {
                 "notes": null,
                 "login": { "username": "u", "password": "p" }
             }),
+            key: Some("2.cipher-key".to_string()),
             favorite: false,
             folder_id: None,
             deleted_at: None,
@@ -358,6 +364,7 @@ mod tests {
         );
         assert_eq!(value.get("archivedDate"), Some(&Value::Null));
         assert_eq!(value.get("object"), Some(&json!("cipherDetails")));
+        assert_eq!(value.get("key"), Some(&json!("2.cipher-key")));
         assert_eq!(value.get("collectionIds"), Some(&json!([])));
         assert_eq!(value.get("fields"), Some(&json!([])));
         assert_eq!(value.pointer("/data/name"), Some(&json!("Example")));
@@ -370,16 +377,54 @@ mod tests {
     }
 
     #[test]
+    fn cipher_db_model_preserves_key_in_api_response() {
+        let row = json!({
+            "id": "cipher-1",
+            "user_id": "user-1",
+            "organization_id": null,
+            "type": 1,
+            "data": "{\"name\":\"2.name\",\"login\":{}}",
+            "key": "2.cipher-key",
+            "favorite": 0,
+            "folder_id": null,
+            "deleted_at": null,
+            "archived_at": null,
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "updated_at": "2026-01-01T00:00:00.000Z"
+        });
+
+        let db_model: CipherDBModel = serde_json::from_value(row).expect("deserialize D1 row");
+        let response = serde_json::to_value(Cipher::from(db_model)).expect("serialize cipher");
+
+        assert_eq!(response.get("key"), Some(&json!("2.cipher-key")));
+    }
+
+    #[test]
     fn create_cipher_request_deserializes_camelcase() {
         let body = json!({
-            "cipher": { "type": 1, "name": "n" },
+            "cipher": { "type": 1, "name": "n", "key": "2.cipher-key" },
             "collectionIds": ["c1", "c2"]
         });
 
         let req: CreateCipherRequest = serde_json::from_value(body).expect("deserialize");
         assert_eq!(req.cipher.r#type, 1);
         assert_eq!(req.cipher.name, "n");
+        assert_eq!(req.cipher.key.as_deref(), Some("2.cipher-key"));
         assert_eq!(req.collection_ids, vec!["c1".to_string(), "c2".to_string()]);
+    }
+
+    #[test]
+    fn flat_cipher_request_preserves_key() {
+        let body = json!({
+            "type": 1,
+            "name": "2.name",
+            "key": "2.cipher-key",
+            "collectionIds": []
+        });
+
+        let req: CipherRequestFlat = serde_json::from_value(body).expect("deserialize");
+
+        assert_eq!(req.cipher.key.as_deref(), Some("2.cipher-key"));
     }
 
     #[test]
@@ -435,6 +480,8 @@ pub struct CipherRequestData {
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,

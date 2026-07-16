@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS ciphers (
     organization_id TEXT,
     type INTEGER NOT NULL,
     data TEXT NOT NULL,
+    key TEXT,
     favorite BOOLEAN NOT NULL DEFAULT 0,
     folder_id TEXT,
     deleted_at TEXT,
