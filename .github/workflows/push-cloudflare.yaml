@@ -16,8 +16,8 @@ env:
     D1_DATABASE_NAME: vaultsql
     R2_BUCKET_NAME: warden-send-files
     WORKER_NAME: warden-worker
-    WRANGLER_VERSION: 4.73.0
-    WORKER_BUILD_VERSION: 0.8.1
+    WRANGLER_VERSION: 4.111.0
+    WORKER_BUILD_VERSION: 0.8.5
 
 jobs:
     preflight:
