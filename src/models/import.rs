@@ -1,45 +1,12 @@
-use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde::Deserialize;
 
-fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?
-        .and_then(|s| if s.is_empty() { None } else { Some(s) }))
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportCipher {
-    #[serde(rename = "type")]
-    pub r#type: i32,
-    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
-    pub folder_id: Option<String>,
-    pub organization_id: Option<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    pub name: String,
-    pub notes: Option<String>,
-    pub favorite: bool,
-    pub login: Option<Value>,
-    pub card: Option<Value>,
-    pub identity: Option<Value>,
-    pub secure_note: Option<Value>,
-    pub fields: Option<Value>,
-    pub password_history: Option<Value>,
-    pub reprompt: Option<i32>,
-    #[serde(rename = "lastKnownRevisionDate")]
-    pub _last_known_revision_date: Option<String>,
-    #[serde(default)]
-    pub archived_date: Option<String>,
-    pub encrypted_for: String,
-}
+pub type ImportCipher = super::cipher::CipherRequestData;
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportFolder {
-    pub id: String,
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
 }
 
@@ -73,7 +40,7 @@ mod tests {
             "name": "n",
             "notes": null,
             "favorite": false,
-            "login": null,
+            "login": { "username": "2.user", "password": "2.password", "uris": [] },
             "card": null,
             "identity": null,
             "secureNote": null,
@@ -82,11 +49,14 @@ mod tests {
             "reprompt": null,
             "lastKnownRevisionDate": null,
             "archivedDate": null,
-            "encryptedFor": ""
+            "encryptedFor": "user-1"
         });
 
         let cipher: ImportCipher = serde_json::from_value(body).expect("deserialize");
         assert_eq!(cipher.folder_id, None);
         assert_eq!(cipher.key.as_deref(), Some("2.cipher-key"));
+        cipher
+            .validate_for_personal_vault("user-1")
+            .expect("valid import cipher");
     }
 }

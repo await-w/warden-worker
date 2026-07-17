@@ -15,6 +15,8 @@ use crate::background::BackgroundExecutor;
 pub enum EmailType {
     TwoFactorEmail,
     TwoFactorLogin,
+    ChangeEmail,
+    VerifyEmail,
 }
 
 impl From<EmailType> for CodeType {
@@ -22,6 +24,8 @@ impl From<EmailType> for CodeType {
         match value {
             EmailType::TwoFactorEmail => CodeType::TwoFactorEmail,
             EmailType::TwoFactorLogin => CodeType::TwoFactorLogin,
+            EmailType::ChangeEmail => CodeType::ChangeEmail,
+            EmailType::VerifyEmail => CodeType::VerifyEmail,
         }
     }
 }

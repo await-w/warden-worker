@@ -112,7 +112,7 @@ pub async fn sync(
         .await?
         .results()?;
 
-    let ciphers = ciphers
+    let mut ciphers = ciphers
         .into_iter()
         .filter_map(
             |cipher| match serde_json::from_value::<CipherDBModel>(cipher.clone()) {
@@ -125,6 +125,15 @@ pub async fn sync(
         )
         .map(|cipher| cipher.into())
         .collect::<Vec<Cipher>>();
+    let show_ssh_keys = headers
+        .get("bitwarden-client-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| semver::Version::parse(value).ok())
+        .is_some_and(|version| version >= semver::Version::new(2024, 12, 0));
+    if !show_ssh_keys {
+        ciphers.retain(|cipher| cipher.r#type != 5);
+    }
+    super::attachments::enrich_ciphers(&db, &state, &mut ciphers).await?;
 
     let send_rows: Vec<Value> = db
         .prepare("SELECT * FROM sends WHERE user_id = ?1 ORDER BY updated_at DESC")
@@ -161,7 +170,7 @@ pub async fn sync(
         premium_from_organization: false,
         email_verified: user.email_verified,
         force_password_reset: false,
-        two_factor_enabled: two_factor::is_authenticator_enabled(&db, &user_id).await?,
+        two_factor_enabled: two_factor::is_any_enabled(&db, &user_id).await?,
         uses_key_connector: false,
         creation_date: time,
         key: user_key.clone(),

@@ -14,9 +14,10 @@ use crate::models::{
     archive,
     cipher::{
         Cipher, CipherDBModel, CipherData, CipherRequestData, CipherRequestFlat,
-        CreateCipherRequest,
+        CreateCipherRequest, client_revision_is_stale, normalize_optional_rfc3339,
     },
 };
+use crate::notifications::{self, UpdateType};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 use axum::extract::Path;
@@ -27,18 +28,159 @@ pub struct CipherIdsRequest {
     ids: Vec<String>,
 }
 
+#[worker::send]
+pub async fn purge_personal_vault(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<super::accounts::SecretVerificationRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    super::accounts::validate_password_or_otp(&db, &claims.sub, &payload).await?;
+
+    super::attachments::delete_user_attachments_from_r2(&state.env, &db, &claims.sub).await?;
+    db.prepare("DELETE FROM ciphers WHERE user_id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    db.prepare("DELETE FROM folders WHERE user_id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    let revision = db::update_user_revision(&db, &claims.sub).await?;
+    notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncVault,
+        claims.sub,
+        revision,
+        claims.device,
+    );
+    Ok(Json(json!({})))
+}
+
 fn now_string() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    db::now_rfc3339_millis()
 }
 
-fn normalize_archived_date(archived_date: Option<String>) -> Option<String> {
-    archived_date.and_then(|d| {
-        let d = d.trim().to_string();
-        if d.is_empty() { None } else { Some(d) }
-    })
+async fn finish_cipher_mutation(
+    db: &D1Database,
+    state: &Arc<AppState>,
+    user_id: &str,
+    cipher_id: &str,
+    _item_revision: &str,
+    acting_device_id: Option<&str>,
+    update_type: UpdateType,
+) -> Result<(), AppError> {
+    let revision = db::update_user_revision(db, user_id).await?;
+    notifications::publish_cipher_update_background(
+        &state.ctx,
+        state.env.clone(),
+        update_type,
+        user_id.to_string(),
+        cipher_id.to_string(),
+        revision,
+        acting_device_id.map(str::to_string),
+    );
+    Ok(())
 }
 
-async fn get_cipher_dbmodel_from_db(
+async fn finish_cipher_batch_mutation(
+    db: &D1Database,
+    state: &Arc<AppState>,
+    user_id: &str,
+    acting_device_id: Option<&str>,
+) -> Result<(), AppError> {
+    let revision = db::update_user_revision(db, user_id).await?;
+    notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncCiphers,
+        user_id.to_string(),
+        revision,
+        acting_device_id.map(str::to_string),
+    );
+    Ok(())
+}
+
+async fn validate_folder(
+    db: &D1Database,
+    folder_id: Option<&str>,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let Some(folder_id) = folder_id else {
+        return Ok(());
+    };
+
+    let folder: Option<Value> = db
+        .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
+        .bind(&[folder_id.into(), user_id.into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    if folder.is_none() {
+        return Err(AppError::BadRequest(
+            "Folder does not exist or belongs to another user".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn update_attachment_keys(
+    db: &D1Database,
+    cipher_id: &str,
+    user_id: &str,
+    attachments: Option<&Value>,
+) -> Result<(), AppError> {
+    let Some(attachments) = attachments else {
+        return Ok(());
+    };
+    let attachments = attachments.as_object().ok_or_else(|| {
+        AppError::BadRequest("Invalid cipher attachment key rotation data".to_string())
+    })?;
+    for (attachment_id, data) in attachments {
+        let file_name = data
+            .get("fileName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("Missing attachment fileName".to_string()))?;
+        let key = data
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("Missing attachment key".to_string()))?;
+        let owner_cipher_id: Option<String> = db
+            .prepare("SELECT cipher_id FROM cipher_attachments WHERE id = ?1 AND user_id = ?2")
+            .bind(&[attachment_id.into(), user_id.into()])?
+            .first(Some("cipher_id"))
+            .await
+            .map_err(|_| AppError::Database)?;
+        let Some(owner_cipher_id) = owner_cipher_id else {
+            log::warn!("attachment {attachment_id} no longer exists during key rotation");
+            continue;
+        };
+        if owner_cipher_id != cipher_id {
+            log::warn!("attachment {attachment_id} does not belong to cipher {cipher_id}");
+            break;
+        }
+        db.prepare("UPDATE cipher_attachments SET file_name = ?1, key = ?2, updated_at = ?3 WHERE id = ?4 AND cipher_id = ?5 AND user_id = ?6")
+            .bind(&[
+                file_name.into(),
+                key.into(),
+                db::now_rfc3339_millis().into(),
+                attachment_id.into(),
+                cipher_id.into(),
+                user_id.into(),
+            ])?
+            .run()
+            .await
+            .map_err(|_| AppError::Database)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn get_cipher_dbmodel_from_db(
     db: &D1Database,
     cipher_id: &str,
     user_id: &str,
@@ -79,24 +221,23 @@ async fn create_cipher_inner(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
     archive::ensure_table(&db).await?;
+    cipher_data_req
+        .validate_for_personal_vault(&claims.sub)
+        .map_err(|message| AppError::BadRequest(message.to_string()))?;
+    if !collection_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "Cipher collections are not supported by this personal vault".to_string(),
+        ));
+    }
+    validate_folder(&db, cipher_data_req.folder_id.as_deref(), &claims.sub).await?;
     let now = now_string();
-    let archived_at = normalize_archived_date(cipher_data_req.archived_date.clone());
+    let archived_at = normalize_optional_rfc3339(cipher_data_req.archived_date.as_deref());
 
-    let cipher_data = CipherData {
-        name: cipher_data_req.name,
-        notes: cipher_data_req.notes,
-        login: cipher_data_req.login,
-        card: cipher_data_req.card,
-        identity: cipher_data_req.identity,
-        secure_note: cipher_data_req.secure_note,
-        fields: cipher_data_req.fields,
-        password_history: cipher_data_req.password_history,
-        reprompt: cipher_data_req.reprompt,
-    };
+    let cipher_data = CipherData::from_request(&cipher_data_req);
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
 
-    let cipher = Cipher {
+    let mut cipher = Cipher {
         id: Uuid::new_v4().to_string(),
         user_id: Some(claims.sub.clone()),
         organization_id: cipher_data_req.organization_id.clone(),
@@ -118,6 +259,7 @@ async fn create_cipher_inner(
         } else {
             Some(collection_ids)
         },
+        attachments: None,
     };
 
     let data = serde_json::to_string(&cipher.data).map_err(|_| AppError::Internal)?;
@@ -143,6 +285,18 @@ async fn create_cipher_inner(
     if let Some(archived_at) = &archived_at {
         archive::save(&db, &claims.sub, &cipher.id, archived_at).await?;
     }
+
+    finish_cipher_mutation(
+        &db,
+        state,
+        &claims.sub,
+        &cipher.id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherCreate,
+    )
+    .await?;
+    super::attachments::enrich_cipher(&db, state, &mut cipher).await?;
 
     Ok(cipher)
 }
@@ -223,26 +377,31 @@ pub async fn update_cipher(
     let existing_cipher = get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
 
     let cipher_data_req = payload;
-    let requested_archived_at = normalize_archived_date(cipher_data_req.archived_date.clone());
+    cipher_data_req
+        .validate_for_personal_vault(&claims.sub)
+        .map_err(|message| AppError::BadRequest(message.to_string()))?;
+    if client_revision_is_stale(
+        &existing_cipher.updated_at,
+        cipher_data_req.last_known_revision_date.as_deref(),
+    ) {
+        return Err(AppError::BadRequest(
+            "The client copy of this cipher is out of date. Resync the client and try again."
+                .to_string(),
+        ));
+    }
+    validate_folder(&db, cipher_data_req.folder_id.as_deref(), &claims.sub).await?;
+
+    let requested_archived_at =
+        normalize_optional_rfc3339(cipher_data_req.archived_date.as_deref());
     let archived_at = requested_archived_at
         .clone()
         .or_else(|| existing_cipher.archived_at.clone());
 
-    let cipher_data = CipherData {
-        name: cipher_data_req.name,
-        notes: cipher_data_req.notes,
-        login: cipher_data_req.login,
-        card: cipher_data_req.card,
-        identity: cipher_data_req.identity,
-        secure_note: cipher_data_req.secure_note,
-        fields: cipher_data_req.fields,
-        password_history: cipher_data_req.password_history,
-        reprompt: cipher_data_req.reprompt,
-    };
+    let cipher_data = CipherData::from_request(&cipher_data_req);
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
 
-    let cipher = Cipher {
+    let mut cipher = Cipher {
         id: id.clone(),
         user_id: Some(claims.sub.clone()),
         organization_id: cipher_data_req.organization_id.clone(),
@@ -260,6 +419,7 @@ pub async fn update_cipher(
         edit: true,
         view_password: true,
         collection_ids: None,
+        attachments: None,
     };
 
     let data = serde_json::to_string(&cipher.data).map_err(|_| AppError::Internal)?;
@@ -280,9 +440,23 @@ pub async fn update_cipher(
     .run()
     .await?;
 
+    update_attachment_keys(&db, &id, &claims.sub, cipher_data_req.attachments2.as_ref()).await?;
+
     if let Some(archived_at) = &requested_archived_at {
         archive::save(&db, &claims.sub, &id, archived_at).await?;
     }
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &cipher.id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -330,6 +504,18 @@ pub async fn soft_delete_cipher(
     let mut cipher: Cipher = existing.into();
     cipher.deleted_at = Some(now.clone());
     cipher.updated_at = now;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -376,6 +562,18 @@ pub async fn restore_cipher(
     let mut cipher: Cipher = existing.into();
     cipher.deleted_at = None;
     cipher.updated_at = now;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -457,7 +655,19 @@ pub async fn archive_cipher(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
 
-    let cipher = archive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+    let mut cipher = archive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -487,7 +697,19 @@ pub async fn unarchive_cipher(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
 
-    let cipher = unarchive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+    let mut cipher = unarchive_cipher_record(&db, &id, &claims.sub, now_string()).await?;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -523,8 +745,11 @@ pub async fn archive_ciphers(
     let mut ciphers = Vec::with_capacity(count);
     for id in payload.ids {
         let cipher = archive_cipher_record(&db, &id, &user_id, now_string()).await?;
-        ciphers.push(json!(cipher));
+        ciphers.push(cipher);
     }
+    super::attachments::enrich_ciphers(&db, &state, &mut ciphers).await?;
+
+    finish_cipher_batch_mutation(&db, &state, &user_id, claims.device.as_deref()).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -563,8 +788,11 @@ pub async fn unarchive_ciphers(
     let mut ciphers = Vec::with_capacity(count);
     for id in payload.ids {
         let cipher = unarchive_cipher_record(&db, &id, &user_id, now_string()).await?;
-        ciphers.push(json!(cipher));
+        ciphers.push(cipher);
     }
+    super::attachments::enrich_ciphers(&db, &state, &mut ciphers).await?;
+
+    finish_cipher_batch_mutation(&db, &state, &user_id, claims.device.as_deref()).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -596,6 +824,9 @@ pub async fn hard_delete_cipher(
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
+    super::attachments::delete_cipher_attachments_from_r2(&state.env, &db, &id, &claims.sub)
+        .await?;
     archive::delete(&db, &claims.sub, &id).await?;
 
     query!(
@@ -606,6 +837,18 @@ pub async fn hard_delete_cipher(
     )
     .map_err(|_| AppError::Database)?
     .run()
+    .await?;
+
+    let revision = db::now_rfc3339_millis();
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &revision,
+        claims.device.as_deref(),
+        UpdateType::SyncLoginDelete,
+    )
     .await?;
 
     let meta = notify::extract_request_meta(&headers);
@@ -649,6 +892,7 @@ pub async fn soft_delete_ciphers(
 
     let count = payload.ids.len();
     for id in payload.ids {
+        get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
         query!(
             &db,
             "UPDATE ciphers SET deleted_at = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4",
@@ -661,6 +905,8 @@ pub async fn soft_delete_ciphers(
         .run()
         .await?;
     }
+
+    finish_cipher_batch_mutation(&db, &state, &claims.sub, claims.device.as_deref()).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -685,14 +931,16 @@ pub async fn restore_ciphers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(payload): Json<CipherIdsRequest>,
-) -> Result<Json<()>, AppError> {
+) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
     let now = Utc::now();
     let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
     let count = payload.ids.len();
+    let mut ciphers = Vec::with_capacity(count);
     for id in payload.ids {
+        let existing = get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
         query!(
             &db,
             "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
@@ -703,7 +951,14 @@ pub async fn restore_ciphers(
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
+        let mut cipher: Cipher = existing.into();
+        cipher.deleted_at = None;
+        cipher.updated_at = now.clone();
+        ciphers.push(cipher);
     }
+    super::attachments::enrich_ciphers(&db, &state, &mut ciphers).await?;
+
+    finish_cipher_batch_mutation(&db, &state, &claims.sub, claims.device.as_deref()).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -719,7 +974,11 @@ pub async fn restore_ciphers(
         },
     );
 
-    Ok(Json(()))
+    Ok(Json(json!({
+        "data": ciphers,
+        "object": "list",
+        "continuationToken": null
+    })))
 }
 
 #[worker::send]
@@ -734,6 +993,9 @@ pub async fn hard_delete_ciphers(
 
     let count = payload.ids.len();
     for id in payload.ids {
+        get_cipher_dbmodel_from_db(&db, &id, &claims.sub).await?;
+        super::attachments::delete_cipher_attachments_from_r2(&state.env, &db, &id, &claims.sub)
+            .await?;
         archive::delete(&db, &claims.sub, &id).await?;
         query!(
             &db,
@@ -745,6 +1007,8 @@ pub async fn hard_delete_ciphers(
         .run()
         .await?;
     }
+
+    finish_cipher_batch_mutation(&db, &state, &claims.sub, claims.device.as_deref()).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -818,6 +1082,25 @@ pub async fn move_ciphers(
         placeholders
     );
 
+    let accessible_count = if payload.ids.is_empty() {
+        0
+    } else {
+        let count_sql = format!(
+            "SELECT COUNT(*) AS count FROM ciphers WHERE user_id = ? AND id IN ({})",
+            placeholders
+        );
+        let mut count_params = vec![claims.sub.clone().into()];
+        for id in &payload.ids {
+            count_params.push(id.clone().into());
+        }
+        db.prepare(&count_sql)
+            .bind(&count_params)?
+            .first::<i64>(Some("count"))
+            .await
+            .map_err(|_| AppError::Database)?
+            .unwrap_or(0) as usize
+    };
+
     let mut params = vec![
         payload
             .folder_id
@@ -836,6 +1119,15 @@ pub async fn move_ciphers(
         .run()
         .await
         .map_err(|_| AppError::Database)?;
+
+    finish_cipher_batch_mutation(&db, &state, &claims.sub, claims.device.as_deref()).await?;
+
+    if accessible_count != payload.ids.len() {
+        return Err(AppError::BadRequest(format!(
+            "Not all ciphers are moved! {accessible_count} of the selected {} were moved.",
+            payload.ids.len()
+        )));
+    }
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -896,7 +1188,7 @@ pub async fn get_ciphers(
         .await?
         .results()?;
 
-    let ciphers: Vec<Cipher> = cipher_rows
+    let mut ciphers: Vec<Cipher> = cipher_rows
         .into_iter()
         .filter_map(|row| match serde_json::from_value::<CipherDBModel>(row) {
             Ok(db_model) => Some(db_model.into()),
@@ -906,6 +1198,7 @@ pub async fn get_ciphers(
             }
         })
         .collect();
+    super::attachments::enrich_ciphers(&db, &state, &mut ciphers).await?;
 
     Ok(Json(json!({
         "data": ciphers,
@@ -940,7 +1233,9 @@ pub async fn get_cipher(
         .await?
         .ok_or_else(|| AppError::NotFound("Cipher not found".to_string()))?;
 
-    Ok(Json(cipher.into()))
+    let mut cipher: Cipher = cipher.into();
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+    Ok(Json(cipher))
 }
 
 #[worker::send]
@@ -1018,6 +1313,18 @@ pub async fn put_cipher_partial(
     cipher.folder_id = data.folder_id;
     cipher.favorite = data.favorite;
     cipher.updated_at = now;
+    super::attachments::enrich_cipher(&db, &state, &mut cipher).await?;
+
+    finish_cipher_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &id,
+        &cipher.updated_at,
+        claims.device.as_deref(),
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     Ok(Json(cipher))
 }

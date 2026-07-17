@@ -86,3 +86,13 @@ pub async fn main(
 
     Ok(Service::call(&mut app, http_req).await?)
 }
+
+#[event(scheduled)]
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    console_error_panic_hook::set_once();
+    logging::init_logging(&env);
+    match handlers::sends::purge_expired_sends(&env).await {
+        Ok(count) => log::info!("scheduled cleanup purged {count} expired Sends"),
+        Err(err) => log::error!("scheduled expired Send cleanup failed: {err}"),
+    }
+}

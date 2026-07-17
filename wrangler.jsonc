@@ -3,6 +3,9 @@
 	"name": "warden-worker",
 	"main": "src/entry.js",
 	"compatibility_date": "2026-02-28",
+	"triggers": {
+		"crons": ["0 3 * * *"]
+	},
 	// 环境变量配置
 	"vars": {
 		// 日志级别配置格式: <全局级别>[,<模块>=<级别>]*
@@ -67,7 +70,8 @@
 		{
 			"binding": "vaultsql",
 			"database_name": "vaultsql",
-			"database_id": "02c3cba2-dec4-4aad-98d6-a443069eb9a8"
+			"database_id": "02c3cba2-dec4-4aad-98d6-a443069eb9a8",
+			"migrations_dir": "sql/d1-migrations"
 		}
 	],
 	"r2_buckets": [
@@ -139,6 +143,8 @@
 			"/css/*",
 			"/api/*",
 			"/identity/*",
+			"/ciphers/*",
+			"/attachments/*",
 			"/sends/*",
 			"/send-verify",
 			"/notifications/*",

@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS webauthn_challenges;
 DROP TABLE IF EXISTS two_factor_webauthn_settings;
 DROP TABLE IF EXISTS two_factor_webauthn;
 DROP TABLE IF EXISTS archives;
+DROP TABLE IF EXISTS cipher_attachments;
 DROP TABLE IF EXISTS folders;
 DROP TABLE IF EXISTS ciphers;
 DROP TABLE IF EXISTS send_file_chunks;
@@ -37,6 +38,10 @@ CREATE TABLE IF NOT EXISTS users (
     security_stamp TEXT,
     password_salt TEXT,
     password_iterations INTEGER NOT NULL DEFAULT 600000,
+    api_key TEXT,
+    email_new TEXT,
+    email_new_token TEXT,
+    email_new_token_sent_at TEXT,
     totp_recover TEXT,
     equivalent_domains TEXT NOT NULL DEFAULT '[]',
     excluded_globals TEXT NOT NULL DEFAULT '[]',
@@ -84,6 +89,20 @@ CREATE TABLE IF NOT EXISTS archives (
     PRIMARY KEY (user_id, cipher_id),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS cipher_attachments (
+    id TEXT PRIMARY KEY NOT NULL,
+    cipher_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    key TEXT,
+    r2_object_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sends (
@@ -251,6 +270,8 @@ CREATE INDEX IF NOT EXISTS idx_ciphers_user_id ON ciphers(user_id);
 CREATE INDEX IF NOT EXISTS idx_ciphers_folder_id ON ciphers(folder_id);
 CREATE INDEX IF NOT EXISTS idx_archives_user_id ON archives(user_id);
 CREATE INDEX IF NOT EXISTS idx_archives_cipher_id ON archives(cipher_id);
+CREATE INDEX IF NOT EXISTS idx_cipher_attachments_cipher_id ON cipher_attachments(cipher_id);
+CREATE INDEX IF NOT EXISTS idx_cipher_attachments_user_id ON cipher_attachments(user_id);
 CREATE INDEX IF NOT EXISTS idx_sends_user_id ON sends(user_id);
 CREATE INDEX IF NOT EXISTS idx_sends_deletion_date ON sends(deletion_date);
 CREATE INDEX IF NOT EXISTS idx_send_files_send_id ON send_files(send_id);

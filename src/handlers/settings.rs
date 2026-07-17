@@ -1,10 +1,15 @@
 use axum::{Json, extract::State};
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::{auth::Claims, db, domains, error::AppError, router::AppState};
+use crate::{
+    auth::Claims,
+    db, domains,
+    error::AppError,
+    notifications::{self, UpdateType},
+    router::AppState,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,7 +54,7 @@ async fn update_domains(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now().to_rfc3339();
+    let now = db::now_rfc3339_millis();
 
     let equivalent_domains = payload.equivalent_domains.unwrap_or_default();
     let excluded_globals = payload
@@ -58,6 +63,14 @@ async fn update_domains(
 
     domains::update_domains_settings(&db, &claims.sub, equivalent_domains, excluded_globals, &now)
         .await?;
+    notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncSettings,
+        claims.sub,
+        now,
+        claims.device,
+    );
 
     Ok(Json(json!({})))
 }

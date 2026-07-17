@@ -241,6 +241,8 @@ impl NotifyEvent {
 pub enum CodeType {
     TwoFactorEmail,
     TwoFactorLogin,
+    ChangeEmail,
+    VerifyEmail,
 }
 
 impl CodeType {
@@ -248,6 +250,8 @@ impl CodeType {
         match self {
             CodeType::TwoFactorEmail => "📧",
             CodeType::TwoFactorLogin => "🔐",
+            CodeType::ChangeEmail => "📧",
+            CodeType::VerifyEmail => "✅",
         }
     }
 }

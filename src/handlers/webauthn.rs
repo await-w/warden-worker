@@ -259,6 +259,7 @@ pub async fn api_webauthn_get(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
     if let Some(claims) = claims_from_bearer(&headers, &state).await? {
+        claims.verify_security_stamp(&db).await?;
         return Ok(Json(webauthn_credentials_response(&db, &claims.sub).await?));
     }
     Ok(Json(json!({
@@ -276,6 +277,7 @@ pub async fn webauthn_attestation_options(
     Json(payload): Json<SecretVerificationData>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     payload.validate(&db, &claims.sub).await?;
 
     let user_row: Value = db
@@ -323,9 +325,12 @@ pub async fn webauthn_attestation_options(
 
 #[worker::send]
 pub async fn webauthn_prf_probe(
-    _claims: Claims,
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<WebAuthnPrfProbeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     let supports_prf = payload.supports_prf.unwrap_or(false);
     Ok(Json(json!({
         "supportsPrf": supports_prf,
@@ -347,6 +352,7 @@ pub async fn webauthn_assertion_options(
     Json(payload): Json<SecretVerificationData>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     payload.validate(&db, &claims.sub).await?;
 
     let rp_id = webauthn::rp_id_from_headers(&headers);
@@ -380,6 +386,7 @@ pub async fn webauthn_save_credential(
     Json(payload): Json<SaveWebAuthnCredentialRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     let slot_id = next_available_webauthn_slot_id(&db, &claims.sub).await?;
     let name = payload
         .name
@@ -531,6 +538,7 @@ pub async fn webauthn_update_credential(
     Json(payload): Json<UpdateWebAuthnCredentialRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     let assertion_token_json = serde_json::to_string(&payload.device_response)
         .map_err(|_| AppError::BadRequest("Invalid WebAuthn assertion".to_string()))?;
 
@@ -656,6 +664,7 @@ pub async fn webauthn_delete_credential(
     Json(payload): Json<SecretVerificationData>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     payload.validate(&db, &claims.sub).await?;
 
     // Get credential name before deletion for notification
@@ -711,6 +720,7 @@ pub async fn get_webauthn(
     Json(payload): Json<SecretVerificationData>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     payload.validate(&db, &claims.sub).await?;
     let response = webauthn_response(&db, &claims.sub).await?;
     Ok(Json(response))
@@ -724,6 +734,7 @@ pub async fn get_webauthn_challenge(
     Json(payload): Json<SecretVerificationData>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     payload.validate(&db, &claims.sub).await?;
 
     let user_row: Value = db
@@ -763,6 +774,7 @@ pub async fn put_webauthn(
     Json(payload): Json<UpdateTwoFactorWebAuthnRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     SecretVerificationData {
         master_password_hash: payload.master_password_hash.clone(),
         otp: payload.otp.clone(),
@@ -804,6 +816,7 @@ pub async fn delete_webauthn(
     Json(payload): Json<UpdateTwoFactorWebAuthnDeleteRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
     SecretVerificationData {
         master_password_hash: payload.master_password_hash.clone(),
         otp: payload.otp.clone(),

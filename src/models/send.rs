@@ -212,8 +212,6 @@ pub fn send_to_json(send: &SendDBModel) -> Value {
         "type": send.r#type,
         "name": send.name,
         "notes": send.notes,
-        "emails": "",
-        "emailHashes": "",
         "text": if send.r#type == SEND_TYPE_TEXT { Some(&data_value) } else { None },
         "file": if send.r#type == SEND_TYPE_FILE { Some(&data_value) } else { None },
         "key": send.key,

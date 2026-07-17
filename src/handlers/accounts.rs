@@ -1,10 +1,10 @@
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Json, extract::State};
 use chrono::Utc;
-use rand::Rng;
+use rand::{Rng, distributions::Alphanumeric};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
 use worker::{Delay, query};
@@ -14,7 +14,11 @@ use crate::{
     crypto::{self, KDF_TYPE_ARGON2ID},
     db,
     error::AppError,
-    models::user::{KeyData, PreloginResponse, RegisterRequest, RegisterVerifyClaims, User},
+    models::{
+        cipher::{CipherData, CipherRequestData},
+        send::SendData,
+        user::{KeyData, PreloginResponse, RegisterRequest, RegisterVerifyClaims, User},
+    },
     notify::{self, NotifyContext, NotifyEvent},
     password,
     router::AppState,
@@ -155,10 +159,65 @@ pub enum ChangeKdfPayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RotateUserAccountKeysRequest {
+    account_unlock_data: RotateAccountUnlockData,
+    account_keys: RotateAccountKeys,
+    account_data: RotateAccountData,
+    old_master_key_authentication_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateAccountUnlockData {
+    #[serde(default)]
+    emergency_access_unlock_data: Vec<Value>,
+    master_password_unlock_data: RotateMasterPasswordUnlockData,
+    #[serde(default)]
+    organization_account_recovery_unlock_data: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateMasterPasswordUnlockData {
+    kdf_type: i32,
+    kdf_iterations: i32,
+    kdf_parallelism: Option<i32>,
+    kdf_memory: Option<i32>,
+    email: String,
+    master_key_authentication_hash: String,
+    master_key_encrypted_user_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateAccountKeys {
+    user_key_encrypted_account_private_key: String,
+    account_public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateAccountData {
+    ciphers: Vec<CipherRequestData>,
+    folders: Vec<RotateFolderData>,
+    sends: Vec<SendData>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateFolderData {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChangeMasterPasswordRequest {
     pub master_password_hash: String,
     pub new_master_password_hash: String,
     pub master_password_hint: Option<String>,
+    #[serde(alias = "key")]
     pub user_symmetric_key: String,
     #[serde(default)]
     pub user_asymmetric_keys: Option<KeyData>,
@@ -178,7 +237,9 @@ pub struct ChangeEmailRequest {
     pub master_password_hash: String,
     pub new_master_password_hash: String,
     pub new_email: String,
+    #[serde(alias = "key")]
     pub user_symmetric_key: String,
+    pub token: NumberOrString,
     #[serde(default)]
     pub kdf: Option<i32>,
     #[serde(default)]
@@ -190,9 +251,25 @@ pub struct ChangeEmailRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+
+impl NumberOrString {
+    fn into_string(self) -> String {
+        match self {
+            Self::Number(value) => value.to_string(),
+            Self::String(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileData {
-    pub name: Option<String>,
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,7 +285,7 @@ pub async fn profile(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let two_factor_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
+    let two_factor_enabled = two_factor::is_any_enabled(&db, &claims.sub).await?;
     let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
         .map_err(|_| AppError::Database)?
         .first(None)
@@ -240,7 +317,7 @@ pub async fn post_profile(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ProfileData>,
 ) -> Result<Json<Value>, AppError> {
-    let name = payload.name.unwrap_or_default();
+    let name = payload.name;
 
     if name.len() > 50 {
         return Err(AppError::BadRequest(
@@ -299,10 +376,12 @@ pub async fn put_avatar(
 pub async fn post_security_stamp(
     claims: Claims,
     State(state): State<Arc<AppState>>,
+    Json(payload): Json<SecretVerificationRequest>,
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now().to_rfc3339();
+    validate_password_or_otp(&db, &claims.sub, &payload).await?;
+    let now = db::now_rfc3339_millis();
     let security_stamp = Uuid::new_v4().to_string();
 
     // Delete all devices for this user (matching vaultwarden behavior)
@@ -322,12 +401,29 @@ pub async fn post_security_stamp(
         .await
         .map_err(|_| AppError::Database)?;
 
-    let two_factor_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
+    let two_factor_enabled = two_factor::is_any_enabled(&db, &claims.sub).await?;
     let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
         .map_err(|_| AppError::Database)?
         .first(None)
         .await?
         .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+    let env = state.env.clone();
+    let user_id = claims.sub.clone();
+    let revision = user.updated_at.clone();
+    state.ctx.wait_until(async move {
+        if let Err(err) = crate::notifications::publish_user_update(
+            &env,
+            crate::notifications::UpdateType::LogOut,
+            &user_id,
+            &revision,
+            None,
+        )
+        .await
+        {
+            log::warn!("failed to publish security-stamp logout: {err}");
+        }
+    });
 
     Ok(Json(json!({
         "id": user.id,
@@ -350,10 +446,16 @@ pub async fn post_security_stamp(
 
 #[worker::send]
 pub async fn revision_date(
-    _claims: Claims,
-    State(_state): State<Arc<AppState>>,
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<i64>, AppError> {
-    Ok(Json(chrono::Utc::now().timestamp_millis()))
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    let revision = db::get_user_revision(&db, &claims.sub).await?;
+    let millis = chrono::DateTime::parse_from_rfc3339(&revision)
+        .map_err(|_| AppError::Internal)?
+        .timestamp_millis();
+    Ok(Json(millis))
 }
 
 #[worker::send]
@@ -523,6 +625,10 @@ pub async fn register(
         security_stamp: Uuid::new_v4().to_string(),
         password_salt: Some(server_password.salt),
         password_iterations: Some(server_password.iterations),
+        api_key: None,
+        email_new: None,
+        email_new_token: None,
+        email_new_token_sent_at: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -666,7 +772,7 @@ pub async fn change_master_password(
         to_js_val(kdf_memory),
         to_js_val(kdf_parallelism),
         security_stamp.into(),
-        now.into(),
+        now.clone().into(),
         server_password.salt.into(),
         server_password.iterations.into(),
         claims.sub.clone().into(),
@@ -674,6 +780,15 @@ pub async fn change_master_password(
     .run()
     .await
     .map_err(|_| AppError::Database)?;
+
+    crate::notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        crate::notifications::UpdateType::LogOut,
+        claims.sub.clone(),
+        now,
+        claims.device.clone(),
+    );
 
     notify::notify_background(
         &state.ctx,
@@ -710,6 +825,7 @@ pub async fn change_email(
     }
 
     let new_email = payload.new_email.to_lowercase();
+    let supplied_token = payload.token.into_string();
 
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
@@ -726,6 +842,17 @@ pub async fn change_email(
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
+    if user.email_new.as_deref() != Some(new_email.as_str()) {
+        return Err(AppError::BadRequest("Email change mismatch".to_string()));
+    }
+    let pending_token = user
+        .email_new_token
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("No email change pending".to_string()))?;
+    if !constant_time_eq::constant_time_eq(pending_token.as_bytes(), supplied_token.as_bytes()) {
+        return Err(AppError::BadRequest("Token mismatch".to_string()));
+    }
+
     let now = Utc::now().to_rfc3339();
     let security_stamp = Uuid::new_v4().to_string();
     let kdf_type = payload.kdf.unwrap_or(user.kdf_type);
@@ -740,7 +867,7 @@ pub async fn change_email(
         password::hash_password(&payload.new_master_password_hash, existing_salt).await?;
 
     db.prepare(
-        "UPDATE users SET email = ?1, email_verified = ?2, master_password_hash = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10, password_salt = ?11, password_iterations = ?12 WHERE id = ?13",
+        "UPDATE users SET email = ?1, email_verified = ?2, master_password_hash = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10, password_salt = ?11, password_iterations = ?12, email_new = NULL, email_new_token = NULL, email_new_token_sent_at = NULL WHERE id = ?13",
     )
     .bind(&[
         new_email.clone().into(),
@@ -752,7 +879,7 @@ pub async fn change_email(
         to_js_val(kdf_memory),
         to_js_val(kdf_parallelism),
         security_stamp.into(),
-        now.into(),
+        now.clone().into(),
         server_password.salt.into(),
         server_password.iterations.into(),
         claims.sub.clone().into(),
@@ -767,12 +894,21 @@ pub async fn change_email(
         }
     })?;
 
+    crate::notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        crate::notifications::UpdateType::LogOut,
+        claims.sub.clone(),
+        now,
+        None,
+    );
+
     notify::notify_background(
         &state.ctx,
         state.env.clone(),
         NotifyEvent::EmailChange,
         NotifyContext {
-            user_id: Some(claims.sub),
+            user_id: Some(claims.sub.clone()),
             user_email: Some(new_email),
             detail: Some("Action: Change Email".to_string()),
             meta: notify::extract_request_meta(&headers),
@@ -872,7 +1008,7 @@ pub async fn post_kdf(
         to_js_val(kdf_memory),
         to_js_val(kdf_parallelism),
         security_stamp.into(),
-        now.into(),
+        now.clone().into(),
         server_password.salt.into(),
         server_password.iterations.into(),
         claims.sub.clone().into(),
@@ -881,12 +1017,21 @@ pub async fn post_kdf(
     .await
     .map_err(|_| AppError::Database)?;
 
+    crate::notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        crate::notifications::UpdateType::LogOut,
+        claims.sub.clone(),
+        now,
+        claims.device.clone(),
+    );
+
     notify::notify_background(
         &state.ctx,
         state.env.clone(),
         NotifyEvent::KdfChange,
         NotifyContext {
-            user_id: Some(claims.sub),
+            user_id: Some(claims.sub.clone()),
             user_email: Some(user.email),
             detail: Some("Action: Change KDF settings".to_string()),
             meta: notify::extract_request_meta(&headers),
@@ -894,6 +1039,263 @@ pub async fn post_kdf(
         },
     );
 
+    Ok(Json(json!({})))
+}
+
+async fn owned_ids(
+    db: &worker::D1Database,
+    sql: &str,
+    user_id: &str,
+) -> Result<HashSet<String>, AppError> {
+    let rows: Vec<Value> = db
+        .prepare(sql)
+        .bind(&[user_id.into()])?
+        .all()
+        .await
+        .map_err(|_| AppError::Database)?
+        .results()?;
+    rows.into_iter()
+        .map(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or(AppError::Database)
+        })
+        .collect()
+}
+
+#[worker::send]
+pub async fn rotate_user_account_keys(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<RotateUserAccountKeysRequest>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    if !password::verify_user_password(
+        &db,
+        &claims.sub,
+        &payload.old_master_key_authentication_hash,
+    )
+    .await?
+    {
+        return Err(AppError::Unauthorized("Invalid password".to_string()));
+    }
+
+    let user: User = db
+        .prepare("SELECT * FROM users WHERE id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let unlock = &payload.account_unlock_data.master_password_unlock_data;
+    if user.kdf_type != unlock.kdf_type
+        || user.kdf_iterations != unlock.kdf_iterations
+        || user.kdf_memory != unlock.kdf_memory
+        || user.kdf_parallelism != unlock.kdf_parallelism
+        || user.email != unlock.email
+    {
+        return Err(AppError::BadRequest(
+            "Changing the KDF variant or email is not supported during key rotation".to_string(),
+        ));
+    }
+    if user.public_key != payload.account_keys.account_public_key {
+        return Err(AppError::BadRequest(
+            "Changing the asymmetric keypair is not possible during key rotation".to_string(),
+        ));
+    }
+    if !payload
+        .account_unlock_data
+        .emergency_access_unlock_data
+        .is_empty()
+        || !payload
+            .account_unlock_data
+            .organization_account_recovery_unlock_data
+            .is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "Organization recovery and emergency access are not available in this personal vault"
+                .to_string(),
+        ));
+    }
+
+    let existing_ciphers = owned_ids(
+        &db,
+        "SELECT id FROM ciphers WHERE user_id = ?1",
+        &claims.sub,
+    )
+    .await?;
+    let existing_folders = owned_ids(
+        &db,
+        "SELECT id FROM folders WHERE user_id = ?1",
+        &claims.sub,
+    )
+    .await?;
+    let existing_sends =
+        owned_ids(&db, "SELECT id FROM sends WHERE user_id = ?1", &claims.sub).await?;
+
+    let provided_ciphers = payload
+        .account_data
+        .ciphers
+        .iter()
+        .filter_map(|cipher| cipher.id.clone())
+        .collect::<HashSet<_>>();
+    let provided_folders = payload
+        .account_data
+        .folders
+        .iter()
+        .filter_map(|folder| folder.id.clone())
+        .collect::<HashSet<_>>();
+    let provided_sends = payload
+        .account_data
+        .sends
+        .iter()
+        .filter_map(|send| send._id.clone())
+        .collect::<HashSet<_>>();
+    if !provided_ciphers.is_superset(&existing_ciphers) {
+        return Err(AppError::BadRequest(
+            "All existing ciphers must be included in the rotation".to_string(),
+        ));
+    }
+    if !provided_folders.is_superset(&existing_folders) {
+        return Err(AppError::BadRequest(
+            "All existing folders must be included in the rotation".to_string(),
+        ));
+    }
+    if !provided_sends.is_superset(&existing_sends) {
+        return Err(AppError::BadRequest(
+            "All existing sends must be included in the rotation".to_string(),
+        ));
+    }
+    for cipher in &payload.account_data.ciphers {
+        let id = cipher.id.as_ref().ok_or_else(|| {
+            AppError::BadRequest("Cipher id is required during key rotation".to_string())
+        })?;
+        if !existing_ciphers.contains(id) {
+            return Err(AppError::BadRequest("Cipher doesn't exist".to_string()));
+        }
+        cipher
+            .validate_for_personal_vault(&claims.sub)
+            .map_err(|message| AppError::BadRequest(message.to_string()))?;
+    }
+    if payload
+        .account_data
+        .folders
+        .iter()
+        .filter_map(|folder| folder.id.as_ref())
+        .any(|id| !existing_folders.contains(id))
+    {
+        return Err(AppError::BadRequest("Folder doesn't exist".to_string()));
+    }
+    if payload
+        .account_data
+        .sends
+        .iter()
+        .filter_map(|send| send._id.as_ref())
+        .any(|id| !existing_sends.contains(id))
+    {
+        return Err(AppError::BadRequest("Send doesn't exist".to_string()));
+    }
+
+    let now = db::now_rfc3339_millis();
+    for folder in payload.account_data.folders {
+        let Some(folder_id) = folder.id else {
+            continue;
+        };
+        db.prepare("UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4")
+            .bind(&[
+                folder.name.into(),
+                now.clone().into(),
+                folder_id.into(),
+                claims.sub.clone().into(),
+            ])?
+            .run()
+            .await
+            .map_err(|_| AppError::Database)?;
+    }
+    for send in payload.account_data.sends {
+        crate::handlers::sends::rotate_send_data(&db, &claims.sub, send, &now).await?;
+    }
+    for cipher in payload.account_data.ciphers {
+        let cipher_id = cipher.id.clone().ok_or(AppError::Internal)?;
+        let data = serde_json::to_string(&CipherData::from_request(&cipher))
+            .map_err(|_| AppError::Internal)?;
+        db.prepare(
+            "UPDATE ciphers SET type = ?1, data = ?2, key = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6
+             WHERE id = ?7 AND user_id = ?8",
+        )
+        .bind(&[
+            cipher.r#type.into(),
+            data.into(),
+            to_js_val(cipher.key.clone()),
+            (if cipher.favorite { 1 } else { 0 }).into(),
+            to_js_val(cipher.folder_id.clone()),
+            now.clone().into(),
+            cipher_id.clone().into(),
+            claims.sub.clone().into(),
+        ])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+        crate::handlers::ciphers::update_attachment_keys(
+            &db,
+            &cipher_id,
+            &claims.sub,
+            cipher.attachments2.as_ref(),
+        )
+        .await?;
+    }
+
+    let server_password = password::hash_password(
+        &unlock.master_key_authentication_hash,
+        user.password_iterations.and(user.password_salt.as_deref()),
+    )
+    .await?;
+    let security_stamp = Uuid::new_v4().to_string();
+    db.prepare(
+        "UPDATE users SET master_password_hash = ?1, key = ?2, private_key = ?3,
+         security_stamp = ?4, password_salt = ?5, password_iterations = ?6, updated_at = ?7
+         WHERE id = ?8",
+    )
+    .bind(&[
+        server_password.hash.into(),
+        unlock.master_key_encrypted_user_key.clone().into(),
+        payload
+            .account_keys
+            .user_key_encrypted_account_private_key
+            .into(),
+        security_stamp.into(),
+        server_password.salt.into(),
+        server_password.iterations.into(),
+        now.clone().into(),
+        claims.sub.clone().into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    crate::notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        crate::notifications::UpdateType::LogOut,
+        claims.sub.clone(),
+        now,
+        claims.device.clone(),
+    );
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::PasswordChange,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            detail: Some("Action: Rotate user account keys".to_string()),
+            meta: notify::extract_request_meta(&headers),
+            ..Default::default()
+        },
+    );
     Ok(Json(json!({})))
 }
 
@@ -1124,6 +1526,32 @@ pub async fn send_verification_email(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RegistrationVerificationClickedRequest {
+    email: String,
+    email_verification_token: String,
+}
+
+#[worker::send]
+pub async fn registration_verification_clicked(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RegistrationVerificationClickedRequest>,
+) -> Result<Json<Value>, AppError> {
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+
+    let token = decode::<RegisterVerifyClaims>(
+        &payload.email_verification_token,
+        &DecodingKey::from_secret(state.jwt_keys.access_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
+    if !token.claims.sub.eq_ignore_ascii_case(payload.email.trim()) {
+        return Err(AppError::Unauthorized("Email does not match".to_string()));
+    }
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteRecoverData {
     pub email: String,
 }
@@ -1189,7 +1617,7 @@ pub async fn post_delete_recover_token(
         return Err(AppError::NotFound("User doesn't exist".to_string()));
     }
 
-    cascade_delete_user_data(&db, &data.user_id).await?;
+    cascade_delete_user_data(&state.env, &db, &data.user_id).await?;
 
     Ok(Json(json!({})))
 }
@@ -1203,7 +1631,7 @@ pub async fn post_delete_account(
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
     validate_password_or_otp(&db, &claims.sub, &payload).await?;
-    cascade_delete_user_data(&db, &claims.sub).await?;
+    cascade_delete_user_data(&state.env, &db, &claims.sub).await?;
     Ok(Json(json!({})))
 }
 
@@ -1216,7 +1644,7 @@ pub async fn delete_account(
     post_delete_account(claims, State(state), Json(payload)).await
 }
 
-async fn validate_password_or_otp(
+pub(crate) async fn validate_password_or_otp(
     db: &worker::D1Database,
     user_id: &str,
     payload: &SecretVerificationRequest,
@@ -1247,7 +1675,13 @@ async fn verify_user_password(
     Ok(())
 }
 
-async fn cascade_delete_user_data(db: &worker::D1Database, user_id: &str) -> Result<(), AppError> {
+async fn cascade_delete_user_data(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    user_id: &str,
+) -> Result<(), AppError> {
+    crate::handlers::sends::delete_user_send_files_from_r2(env, db, user_id).await?;
+    crate::handlers::attachments::delete_user_attachments_from_r2(env, db, user_id).await?;
     db.prepare("DELETE FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
         .run()
@@ -1296,7 +1730,7 @@ pub async fn post_keys(
         .bind(&[
             payload.encrypted_private_key.clone().into(),
             payload.public_key.clone().into(),
-            now.into(),
+            now.clone().into(),
             claims.sub.clone().into(),
         ])?
         .run()
@@ -1311,22 +1745,72 @@ pub async fn post_keys(
 }
 
 #[worker::send]
+pub async fn get_public_key(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    let user: Option<Value> = db
+        .prepare("SELECT id, public_key FROM users WHERE id = ?1")
+        .bind(&[user_id.into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    let user = user.ok_or_else(|| AppError::NotFound("User doesn't exist".to_string()))?;
+    let public_key = user
+        .get("public_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::NotFound("User has no public_key".to_string()))?;
+    Ok(Json(json!({
+        "userId": user.get("id").cloned().unwrap_or(Value::Null),
+        "publicKey": public_key,
+        "object": "userKey"
+    })))
+}
+
+#[worker::send]
 pub async fn post_api_key(
     claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SecretVerificationRequest>,
 ) -> Result<Json<Value>, AppError> {
+    update_api_key(claims, state, payload, false).await
+}
+
+async fn update_api_key(
+    claims: Claims,
+    state: Arc<AppState>,
+    payload: SecretVerificationRequest,
+    rotate: bool,
+) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
     validate_password_or_otp(&db, &claims.sub, &payload).await?;
 
-    let api_key = Uuid::new_v4().to_string().replace('-', "");
-    let now = Utc::now().to_rfc3339();
+    let existing: Option<String> = db
+        .prepare("SELECT api_key FROM users WHERE id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .first(Some("api_key"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    let api_key = if rotate || existing.as_deref().unwrap_or_default().is_empty() {
+        rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(30)
+            .map(char::from)
+            .collect::<String>()
+    } else {
+        existing.unwrap_or_default()
+    };
+    let now = db::now_rfc3339_millis();
 
     db.prepare("UPDATE users SET api_key = ?1, updated_at = ?2 WHERE id = ?3")
         .bind(&[
             api_key.clone().into(),
-            now.into(),
+            now.clone().into(),
             claims.sub.clone().into(),
         ])?
         .run()
@@ -1335,7 +1819,7 @@ pub async fn post_api_key(
 
     Ok(Json(json!({
         "apiKey": api_key,
-        "revisionDate": chrono::Utc::now().timestamp_millis(),
+        "revisionDate": now,
         "object": "apiKey"
     })))
 }
@@ -1346,40 +1830,49 @@ pub async fn rotate_api_key(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SecretVerificationRequest>,
 ) -> Result<Json<Value>, AppError> {
-    post_api_key(claims, State(state), Json(payload)).await
+    update_api_key(claims, state, payload, true).await
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyEmailTokenRequest {
+    pub user_id: String,
     pub token: String,
 }
 
 #[worker::send]
 pub async fn post_verify_email_token(
-    claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<VerifyEmailTokenRequest>,
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
-    claims.verify_security_stamp(&db).await?;
-
-    use crate::models::user::RegisterVerifyClaims;
     use jsonwebtoken::{DecodingKey, Validation, decode};
 
     let decoding_key = DecodingKey::from_secret(state.jwt_keys.access_secret.as_ref());
-    let token_data =
-        decode::<RegisterVerifyClaims>(&payload.token, &decoding_key, &Validation::default())
-            .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
-
-    let email = token_data.claims.sub.to_lowercase();
-    if email != claims.email.to_lowercase() {
-        return Err(AppError::Unauthorized("Email does not match".to_string()));
+    let token_data = decode::<crate::auth::BasicJwtClaims>(
+        &payload.token,
+        &decoding_key,
+        &Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid email verification token".to_string()))?;
+    if token_data.claims.sub != payload.user_id
+        || token_data.claims.iss != "warden-worker|verify-email"
+    {
+        return Err(AppError::Unauthorized("Invalid claim".to_string()));
     }
 
-    let now = Utc::now().to_rfc3339();
+    let exists: Option<String> = db
+        .prepare("SELECT id FROM users WHERE id = ?1")
+        .bind(&[payload.user_id.clone().into()])?
+        .first(Some("id"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    if exists.is_none() {
+        return Err(AppError::NotFound("User doesn't exist".to_string()));
+    }
+    let now = db::now_rfc3339_millis();
     db.prepare("UPDATE users SET email_verified = ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[1.into(), now.into(), claims.sub.clone().into()])?
+        .bind(&[1.into(), now.into(), payload.user_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
@@ -1392,15 +1885,39 @@ pub async fn post_verify_email(
     claims: Claims,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, AppError> {
+    if !notify::is_email_webhook_configured(&state.env) {
+        return Err(AppError::BadRequest(
+            "Cannot verify email address".to_string(),
+        ));
+    }
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-
-    let now = Utc::now().to_rfc3339();
-    db.prepare("UPDATE users SET email_verified = ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[1.into(), now.into(), claims.sub.clone().into()])?
-        .run()
+    let email: String = db
+        .prepare("SELECT email FROM users WHERE id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .first(Some("email"))
         .await
-        .map_err(|_| AppError::Database)?;
+        .map_err(|_| AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("User doesn't exist".to_string()))?;
+    let now = Utc::now();
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &crate::auth::BasicJwtClaims {
+            nbf: now.timestamp() as usize,
+            exp: (now + chrono::Duration::minutes(10)).timestamp() as usize,
+            iss: "warden-worker|verify-email".to_string(),
+            sub: claims.sub,
+        },
+        &jsonwebtoken::EncodingKey::from_secret(state.jwt_keys.access_secret.as_bytes()),
+    )
+    .map_err(|_| AppError::Internal)?;
+    notify::send_email_token_background(
+        &state.ctx,
+        state.env.clone(),
+        email,
+        token,
+        notify::EmailType::VerifyEmail,
+    );
 
     Ok(Json(json!({})))
 }
@@ -1408,6 +1925,7 @@ pub async fn post_verify_email(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailTokenRequest {
+    pub master_password_hash: String,
     pub new_email: String,
 }
 
@@ -1422,6 +1940,10 @@ pub async fn post_email_token(
 
     let new_email = payload.new_email.to_lowercase();
 
+    if !password::verify_user_password(&db, &claims.sub, &payload.master_password_hash).await? {
+        return Err(AppError::Unauthorized("Invalid password".to_string()));
+    }
+
     let existing: Option<Value> = db
         .prepare("SELECT id FROM users WHERE email = ?1 AND id != ?2")
         .bind(&[new_email.clone().into(), claims.sub.clone().into()])?
@@ -1432,25 +1954,30 @@ pub async fn post_email_token(
         return Err(AppError::BadRequest("Email already in use".to_string()));
     }
 
-    use crate::models::user::RegisterVerifyClaims;
-    use chrono::Duration;
-    use jsonwebtoken::{EncodingKey, Header, encode};
-
-    let now = Utc::now();
-    let exp = (now + Duration::hours(1)).timestamp() as usize;
-    let token_claims = RegisterVerifyClaims {
-        sub: new_email.clone(),
-        name: None,
-        exp,
-    };
-    let token = encode(
-        &Header::default(),
-        &token_claims,
-        &EncodingKey::from_secret(state.jwt_keys.access_secret.as_ref()),
+    let token = two_factor::generate_email_token(6);
+    let now = db::now_rfc3339_millis();
+    db.prepare(
+        "UPDATE users SET email_new = ?1, email_new_token = ?2, email_new_token_sent_at = ?3, updated_at = ?3 WHERE id = ?4",
     )
-    .map_err(|_| AppError::Internal)?;
+    .bind(&[
+        new_email.clone().into(),
+        token.clone().into(),
+        now.into(),
+        claims.sub.into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
 
-    Ok(Json(json!({ "token": token })))
+    notify::send_email_token_background(
+        &state.ctx,
+        state.env.clone(),
+        new_email,
+        token,
+        notify::EmailType::ChangeEmail,
+    );
+
+    Ok(Json(json!({})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1620,5 +2147,18 @@ mod tests {
             "UNIQUE constraint failed: users.email"
         ));
         assert!(!is_single_user_registration_conflict("database is locked"));
+    }
+
+    #[test]
+    fn change_password_accepts_current_android_key_field() {
+        let payload: ChangeMasterPasswordRequest = serde_json::from_value(json!({
+            "masterPasswordHash": "old-hash",
+            "newMasterPasswordHash": "new-hash",
+            "masterPasswordHint": null,
+            "key": "wrapped-user-key"
+        }))
+        .unwrap();
+
+        assert_eq!(payload.user_symmetric_key, "wrapped-user-key");
     }
 }

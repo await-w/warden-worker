@@ -1,5 +1,4 @@
 use axum::{Json, extract::State};
-use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -9,6 +8,7 @@ use crate::auth::Claims;
 use crate::db;
 use crate::error::AppError;
 use crate::models::folder::{CreateFolderRequest, Folder, FolderResponse};
+use crate::notifications::{self, UpdateType};
 use crate::router::AppState;
 use axum::extract::Path;
 
@@ -20,8 +20,7 @@ pub async fn create_folder(
 ) -> Result<Json<FolderResponse>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = db::now_rfc3339_millis();
 
     let folder = Folder {
         id: Uuid::new_v4().to_string(),
@@ -43,6 +42,17 @@ pub async fn create_folder(
     .map_err(|_| AppError::Database)?
     .run()
     .await?;
+
+    let revision = db::update_user_revision(&db, &claims.sub).await?;
+    notifications::publish_folder_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncFolderCreate,
+        claims.sub.clone(),
+        folder.id.clone(),
+        revision,
+        claims.device.clone(),
+    );
 
     let response = FolderResponse {
         id: folder.id,
@@ -139,15 +149,27 @@ pub async fn delete_folder(
         ));
     }
 
+    let user_id = claims.sub.clone();
     query!(
         &db,
         "DELETE FROM folders WHERE id = ?1 AND user_id = ?2",
         id,
-        claims.sub
+        user_id
     )
     .map_err(|_| AppError::Database)?
     .run()
     .await?;
+
+    let revision = db::update_user_revision(&db, &claims.sub).await?;
+    notifications::publish_folder_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncFolderDelete,
+        claims.sub,
+        id,
+        revision,
+        claims.device,
+    );
 
     Ok(Json(()))
 }
@@ -160,8 +182,7 @@ pub async fn update_folder(
 ) -> Result<Json<FolderResponse>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = db::now_rfc3339_millis();
 
     let existing_folder: Folder = query!(
         &db,
@@ -193,6 +214,17 @@ pub async fn update_folder(
     .map_err(|_| AppError::Database)?
     .run()
     .await?;
+
+    let revision = db::update_user_revision(&db, &claims.sub).await?;
+    notifications::publish_folder_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncFolderUpdate,
+        claims.sub,
+        folder.id.clone(),
+        revision,
+        claims.device,
+    );
 
     let response = FolderResponse {
         id: folder.id,

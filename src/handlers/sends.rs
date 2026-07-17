@@ -25,6 +25,7 @@ use crate::{
         SEND_TYPE_FILE, SEND_TYPE_TEXT, SendAccessData, SendDBModel, SendData, SendFileDBModel,
         send_to_json, send_to_json_access, uuid_from_access_id,
     },
+    notifications::{self, UpdateType},
     notify::{self, NotifyContext, NotifyEvent},
     router::AppState,
 };
@@ -33,6 +34,7 @@ const SEND_FILES_BUCKET_BINDING: &str = "SEND_FILES_BUCKET";
 const SEND_ACCESS_RATE_LIMITER_BINDING: &str = "SEND_ACCESS_LIMITER";
 const SEND_ACCESS_TOKEN_ISSUER: &str = "warden-worker|send";
 const SEND_ACCESS_TOKEN_TTL_MINUTES: i64 = 2;
+const SEND_PASSWORD_ITERATIONS: i32 = 100_000;
 
 /// Cookie name for Turnstile send-access pass (HttpOnly, signed JWT for backend)
 const SEND_ACCESS_COOKIE: &str = "cf_send_pass";
@@ -154,6 +156,104 @@ struct SendAccessPassClaims {
     aud: String,
     exp: usize,
     iat: usize,
+}
+
+fn validate_deletion_date(deletion_date: &str) -> Result<(), AppError> {
+    let deletion_date = parse_rfc3339(deletion_date)?;
+    if deletion_date > Utc::now() + chrono::Duration::days(31) {
+        return Err(AppError::BadRequest(
+            "You cannot have a Send with a deletion date that far into the future. Adjust the Deletion Date to a value less than 31 days from now and try again."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn rotate_send_data(
+    db: &worker::D1Database,
+    user_id: &str,
+    payload: SendData,
+    now: &str,
+) -> Result<(), AppError> {
+    let send_id = payload._id.clone().ok_or_else(|| {
+        AppError::BadRequest("Send id is required during key rotation".to_string())
+    })?;
+    let existing = get_send_by_id_and_user(db, &send_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Send doesn't exist".to_string()))?;
+    if existing.r#type != payload.r#type {
+        return Err(AppError::BadRequest("Cannot change send type".to_string()));
+    }
+    reject_unsupported_email_verification(&payload)?;
+    validate_deletion_date(&payload.deletion_date)?;
+
+    let name = payload.name.clone();
+    let notes = payload.notes.clone();
+    let password = payload.password.clone();
+    let max_access_count = payload.max_access_count;
+    let expiration_date = payload.expiration_date.clone();
+    let deletion_date = payload.deletion_date.clone();
+    let disabled = payload.disabled;
+    let hide_email = payload.hide_email;
+    let (send_type, key, data) = extract_send_payload_data(payload)?;
+    let data = serde_json::to_string(&data).map_err(|_| AppError::Internal)?;
+
+    let (password_hash, password_salt, password_iter) = if let Some(password) = password {
+        let salt = new_salt_b64();
+        let hash = hash_password(&password, &salt, SEND_PASSWORD_ITERATIONS)?;
+        (Some(hash), Some(salt), Some(SEND_PASSWORD_ITERATIONS))
+    } else {
+        (
+            existing.password_hash,
+            existing.password_salt,
+            existing.password_iter,
+        )
+    };
+
+    db.prepare(
+        "UPDATE sends SET type = ?1, name = ?2, notes = ?3, data = ?4, key = ?5,
+         password_hash = ?6, password_salt = ?7, password_iter = ?8,
+         max_access_count = ?9, updated_at = ?10, expiration_date = ?11,
+         deletion_date = ?12, disabled = ?13, hide_email = ?14
+         WHERE id = ?15 AND user_id = ?16",
+    )
+    .bind(&[
+        send_type.into(),
+        name.into(),
+        notes
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        data.into(),
+        key.into(),
+        password_hash
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        password_salt
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        password_iter
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        max_access_count
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        now.into(),
+        expiration_date
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        deletion_date.into(),
+        (if disabled { 1 } else { 0 }).into(),
+        hide_email
+            .map(|value| if value { 1 } else { 0 })
+            .map(Into::into)
+            .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+        send_id.into(),
+        user_id.into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -405,7 +505,7 @@ fn display_size(bytes: i64) -> String {
     format!("{:.1} GB", gb)
 }
 
-fn hash_password(password: &str, salt_b64: &str) -> Result<String, AppError> {
+fn hash_password_legacy(password: &str, salt_b64: &str) -> Result<String, AppError> {
     let salt = general_purpose::STANDARD
         .decode(salt_b64)
         .map_err(|_| AppError::Internal)?;
@@ -416,10 +516,43 @@ fn hash_password(password: &str, salt_b64: &str) -> Result<String, AppError> {
     Ok(general_purpose::STANDARD.encode(out))
 }
 
+fn hash_password(password: &str, salt_b64: &str, iterations: i32) -> Result<String, AppError> {
+    let salt = general_purpose::STANDARD
+        .decode(salt_b64)
+        .map_err(|_| AppError::Internal)?;
+    let iterations = u32::try_from(iterations).map_err(|_| AppError::Internal)?;
+    if iterations == 0 {
+        return Err(AppError::Internal);
+    }
+    let mut out = [0_u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut out);
+    Ok(general_purpose::STANDARD.encode(out))
+}
+
 fn new_salt_b64() -> String {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 64];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     general_purpose::STANDARD.encode(bytes)
+}
+
+async fn finish_send_mutation(
+    db: &worker::D1Database,
+    state: &Arc<AppState>,
+    user_id: &str,
+    send_id: &str,
+    _revision_date: &str,
+    update_type: UpdateType,
+) -> Result<(), AppError> {
+    let revision = db::update_user_revision(db, user_id).await?;
+    notifications::publish_send_update_background(
+        &state.ctx,
+        state.env.clone(),
+        update_type,
+        user_id.to_string(),
+        send_id.to_string(),
+        revision,
+    );
+    Ok(())
 }
 
 fn extract_send_payload_data(mut data: SendData) -> Result<(i32, String, Value), AppError> {
@@ -479,17 +612,134 @@ async fn get_send_by_id_and_user(
     Ok(value.and_then(|v| serde_json::from_value::<SendDBModel>(v).ok()))
 }
 
+async fn delete_send_files_from_r2(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    send_id: &str,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let file_rows: Vec<Value> = db
+        .prepare(
+            "SELECT r2_object_key, storage_type FROM send_files WHERE send_id = ?1 AND user_id = ?2",
+        )
+        .bind(&[send_id.into(), user_id.into()])?
+        .all()
+        .await
+        .map_err(|_| AppError::Database)?
+        .results()?;
+    let r2_keys = file_rows
+        .iter()
+        .filter(|row| {
+            row.get("storage_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("d1_base64")
+                == "r2"
+        })
+        .map(|row| {
+            row.get("r2_object_key")
+                .and_then(|value| value.as_str())
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .ok_or(AppError::Internal)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if r2_keys.is_empty() {
+        return Ok(());
+    }
+    let bucket = env
+        .bucket(SEND_FILES_BUCKET_BINDING)
+        .map_err(|_| AppError::Internal)?;
+    for key in r2_keys {
+        bucket.delete(key).await.map_err(|err| {
+            log::error!(
+                target: targets::API,
+                "send R2 delete failed user_id={user_id} send_id={send_id}: {err:?}"
+            );
+            AppError::Internal
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_user_send_files_from_r2(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let rows: Vec<Value> = db
+        .prepare("SELECT id FROM sends WHERE user_id = ?1 AND type = ?2")
+        .bind(&[user_id.into(), SEND_TYPE_FILE.into()])?
+        .all()
+        .await
+        .map_err(|_| AppError::Database)?
+        .results()?;
+    for row in rows {
+        let send_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(AppError::Database)?;
+        delete_send_files_from_r2(env, db, send_id, user_id).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn purge_expired_sends(env: &worker::Env) -> Result<usize, AppError> {
+    let db = db::get_db(env)?;
+    let now = now_rfc3339_millis();
+    let rows: Vec<Value> = db
+        .prepare("SELECT id, user_id, type FROM sends WHERE deletion_date <= ?1")
+        .bind(&[now.into()])?
+        .all()
+        .await
+        .map_err(|_| AppError::Database)?
+        .results()?;
+
+    let mut purged = 0;
+    for row in rows {
+        let send_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(AppError::Database)?;
+        let user_id = row
+            .get("user_id")
+            .and_then(Value::as_str)
+            .ok_or(AppError::Database)?;
+        let send_type = row.get("type").and_then(Value::as_i64).unwrap_or_default() as i32;
+
+        if send_type == SEND_TYPE_FILE
+            && let Err(err) = delete_send_files_from_r2(env, &db, send_id, user_id).await
+        {
+            log::error!(
+                target: targets::API,
+                "expired Send cleanup retained metadata user_id={user_id} send_id={send_id}: {err}"
+            );
+            continue;
+        }
+
+        db.prepare("DELETE FROM sends WHERE id = ?1 AND user_id = ?2")
+            .bind(&[send_id.into(), user_id.into()])?
+            .run()
+            .await
+            .map_err(|_| AppError::Database)?;
+        db::update_user_revision(&db, user_id).await?;
+        purged += 1;
+    }
+    Ok(purged)
+}
+
 async fn update_send_access_count(
     db: &worker::D1Database,
     send_id: &str,
     delta: i32,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
+    let revision = now_rfc3339_millis();
     db.prepare("UPDATE sends SET access_count = access_count + ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[delta.into(), now_rfc3339_millis().into(), send_id.into()])?
+        .bind(&[delta.into(), revision.clone().into(), send_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
-    Ok(())
+    Ok(revision)
 }
 
 async fn get_creator_identifier(
@@ -549,7 +799,12 @@ fn validate_send_password(send: &SendDBModel, password: Option<String>) -> Resul
         log::warn!(target: targets::AUTH, "send.password_check.fail send_id={} reason=password_not_provided", send.id);
         return Err(AppError::Unauthorized("Password not provided".to_string()));
     };
-    let candidate = hash_password(&password, stored_salt_b64)?;
+    let candidate = match send.password_iter {
+        Some(iterations) if iterations > 0 => {
+            hash_password(&password, stored_salt_b64, iterations)?
+        }
+        _ => hash_password_legacy(&password, stored_salt_b64)?,
+    };
     if !constant_time_eq(stored_hash_b64.as_bytes(), candidate.as_bytes()) {
         log::warn!(target: targets::AUTH, "send.password_check.fail send_id={} reason=password_mismatch", send.id);
         return Err(AppError::BadRequest("Invalid password".to_string()));
@@ -636,7 +891,12 @@ pub async fn issue_send_access_token(
                 "Password is required",
             ));
         };
-        let candidate = hash_password(&password_hash_b64, stored_salt_b64)?;
+        let candidate = match send.password_iter {
+            Some(iterations) if iterations > 0 => {
+                hash_password(&password_hash_b64, stored_salt_b64, iterations)?
+            }
+            _ => hash_password_legacy(&password_hash_b64, stored_salt_b64)?,
+        };
         if !constant_time_eq(stored_hash_b64.as_bytes(), candidate.as_bytes()) {
             log::warn!(
                 target: targets::AUTH,
@@ -653,7 +913,16 @@ pub async fn issue_send_access_token(
         }
     }
 
-    update_send_access_count(&db, &send.id, 1).await?;
+    let revision = update_send_access_count(&db, &send.id, 1).await?;
+    finish_send_mutation(
+        &db,
+        state,
+        &send.user_id,
+        &send.id,
+        &revision,
+        UpdateType::SyncSendUpdate,
+    )
+    .await?;
 
     let now = Utc::now();
     let expires_in = chrono::Duration::minutes(SEND_ACCESS_TOKEN_TTL_MINUTES);
@@ -783,84 +1052,9 @@ pub async fn delete_send(
     );
 
     if owned.r#type == SEND_TYPE_FILE {
-        let file_rows: Vec<Value> = db
-            .prepare("SELECT r2_object_key, storage_type FROM send_files WHERE send_id = ?1 AND user_id = ?2")
-            .bind(&[send_id.clone().into(), claims.sub.clone().into()])?
-            .all()
-            .await
-            .map_err(|_| AppError::Database)?
-            .results()?;
-
-        log::info!(
-            target: targets::API,
-            "send.delete.files user_id={} send_id={} file_count={}",
-            claims.sub,
-            send_id,
-            file_rows.len()
-        );
-
-        if let Ok(bucket) = state.env.bucket(SEND_FILES_BUCKET_BINDING) {
-            for row in file_rows {
-                let storage_type = row
-                    .get("storage_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("d1_base64");
-                if storage_type != "r2" {
-                    log::debug!(
-                        target: targets::API,
-                        "send.delete.file.skip_d1 user_id={} send_id={} file_storage_type={}",
-                        claims.sub,
-                        send_id,
-                        storage_type
-                    );
-                    continue;
-                }
-                if let Some(key) = row.get("r2_object_key").and_then(|v| v.as_str()) {
-                    log::info!(
-                        target: targets::API,
-                        "send.delete.r2_object.deleting user_id={} send_id={} object_key={}",
-                        claims.sub,
-                        send_id,
-                        key
-                    );
-                    match bucket.delete(key.to_string()).await {
-                        Ok(_) => {
-                            log::info!(
-                                target: targets::API,
-                                "send.delete.r2_object.success user_id={} send_id={} object_key={}",
-                                claims.sub,
-                                send_id,
-                                key
-                            );
-                        }
-                        Err(e) => {
-                            log::error!(
-                                target: targets::API,
-                                "send.delete.r2_object.error user_id={} send_id={} object_key={} error={:?}",
-                                claims.sub,
-                                send_id,
-                                key,
-                                e
-                            );
-                        }
-                    }
-                } else {
-                    log::warn!(
-                        target: targets::API,
-                        "send.delete.r2_object.missing_key user_id={} send_id={}",
-                        claims.sub,
-                        send_id
-                    );
-                }
-            }
-        } else {
-            log::error!(
-                target: targets::API,
-                "send.delete.r2_bucket.access_error user_id={} send_id={}",
-                claims.sub,
-                send_id
-            );
-        }
+        // R2 deletion is part of the operation. Keep D1 metadata intact on
+        // failure so the operation can be retried without orphaning objects.
+        delete_send_files_from_r2(&state.env, &db, &send_id, &claims.sub).await?;
 
         query!(
             &db,
@@ -896,6 +1090,17 @@ pub async fn delete_send(
         claims.sub,
         send_id
     );
+
+    let revision = db::now_rfc3339_millis();
+    finish_send_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &send_id,
+        &revision,
+        UpdateType::SyncSendDelete,
+    )
+    .await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -936,7 +1141,7 @@ pub async fn post_send(
 
     if payload.r#type == SEND_TYPE_FILE {
         return Err(AppError::BadRequest(
-            "File sends should use /api/sends/file/v2".to_string(),
+            "File sends should use /api/sends/file".to_string(),
         ));
     }
 
@@ -959,6 +1164,7 @@ pub async fn post_send(
     let max_access_count = payload.max_access_count;
     let expiration_date = payload.expiration_date.clone();
     let deletion_date = payload.deletion_date.clone();
+    validate_deletion_date(&deletion_date)?;
     let disabled = payload.disabled;
     let hide_email = payload.hide_email;
 
@@ -971,16 +1177,19 @@ pub async fn post_send(
         .filter(|p| !p.trim().is_empty())
         .map(|_| new_salt_b64());
     let password_hash = match (password.as_deref(), password_salt.as_deref()) {
-        (Some(p), Some(salt)) if !p.trim().is_empty() => Some(hash_password(p, salt)?),
+        (Some(p), Some(salt)) if !p.trim().is_empty() => {
+            Some(hash_password(p, salt, SEND_PASSWORD_ITERATIONS)?)
+        }
         _ => None,
     };
+    let password_iter = password_hash.as_ref().map(|_| SEND_PASSWORD_ITERATIONS);
 
     let data_str = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
 
     query!(
         &db,
         "INSERT INTO sends (id, user_id, organization_id, type, name, notes, data, key, password_hash, password_salt, password_iter, max_access_count, access_count, created_at, updated_at, expiration_date, deletion_date, disabled, hide_email)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17)",
         send_id,
         claims.sub,
         send_type,
@@ -990,6 +1199,7 @@ pub async fn post_send(
         key,
         password_hash,
         password_salt,
+        password_iter,
         max_access_count,
         now,
         now,
@@ -1005,6 +1215,16 @@ pub async fn post_send(
     let send = get_send_by_id_and_user(&db, &send_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::Internal)?;
+
+    finish_send_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &send_id,
+        &send.updated_at,
+        UpdateType::SyncSendCreate,
+    )
+    .await?;
 
     log::info!(
         target: targets::API,
@@ -1026,6 +1246,183 @@ pub async fn post_send(
             send_id: Some(send_id),
             detail: Some(format!("type={send_type}")),
             meta,
+            ..Default::default()
+        },
+    );
+    Ok(Json(send_to_json(&send)))
+}
+
+#[worker::send]
+pub async fn post_send_file_legacy(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+
+    let mut model = None;
+    let mut encrypted_file_name = None;
+    let mut uploaded_bytes = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::BadRequest("Invalid multipart".to_string()))?
+    {
+        match field.name() {
+            Some("model") => {
+                model = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| AppError::BadRequest("Invalid send model".to_string()))?,
+                );
+            }
+            Some("data") => {
+                encrypted_file_name = field.file_name().map(str::to_string);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|err| AppError::BadRequest(format!("Invalid multipart data: {err}")))?
+                {
+                    bytes.extend_from_slice(&chunk);
+                }
+                uploaded_bytes = Some(bytes);
+            }
+            _ => {}
+        }
+    }
+
+    let model = model.ok_or_else(|| AppError::BadRequest("Missing send model".to_string()))?;
+    let payload: SendData = serde_json::from_str(&model)
+        .map_err(|_| AppError::BadRequest("Invalid send model".to_string()))?;
+    reject_unsupported_email_verification(&payload)?;
+    if payload.r#type != SEND_TYPE_FILE {
+        return Err(AppError::BadRequest(
+            "Send content is not a file".to_string(),
+        ));
+    }
+    validate_deletion_date(&payload.deletion_date)?;
+    let encrypted_file_name = encrypted_file_name
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("No filename provided".to_string()))?;
+    let bytes =
+        uploaded_bytes.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?;
+    let file_length = i64::try_from(bytes.len())
+        .map_err(|_| AppError::BadRequest("Invalid send size".to_string()))?;
+    check_storage_quota(&db, file_length).await?;
+
+    let name = payload.name.clone();
+    let notes = payload.notes.clone();
+    let password = payload.password.clone();
+    let max_access_count = payload.max_access_count;
+    let expiration_date = payload.expiration_date.clone();
+    let deletion_date = payload.deletion_date.clone();
+    let disabled = payload.disabled;
+    let hide_email = payload.hide_email;
+    let (send_type, key, mut data_value) = extract_send_payload_data(payload)?;
+    let file_id = Uuid::new_v4().to_string();
+    if let Some(obj) = data_value.as_object_mut() {
+        obj.insert("id".to_string(), Value::String(file_id.clone()));
+        obj.insert("size".to_string(), Value::Number(file_length.into()));
+        obj.insert(
+            "sizeName".to_string(),
+            Value::String(display_size(file_length)),
+        );
+    }
+
+    let send_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339_millis();
+    let data_str = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
+    let object_key = format!("sends/{}/{}/{}", claims.sub, send_id, file_id);
+    let password_salt = password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| new_salt_b64());
+    let password_hash = match (password.as_deref(), password_salt.as_deref()) {
+        (Some(password), Some(salt)) => {
+            Some(hash_password(password, salt, SEND_PASSWORD_ITERATIONS)?)
+        }
+        _ => None,
+    };
+    let password_iter = password_hash.as_ref().map(|_| SEND_PASSWORD_ITERATIONS);
+
+    let send_stmt = query!(
+        &db,
+        "INSERT INTO sends (id, user_id, organization_id, type, name, notes, data, key, password_hash, password_salt, password_iter, max_access_count, access_count, created_at, updated_at, expiration_date, deletion_date, disabled, hide_email)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17)",
+        send_id,
+        claims.sub,
+        send_type,
+        name,
+        notes,
+        data_str,
+        key,
+        password_hash,
+        password_salt,
+        password_iter,
+        max_access_count,
+        now,
+        now,
+        expiration_date,
+        deletion_date,
+        if disabled { 1 } else { 0 },
+        hide_email.map(|value| if value { 1 } else { 0 })
+    )
+    .map_err(|_| AppError::Database)?;
+    let file_stmt = query!(
+        &db,
+        "INSERT INTO send_files (id, send_id, user_id, file_name, size, mime, data_base64, r2_object_key, storage_type, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, 'r2', ?7, ?8)",
+        file_id,
+        send_id,
+        claims.sub,
+        encrypted_file_name,
+        file_length,
+        object_key,
+        now,
+        now
+    )
+    .map_err(|_| AppError::Database)?;
+
+    let bucket = state
+        .env
+        .bucket(SEND_FILES_BUCKET_BINDING)
+        .map_err(|_| AppError::Internal)?;
+    bucket
+        .put(object_key.clone(), bytes)
+        .execute()
+        .await
+        .map_err(|_| AppError::Internal)?;
+    if db.batch(vec![send_stmt, file_stmt]).await.is_err() {
+        let _ = bucket.delete(object_key).await;
+        return Err(AppError::Database);
+    }
+
+    let send = get_send_by_id_and_user(&db, &send_id, &claims.sub)
+        .await?
+        .ok_or(AppError::Internal)?;
+    finish_send_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &send_id,
+        &send.updated_at,
+        UpdateType::SyncSendCreate,
+    )
+    .await?;
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::SendCreate,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            send_id: Some(send_id),
+            detail: Some(format!("type={send_type}, file={encrypted_file_name}")),
+            meta: notify::extract_request_meta(&headers),
             ..Default::default()
         },
     );
@@ -1097,9 +1494,11 @@ pub async fn put_send(
 
     let name = payload.name.clone();
     let notes = payload.notes.clone();
+    let password = payload.password.clone();
     let max_access_count = payload.max_access_count;
     let expiration_date = payload.expiration_date.clone();
     let deletion_date = payload.deletion_date.clone();
+    validate_deletion_date(&deletion_date)?;
     let disabled = payload.disabled;
     let hide_email = payload.hide_email;
 
@@ -1122,12 +1521,12 @@ pub async fn put_send(
     let mut password_salt = existing.password_salt.clone();
     let mut password_iter = existing.password_iter;
 
-    if let Some(password) = payload.password.as_deref() {
+    if let Some(password) = password.as_deref() {
         let salt = new_salt_b64();
-        let hash = hash_password(password, &salt)?;
+        let hash = hash_password(password, &salt, SEND_PASSWORD_ITERATIONS)?;
         password_hash = Some(hash);
         password_salt = Some(salt);
-        password_iter = None;
+        password_iter = Some(SEND_PASSWORD_ITERATIONS);
     }
 
     log::info!(
@@ -1135,8 +1534,8 @@ pub async fn put_send(
         "send.update.password_apply send_id={} has_password_key={} apply_new_password={} keep_existing_password={}",
         send_id,
         has_password_key,
-        payload.password.as_deref().is_some(),
-        payload.password.as_deref().is_none()
+        password.as_deref().is_some(),
+        password.as_deref().is_none()
     );
 
     query!(
@@ -1180,6 +1579,16 @@ pub async fn put_send(
         .await?
         .ok_or_else(|| AppError::Internal)?;
 
+    finish_send_mutation(
+        &db,
+        &state,
+        &existing.user_id,
+        &existing.id,
+        &send.updated_at,
+        UpdateType::SyncSendUpdate,
+    )
+    .await?;
+
     log::info!(
         target: targets::API,
         "send.update.success user_id={} send_id={} type={} stored_has_password={}",
@@ -1220,6 +1629,7 @@ pub async fn put_remove_send_password(
         .await?
         .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
 
+    let now = now_rfc3339_millis();
     query!(
         &db,
         "UPDATE sends
@@ -1228,7 +1638,7 @@ pub async fn put_remove_send_password(
              password_iter = NULL,
              updated_at = ?1
          WHERE id = ?2 AND user_id = ?3",
-        now_rfc3339_millis(),
+        now,
         send_id,
         claims.sub
     )
@@ -1239,6 +1649,16 @@ pub async fn put_remove_send_password(
     let send = get_send_by_id_and_user(&db, &existing.id, &existing.user_id)
         .await?
         .ok_or_else(|| AppError::Internal)?;
+
+    finish_send_mutation(
+        &db,
+        &state,
+        &existing.user_id,
+        &existing.id,
+        &send.updated_at,
+        UpdateType::SyncSendUpdate,
+    )
+    .await?;
 
     log::info!(
         target: targets::API,
@@ -1254,7 +1674,6 @@ pub async fn put_remove_send_password(
 pub async fn post_send_file_v2(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(payload): Json<SendData>,
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
@@ -1290,9 +1709,11 @@ pub async fn post_send_file_v2(
 
     let name = payload.name.clone();
     let notes = payload.notes.clone();
+    let password = payload.password.clone();
     let max_access_count = payload.max_access_count;
     let expiration_date = payload.expiration_date.clone();
     let deletion_date = payload.deletion_date.clone();
+    validate_deletion_date(&deletion_date)?;
     let disabled = payload.disabled;
     let hide_email = payload.hide_email;
 
@@ -1312,11 +1733,22 @@ pub async fn post_send_file_v2(
     let now = now_rfc3339_millis();
     let data_str = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
     let object_key = format!("sends/{}/{}/{}", claims.sub, send_id, file_id);
+    let password_salt = password
+        .as_deref()
+        .filter(|password| !password.trim().is_empty())
+        .map(|_| new_salt_b64());
+    let password_hash = match (password.as_deref(), password_salt.as_deref()) {
+        (Some(password), Some(salt)) => {
+            Some(hash_password(password, salt, SEND_PASSWORD_ITERATIONS)?)
+        }
+        _ => None,
+    };
+    let password_iter = password_hash.as_ref().map(|_| SEND_PASSWORD_ITERATIONS);
 
     query!(
         &db,
         "INSERT INTO sends (id, user_id, organization_id, type, name, notes, data, key, password_hash, password_salt, password_iter, max_access_count, access_count, created_at, updated_at, expiration_date, deletion_date, disabled, hide_email)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17)",
         send_id,
         claims.sub,
         send_type,
@@ -1324,6 +1756,9 @@ pub async fn post_send_file_v2(
         notes,
         data_str,
         key,
+        password_hash,
+        password_salt,
+        password_iter,
         max_access_count,
         now,
         now,
@@ -1358,6 +1793,10 @@ pub async fn post_send_file_v2(
     .run()
     .await?;
 
+    // Vaultwarden persists the placeholder Send and advances the user's
+    // revision here, but emits SyncSendCreate only after the file upload.
+    db::update_user_revision(&db, &claims.sub).await?;
+
     let send = get_send_by_id_and_user(&db, &send_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::Internal)?;
@@ -1369,28 +1808,6 @@ pub async fn post_send_file_v2(
         send_id,
         file_id,
         object_key
-    );
-
-    let send_id_for_notify = send_id.clone();
-    let file_name = data_value
-        .get("fileName")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "file".to_string());
-
-    let meta = notify::extract_request_meta(&headers);
-    notify::notify_background(
-        &state.ctx,
-        state.env.clone(),
-        NotifyEvent::SendCreate,
-        NotifyContext {
-            user_id: Some(claims.sub),
-            user_email: Some(claims.email),
-            send_id: Some(send_id_for_notify),
-            detail: Some(format!("type={send_type}, file={file_name}")),
-            meta,
-            ..Default::default()
-        },
     );
 
     Ok(Json(json!({
@@ -1405,6 +1822,7 @@ pub async fn post_send_file_v2(
 pub async fn post_send_file_v2_data(
     claims: Claims,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((send_id, file_id)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
@@ -1422,7 +1840,7 @@ pub async fn post_send_file_v2_data(
     }
 
     let file_row: Option<Value> = db
-        .prepare("SELECT size, r2_object_key, storage_type FROM send_files WHERE id = ?1 AND send_id = ?2 AND user_id = ?3 LIMIT 1")
+        .prepare("SELECT size, file_name, r2_object_key, storage_type FROM send_files WHERE id = ?1 AND send_id = ?2 AND user_id = ?3 LIMIT 1")
         .bind(&[file_id.clone().into(), send_id.clone().into(), claims.sub.clone().into()])?
         .first(None)
         .await
@@ -1453,6 +1871,11 @@ pub async fn post_send_file_v2_data(
             "Send storage backend mismatch".to_string(),
         ));
     }
+    let file_name = file_row
+        .get("file_name")
+        .and_then(Value::as_str)
+        .unwrap_or("file")
+        .to_string();
 
     let now = now_rfc3339_millis();
     let expected_size = size as usize;
@@ -1470,6 +1893,20 @@ pub async fn post_send_file_v2_data(
         let name = field.name().unwrap_or("").to_string();
         if name != "data" {
             continue;
+        }
+
+        let uploaded_file_name = field
+            .file_name()
+            .ok_or_else(|| AppError::BadRequest("Send file name is not provided".to_string()))?;
+        let is_cli = headers
+            .get("device-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i32>().ok())
+            .is_some_and(|device_type| (23..=25).contains(&device_type));
+        if uploaded_file_name != file_name && !(is_cli && file_name.ends_with(uploaded_file_name)) {
+            return Err(AppError::BadRequest(format!(
+                "Send file name does not match. Expected '{file_name}' got '{uploaded_file_name}'"
+            )));
         }
 
         uploaded = true;
@@ -1522,6 +1959,30 @@ pub async fn post_send_file_v2_data(
     .map_err(|_| AppError::Database)?
     .run()
     .await?;
+
+    finish_send_mutation(
+        &db,
+        &state,
+        &claims.sub,
+        &send_id,
+        &now,
+        UpdateType::SyncSendCreate,
+    )
+    .await?;
+
+    notify::notify_background(
+        &state.ctx,
+        state.env.clone(),
+        NotifyEvent::SendCreate,
+        NotifyContext {
+            user_id: Some(claims.sub),
+            user_email: Some(claims.email),
+            send_id: Some(send_id),
+            detail: Some(format!("type={SEND_TYPE_FILE}, file={file_name}")),
+            meta: notify::extract_request_meta(&headers),
+            ..Default::default()
+        },
+    );
 
     Ok(Json(json!({})))
 }
@@ -1589,7 +2050,16 @@ pub async fn post_access_legacy(
     validate_send_password(&send, payload.password)?;
 
     if send.r#type == SEND_TYPE_TEXT {
-        update_send_access_count(&db, &send.id, 1).await?;
+        let revision = update_send_access_count(&db, &send.id, 1).await?;
+        finish_send_mutation(
+            &db,
+            &state,
+            &send.user_id,
+            &send.id,
+            &revision,
+            UpdateType::SyncSendUpdate,
+        )
+        .await?;
     }
 
     let creator_identifier = get_creator_identifier(&db, &send).await?;
@@ -1620,7 +2090,7 @@ pub async fn post_access_file(
     }
 
     let token = generate_download_token(&state, &send.id, &file_id).await?;
-    let url = format!("/api/sends/{}/{file_id}?t={token}", send.id);
+    let url = state.public_url(&format!("/api/sends/{}/{file_id}?t={token}", send.id));
 
     log::info!(target: targets::AUTH, "send.access_file_token.success send_id={} file_id={}", send.id, file_id);
     Ok(Json(json!({
@@ -1686,10 +2156,19 @@ pub async fn post_access_file_legacy(
         return Err(AppError::NotFound("Send not found".to_string()));
     }
 
-    update_send_access_count(&db, &send.id, 1).await?;
+    let revision = update_send_access_count(&db, &send.id, 1).await?;
+    finish_send_mutation(
+        &db,
+        &state,
+        &send.user_id,
+        &send.id,
+        &revision,
+        UpdateType::SyncSendUpdate,
+    )
+    .await?;
 
     let token = generate_download_token(&state, &send_id, &file_id).await?;
-    let url = format!("/api/sends/{send_id}/{file_id}?t={token}");
+    let url = state.public_url(&format!("/api/sends/{send_id}/{file_id}?t={token}"));
 
     log::info!(target: targets::AUTH, "send.access_file.success send_id={} file_id={}", send_id, file_id);
 
@@ -1797,4 +2276,47 @@ pub async fn download_send(
             .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hash_password, hash_password_legacy, new_salt_b64, validate_deletion_date};
+    use base64::{Engine as _, engine::general_purpose};
+    use chrono::{SecondsFormat, Utc};
+
+    #[test]
+    fn send_password_hash_matches_vaultwarden_pbkdf2_sha256() {
+        let salt = general_purpose::STANDARD.encode(b"salt");
+        assert_eq!(
+            hash_password("password", &salt, 1).expect("hash password"),
+            "Eg+2z/z4syxD5yJSVsT4N6hlSMkszDVICAWYfLcL4Xs="
+        );
+    }
+
+    #[test]
+    fn legacy_send_password_hash_remains_readable() {
+        let salt = general_purpose::STANDARD.encode(b"salt");
+        assert_eq!(
+            hash_password_legacy("password", &salt).expect("hash legacy password"),
+            "E2Ab2k6njlWge5iGbSvmvgdE44ZvE8AMgRyrYIoo8yI="
+        );
+    }
+
+    #[test]
+    fn send_password_salt_matches_upstream_length() {
+        let salt = general_purpose::STANDARD
+            .decode(new_salt_b64())
+            .expect("decode salt");
+        assert_eq!(salt.len(), 64);
+    }
+
+    #[test]
+    fn send_deletion_date_is_limited_to_31_days() {
+        let valid =
+            (Utc::now() + chrono::Duration::days(30)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let invalid =
+            (Utc::now() + chrono::Duration::days(32)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        assert!(validate_deletion_date(&valid).is_ok());
+        assert!(validate_deletion_date(&invalid).is_err());
+    }
 }

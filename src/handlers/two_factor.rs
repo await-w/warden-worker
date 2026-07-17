@@ -3,7 +3,7 @@ use axum::{Json, extract::State};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use totp_rs::{Algorithm, Secret, TOTP};
 
@@ -142,6 +142,20 @@ pub async fn two_factor_status(
         "data": providers,
         "object": "list",
         "continuationToken": null
+    })))
+}
+
+#[worker::send]
+pub async fn get_device_verification_settings(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    Ok(Json(json!({
+        "isDeviceVerificationSectionEnabled": false,
+        "unknownDeviceVerificationEnabled": false,
+        "object": "deviceVerificationSettings"
     })))
 }
 

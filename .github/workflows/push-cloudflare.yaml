@@ -248,7 +248,9 @@ jobs:
                   wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --file=./sql/schema.sql --remote
                   echo "Database schema initialized successfully."
 
-            - name: Migrate existing database
+            # 仅用于把原生 D1 migrations 启用前创建的数据库提升到当前基线。
+            # 后续数据库变更请只在 sql/d1-migrations 中新增迁移文件，不要继续扩展此步骤。
+            - name: Bring existing database to migration baseline (legacy)
               if: steps.setup_d1.outputs.is_new != 'true'
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -272,9 +274,38 @@ jobs:
                       echo "Cipher key migration already applied."
                   fi
 
+                  echo "Checking account compatibility columns..."
+                  for column in api_key email_new email_new_token email_new_token_sent_at; do
+                      column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('users') WHERE name = '$column'" | jq -r '.[0].results[0].column_count // 0')
+                      if [ "$column_count" = "0" ]; then
+                          wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --command "ALTER TABLE users ADD COLUMN $column TEXT"
+                          echo "Added users.$column."
+                      else
+                          echo "users.$column already exists."
+                      fi
+                  done
+
+                  echo "Checking cipher attachments migration..."
+                  attachments_table_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type = 'table' AND name = 'cipher_attachments'" | jq -r '.[0].results[0].table_count // 0')
+                  if [ "$attachments_table_count" = "0" ]; then
+                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260716_add_cipher_attachments.sql
+                      echo "Cipher attachments migration applied."
+                  else
+                      echo "Cipher attachments migration already applied."
+                  fi
+
                   echo "Ensuring single-user registration constraint..."
                   wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_enforce_single_user.sql
                   echo "Single-user registration constraint is active."
+
+            - name: Apply pending D1 migrations
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+              run: |
+                  echo "Applying pending migrations from sql/d1-migrations..."
+                  wrangler d1 migrations apply ${{ env.D1_DATABASE_NAME }} --remote
+                  echo "All pending D1 migrations applied successfully."
 
             - name: Create R2 Bucket (only if not exists)
               if: needs.preflight.outputs.r2_bucket_exists != 'true'

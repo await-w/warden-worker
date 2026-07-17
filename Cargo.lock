@@ -2022,6 +2022,7 @@ dependencies = [
  "pbkdf2",
  "rand 0.8.6",
  "rsa",
+ "semver",
  "serde",
  "serde_cbor_2",
  "serde_json",

@@ -1,6 +1,7 @@
 use axum::http::HeaderMap;
 use axum::{Json, extract::State};
 use chrono::Utc;
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
@@ -11,7 +12,11 @@ use crate::db;
 use crate::error::AppError;
 use crate::models::folder::Folder;
 use crate::models::import::ImportRequest;
-use crate::models::{archive, cipher::CipherData};
+use crate::models::{
+    archive,
+    cipher::{CipherData, normalize_optional_rfc3339},
+};
+use crate::notifications::{self, UpdateType};
 use crate::notify::{self, NotifyContext, NotifyEvent};
 use crate::router::AppState;
 
@@ -32,12 +37,49 @@ pub async fn import_data(
     let now = Utc::now();
     let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    let folder_query = "INSERT OR IGNORE INTO folders (id, user_id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+    for cipher in &payload.ciphers {
+        cipher
+            .validate_for_personal_vault(&claims.sub)
+            .map_err(|message| AppError::BadRequest(message.to_string()))?;
+    }
+    for relationship in &payload.folder_relationships {
+        if relationship.key >= payload.ciphers.len() || relationship.value >= payload.folders.len()
+        {
+            return Err(AppError::BadRequest(
+                "Invalid cipher-folder import relationship".to_string(),
+            ));
+        }
+    }
+
+    let existing_folder_rows: Vec<serde_json::Value> = db
+        .prepare("SELECT id FROM folders WHERE user_id = ?1")
+        .bind(&[claims.sub.clone().into()])?
+        .all()
+        .await?
+        .results()?;
+    let existing_folder_ids: HashSet<String> = existing_folder_rows
+        .into_iter()
+        .filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .collect();
+
+    let folder_query = "INSERT INTO folders (id, user_id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)";
 
     let mut folder_stmts: Vec<D1PreparedStatement> = Vec::new();
+    let mut resolved_folder_ids = Vec::with_capacity(payload.folders.len());
     for import_folder in &payload.folders {
+        let (folder_id, create_folder) = match import_folder.id.as_ref() {
+            Some(folder_id) if existing_folder_ids.contains(folder_id) => {
+                (folder_id.clone(), false)
+            }
+            _ => (Uuid::new_v4().to_string(), true),
+        };
+        resolved_folder_ids.push(folder_id.clone());
+        if !create_folder {
+            continue;
+        }
+
         let folder = Folder {
-            id: import_folder.id.clone(),
+            id: folder_id,
             user_id: claims.sub.clone(),
             name: import_folder.name.clone(),
             created_at: now.clone(),
@@ -51,19 +93,27 @@ pub async fn import_data(
             folder.created_at.into(),
             folder.updated_at.into(),
         ])?);
-
-        if folder_stmts.len() >= IMPORT_BATCH_SIZE {
-            run_batch(&db, &mut folder_stmts).await?;
-        }
     }
-    run_batch(&db, &mut folder_stmts).await?;
 
-    for relationship in payload.folder_relationships {
-        if let Some(cipher) = payload.ciphers.get_mut(relationship.key)
-            && let Some(folder) = payload.folders.get(relationship.value)
-        {
-            cipher.folder_id = Some(folder.id.clone());
-        }
+    for relationship in &payload.folder_relationships {
+        payload.ciphers[relationship.key].folder_id =
+            Some(resolved_folder_ids[relationship.value].clone());
+    }
+
+    let valid_folder_ids: HashSet<&str> = existing_folder_ids
+        .iter()
+        .map(String::as_str)
+        .chain(resolved_folder_ids.iter().map(String::as_str))
+        .collect();
+    if payload.ciphers.iter().any(|cipher| {
+        cipher
+            .folder_id
+            .as_deref()
+            .is_some_and(|folder_id| !valid_folder_ids.contains(folder_id))
+    }) {
+        return Err(AppError::BadRequest(
+            "Folder does not exist or belongs to another user".to_string(),
+        ));
     }
 
     let cipher_query = "INSERT OR IGNORE INTO ciphers (id, user_id, organization_id, type, data, key, favorite, folder_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
@@ -74,31 +124,8 @@ pub async fn import_data(
     let mut cipher_stmts: Vec<D1PreparedStatement> = Vec::new();
     let mut archive_stmts: Vec<D1PreparedStatement> = Vec::new();
     for import_cipher in payload.ciphers {
-        if import_cipher.encrypted_for != claims.sub {
-            return Err(AppError::BadRequest(
-                "Cipher encrypted for wrong user".to_string(),
-            ));
-        }
-        let archived_at = import_cipher.archived_date.as_ref().and_then(|d| {
-            let d = d.trim();
-            if d.is_empty() {
-                None
-            } else {
-                Some(d.to_string())
-            }
-        });
-
-        let cipher_data = CipherData {
-            name: import_cipher.name,
-            notes: import_cipher.notes,
-            login: import_cipher.login,
-            card: import_cipher.card,
-            identity: import_cipher.identity,
-            secure_note: import_cipher.secure_note,
-            fields: import_cipher.fields,
-            password_history: import_cipher.password_history,
-            reprompt: import_cipher.reprompt,
-        };
+        let archived_at = normalize_optional_rfc3339(import_cipher.archived_date.as_deref());
+        let cipher_data = CipherData::from_request(&import_cipher);
 
         let id = Uuid::new_v4().to_string();
         let user_id = claims.sub.clone();
@@ -124,16 +151,20 @@ pub async fn import_data(
                 archived_at.into(),
             ])?);
         }
-
-        if cipher_stmts.len() >= IMPORT_BATCH_SIZE {
-            run_batch(&db, &mut cipher_stmts).await?;
-        }
-        if archive_stmts.len() >= IMPORT_BATCH_SIZE {
-            run_batch(&db, &mut archive_stmts).await?;
-        }
     }
-    run_batch(&db, &mut cipher_stmts).await?;
-    run_batch(&db, &mut archive_stmts).await?;
+    run_batches(&db, &mut folder_stmts).await?;
+    run_batches(&db, &mut cipher_stmts).await?;
+    run_batches(&db, &mut archive_stmts).await?;
+
+    let revision = db::update_user_revision(&db, &claims.sub).await?;
+    notifications::publish_user_update_background(
+        &state.ctx,
+        state.env.clone(),
+        UpdateType::SyncVault,
+        claims.sub.clone(),
+        revision,
+        claims.device.clone(),
+    );
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -164,4 +195,15 @@ async fn run_batch(db: &D1Database, stmts: &mut Vec<D1PreparedStatement>) -> Res
     let stmts = std::mem::take(stmts);
     db.batch(stmts).await.map_err(|_| AppError::Database)?;
     Ok(())
+}
+
+async fn run_batches(
+    db: &D1Database,
+    stmts: &mut Vec<D1PreparedStatement>,
+) -> Result<(), AppError> {
+    while stmts.len() > IMPORT_BATCH_SIZE {
+        let mut batch = stmts.drain(..IMPORT_BATCH_SIZE).collect();
+        run_batch(db, &mut batch).await?;
+    }
+    run_batch(db, stmts).await
 }

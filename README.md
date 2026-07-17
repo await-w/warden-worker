@@ -201,15 +201,36 @@ wrangler deploy
 ### 6. 升级
 > 如果你曾经部署过旧版本并准备升级，建议在客户端 **导出密码库**  → **重新部署本项目（全新初始化数据库）** → **再导入密码库（可显著降低迁移/兼容成本）**。
 
-从旧版本升级到包含 Vaultwarden 兼容服务端密码哈希的版本时，GitHub Actions 会自动检测并添加 `password_iterations` 列。手动部署需要先执行：
+GitHub Actions 会先把旧数据库提升到原生迁移基线，再自动执行 `sql/d1-migrations/` 中尚未应用的迁移。Wrangler 使用数据库内的 `d1_migrations` 表记录执行状态，因此同一个迁移不会重复运行。
+
+手动部署时，完成下方旧版本基线迁移后，统一执行：
 
 ```bash
 wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_add_password_iterations.sql
 wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_cipher_key.sql
+wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_account_compat_columns.sql
+wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_cipher_attachments.sql
 wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_enforce_single_user.sql
+wrangler d1 migrations apply vaultsql --remote
 ```
 
+以后新增数据库结构或数据迁移时，不再修改 `.github/workflows/push-cloudflare.yaml`，也不再修改已经发布过的迁移文件。只需新增一个按顺序编号的 SQL 文件，例如：
+
+```text
+sql/d1-migrations/0002_add_example_column.sql
+```
+
+也可以用 Wrangler 创建编号文件：
+
+```bash
+wrangler d1 migrations create vaultsql add_example_column
+```
+
+在新文件中写入本次数据库变更即可。`sql/schema.sql` 是启用原生迁移时的基线结构，新数据库会先导入该基线，然后执行 `sql/d1-migrations/` 中的全部迁移；因此后续结构变化也只写入新的迁移文件，不再同步修改基线 schema。
+
 `20260716_add_cipher_key.sql` 为密码项增加独立加密密钥列，使 2026.6.1 及更新版本的 Bitwarden 客户端可以正常创建和同步密码项。该迁移不会修改已有密码项；升级 Worker 前必须先应用，否则新建或更新密码项会因缺少数据库列而失败。
+
+`20260716_add_account_compat_columns.sql` 增加用户 API Key 与待确认邮箱字段；`20260716_add_cipher_attachments.sql` 增加附件元数据表，附件二进制数据仍存储在既有的 `SEND_FILES_BUCKET` R2 Bucket。GitHub Actions 会逐项检测这些列和表，已经迁移的数据库不会重复执行。`wrangler.jsonc` 中的每日 Cron 会清理已过删除日期的 Send，避免 D1 元数据与 R2 文件长期残留。
 
 密码迁移不会立即改写现有密码哈希。旧记录会在用户下一次成功输入主密码时自动迁移为独立的 PBKDF2-HMAC-SHA256（600,000 次迭代、64 字节随机 salt）；客户端 KDF 设置保持不变。单用户迁移会阻止继续向 `users` 表插入记录，但不会删除或修改已有用户。注册接口也会在检测到首个用户后立即返回错误，不再执行耗时的密码哈希。
 

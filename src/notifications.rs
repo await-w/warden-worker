@@ -7,6 +7,7 @@ use worker::{
 };
 
 use crate::auth::Claims;
+use crate::background::BackgroundExecutor;
 
 const DO_BINDING: &str = "NOTIFICATIONS_HUB";
 const DO_INSTANCE_NAME: &str = "global";
@@ -25,6 +26,7 @@ const ANONYMOUS_HUB_PATH_WITH_PREFIX: &str = "/notifications/anonymous-hub";
 
 const INTERNAL_AUTH_REQUEST_PATH: &str = "/internal/auth-request";
 const INTERNAL_AUTH_RESPONSE_PATH: &str = "/internal/auth-response";
+const INTERNAL_VAULT_UPDATE_PATH: &str = "/internal/vault-update";
 const INTERNAL_CLOSE_ANONYMOUS_PATH: &str = "/internal/close-anonymous";
 
 const TARGET_RECEIVE_MESSAGE: &str = "ReceiveMessage";
@@ -48,6 +50,44 @@ struct AuthEventPayload {
 #[serde(rename_all = "camelCase")]
 struct CloseAnonymousPayload {
     token: String,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum VaultPayloadKind {
+    Cipher,
+    Folder,
+    Send,
+    User,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VaultEventPayload {
+    user_id: String,
+    item_id: Option<String>,
+    revision_date: String,
+    update_type: i32,
+    acting_device_id: Option<String>,
+    kind: VaultPayloadKind,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[repr(i32)]
+pub enum UpdateType {
+    SyncCipherUpdate = 0,
+    SyncCipherCreate = 1,
+    SyncLoginDelete = 2,
+    SyncFolderDelete = 3,
+    SyncCiphers = 4,
+    SyncVault = 5,
+    SyncFolderCreate = 7,
+    SyncFolderUpdate = 8,
+    SyncSettings = 10,
+    LogOut = 11,
+    SyncSendCreate = 12,
+    SyncSendUpdate = 13,
+    SyncSendDelete = 14,
 }
 
 #[durable_object(websocket)]
@@ -87,6 +127,13 @@ impl DurableObject for NotificationsHub {
                 return Response::error("Forbidden", 403);
             }
             return self.handle_internal_auth_response(&mut req).await;
+        }
+
+        if req.method() == Method::Post && path == INTERNAL_VAULT_UPDATE_PATH {
+            if !self.is_internal_request(&req).await {
+                return Response::error("Forbidden", 403);
+            }
+            return self.handle_internal_vault_update(&mut req).await;
         }
 
         if req.method() == Method::Post && path == INTERNAL_CLOSE_ANONYMOUS_PATH {
@@ -164,6 +211,22 @@ impl NotificationsHub {
         let token_data = decode::<Claims>(&access_token, &decoding_key, &Validation::default())
             .map_err(|_| Error::RustError("Invalid token".to_string()))?;
 
+        let token_stamp = token_data.claims.security_stamp.as_deref().unwrap_or("");
+        let db = self
+            .env
+            .d1("vaultsql")
+            .map_err(|e| Error::RustError(format!("Failed to get database: {e}")))?;
+        let stored_stamp: Option<String> = db
+            .prepare("SELECT security_stamp FROM users WHERE id = ?1")
+            .bind(&[token_data.claims.sub.clone().into()])
+            .map_err(|e| Error::RustError(format!("Failed to bind database query: {e}")))?
+            .first(Some("security_stamp"))
+            .await
+            .map_err(|e| Error::RustError(format!("Failed to query database: {e}")))?;
+        if token_stamp.is_empty() || stored_stamp.as_deref() != Some(token_stamp) {
+            return Response::error("Invalid security stamp", 401);
+        }
+
         let tag = user_tag(&token_data.claims.sub);
         let tags = [tag.as_str()];
         self.accept_with_tags(&tags)
@@ -217,6 +280,17 @@ impl NotificationsHub {
             encode_anonymous_auth_response(&payload.auth_request_id, &payload.user_id);
         self.broadcast_to_tag(&anon_tag(&payload.auth_request_id), &anonymous_event);
 
+        Response::empty().map(|resp| resp.with_status(204))
+    }
+
+    async fn handle_internal_vault_update(&self, req: &mut Request) -> Result<Response> {
+        let payload: VaultEventPayload = match req.json().await {
+            Ok(v) => v,
+            Err(_) => return Response::error("Bad request", 400),
+        };
+
+        let event = encode_vault_update(&payload);
+        self.broadcast_to_tag(&user_tag(&payload.user_id), &event);
         Response::empty().map(|resp| resp.with_status(204))
     }
 
@@ -294,6 +368,198 @@ pub async fn publish_auth_response(env: &Env, user_id: &str, auth_request_id: &s
         &AuthEventPayload {
             user_id: user_id.to_string(),
             auth_request_id: auth_request_id.to_string(),
+        },
+    )
+    .await
+}
+
+pub async fn publish_cipher_update(
+    env: &Env,
+    update_type: UpdateType,
+    user_id: &str,
+    cipher_id: &str,
+    revision_date: &str,
+    acting_device_id: Option<&str>,
+) -> Result<()> {
+    publish_vault_update(
+        env,
+        update_type,
+        user_id,
+        Some(cipher_id),
+        revision_date,
+        acting_device_id,
+        VaultPayloadKind::Cipher,
+    )
+    .await
+}
+
+pub async fn publish_folder_update(
+    env: &Env,
+    update_type: UpdateType,
+    user_id: &str,
+    folder_id: &str,
+    revision_date: &str,
+    acting_device_id: Option<&str>,
+) -> Result<()> {
+    publish_vault_update(
+        env,
+        update_type,
+        user_id,
+        Some(folder_id),
+        revision_date,
+        acting_device_id,
+        VaultPayloadKind::Folder,
+    )
+    .await
+}
+
+pub async fn publish_send_update(
+    env: &Env,
+    update_type: UpdateType,
+    user_id: &str,
+    send_id: &str,
+    revision_date: &str,
+) -> Result<()> {
+    publish_vault_update(
+        env,
+        update_type,
+        user_id,
+        Some(send_id),
+        revision_date,
+        None,
+        VaultPayloadKind::Send,
+    )
+    .await
+}
+
+pub async fn publish_user_update(
+    env: &Env,
+    update_type: UpdateType,
+    user_id: &str,
+    revision_date: &str,
+    acting_device_id: Option<&str>,
+) -> Result<()> {
+    publish_vault_update(
+        env,
+        update_type,
+        user_id,
+        None,
+        revision_date,
+        acting_device_id,
+        VaultPayloadKind::User,
+    )
+    .await
+}
+
+pub fn publish_cipher_update_background(
+    context: &BackgroundExecutor,
+    env: Env,
+    update_type: UpdateType,
+    user_id: String,
+    cipher_id: String,
+    revision_date: String,
+    acting_device_id: Option<String>,
+) {
+    context.wait_until(async move {
+        if let Err(err) = publish_cipher_update(
+            &env,
+            update_type,
+            &user_id,
+            &cipher_id,
+            &revision_date,
+            acting_device_id.as_deref(),
+        )
+        .await
+        {
+            log::warn!("failed to publish cipher update: {err}");
+        }
+    });
+}
+
+pub fn publish_folder_update_background(
+    context: &BackgroundExecutor,
+    env: Env,
+    update_type: UpdateType,
+    user_id: String,
+    folder_id: String,
+    revision_date: String,
+    acting_device_id: Option<String>,
+) {
+    context.wait_until(async move {
+        if let Err(err) = publish_folder_update(
+            &env,
+            update_type,
+            &user_id,
+            &folder_id,
+            &revision_date,
+            acting_device_id.as_deref(),
+        )
+        .await
+        {
+            log::warn!("failed to publish folder update: {err}");
+        }
+    });
+}
+
+pub fn publish_send_update_background(
+    context: &BackgroundExecutor,
+    env: Env,
+    update_type: UpdateType,
+    user_id: String,
+    send_id: String,
+    revision_date: String,
+) {
+    context.wait_until(async move {
+        if let Err(err) =
+            publish_send_update(&env, update_type, &user_id, &send_id, &revision_date).await
+        {
+            log::warn!("failed to publish send update: {err}");
+        }
+    });
+}
+
+pub fn publish_user_update_background(
+    context: &BackgroundExecutor,
+    env: Env,
+    update_type: UpdateType,
+    user_id: String,
+    revision_date: String,
+    acting_device_id: Option<String>,
+) {
+    context.wait_until(async move {
+        if let Err(err) = publish_user_update(
+            &env,
+            update_type,
+            &user_id,
+            &revision_date,
+            acting_device_id.as_deref(),
+        )
+        .await
+        {
+            log::warn!("failed to publish user update: {err}");
+        }
+    });
+}
+
+async fn publish_vault_update(
+    env: &Env,
+    update_type: UpdateType,
+    user_id: &str,
+    item_id: Option<&str>,
+    revision_date: &str,
+    acting_device_id: Option<&str>,
+    kind: VaultPayloadKind,
+) -> Result<()> {
+    dispatch_internal(
+        env,
+        INTERNAL_VAULT_UPDATE_PATH,
+        &VaultEventPayload {
+            user_id: user_id.to_string(),
+            item_id: item_id.map(str::to_string),
+            revision_date: revision_date.to_string(),
+            update_type: update_type as i32,
+            acting_device_id: acting_device_id.map(str::to_string),
+            kind,
         },
     )
     .await
@@ -446,6 +712,58 @@ fn encode_anonymous_auth_response(auth_request_id: &str, user_id: &str) -> Vec<u
     add_signalr_length_prefix(payload)
 }
 
+fn encode_vault_update(event: &VaultEventPayload) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(256);
+
+    write_array_len(&mut payload, 5);
+    write_i32(&mut payload, 1);
+    write_map_len(&mut payload, 0);
+    write_nil(&mut payload);
+    write_str(&mut payload, TARGET_RECEIVE_MESSAGE);
+    write_array_len(&mut payload, 1);
+
+    write_map_len(&mut payload, 3);
+    write_str(&mut payload, "ContextId");
+    write_optional_str(&mut payload, event.acting_device_id.as_deref());
+    write_str(&mut payload, "Type");
+    write_i32(&mut payload, event.update_type);
+    write_str(&mut payload, "Payload");
+
+    match event.kind {
+        VaultPayloadKind::Cipher => {
+            write_map_len(&mut payload, 5);
+            write_str(&mut payload, "Id");
+            write_optional_str(&mut payload, event.item_id.as_deref());
+            write_str(&mut payload, "UserId");
+            write_str(&mut payload, &event.user_id);
+            write_str(&mut payload, "OrganizationId");
+            write_nil(&mut payload);
+            write_str(&mut payload, "CollectionIds");
+            write_nil(&mut payload);
+            write_str(&mut payload, "RevisionDate");
+            write_timestamp(&mut payload, &event.revision_date);
+        }
+        VaultPayloadKind::Folder | VaultPayloadKind::Send => {
+            write_map_len(&mut payload, 3);
+            write_str(&mut payload, "Id");
+            write_optional_str(&mut payload, event.item_id.as_deref());
+            write_str(&mut payload, "UserId");
+            write_str(&mut payload, &event.user_id);
+            write_str(&mut payload, "RevisionDate");
+            write_timestamp(&mut payload, &event.revision_date);
+        }
+        VaultPayloadKind::User => {
+            write_map_len(&mut payload, 2);
+            write_str(&mut payload, "UserId");
+            write_str(&mut payload, &event.user_id);
+            write_str(&mut payload, "Date");
+            write_timestamp(&mut payload, &event.revision_date);
+        }
+    }
+
+    add_signalr_length_prefix(payload)
+}
+
 fn write_auth_payload_map(out: &mut Vec<u8>, auth_request_id: &str, user_id: &str) {
     write_map_len(out, 2);
     write_str(out, "Id");
@@ -476,6 +794,30 @@ fn add_signalr_length_prefix(mut body: Vec<u8>) -> Vec<u8> {
 
 fn write_nil(out: &mut Vec<u8>) {
     out.push(0xc0);
+}
+
+fn write_optional_str(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => write_str(out, value),
+        None => write_nil(out),
+    }
+}
+
+fn write_timestamp(out: &mut Vec<u8>, value: &str) {
+    let Ok(date) = chrono::DateTime::parse_from_rfc3339(value) else {
+        write_str(out, value);
+        return;
+    };
+    let seconds = date.timestamp();
+    let nanos = u64::from(date.timestamp_subsec_nanos());
+    if (0..(1_i64 << 34)).contains(&seconds) {
+        let packed = (nanos << 34) | seconds as u64;
+        out.push(0xd7); // fixext 8
+        out.push(0xff); // MessagePack timestamp extension type -1
+        out.extend_from_slice(&packed.to_be_bytes());
+    } else {
+        write_str(out, value);
+    }
 }
 
 fn write_i32(out: &mut Vec<u8>, value: i32) {

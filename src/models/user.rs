@@ -20,6 +20,14 @@ pub struct User {
     pub security_stamp: String,
     pub password_salt: Option<String>,
     pub password_iterations: Option<i32>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub email_new: Option<String>,
+    #[serde(default)]
+    pub email_new_token: Option<String>,
+    #[serde(default)]
+    pub email_new_token_sent_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

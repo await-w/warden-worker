@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::{db, error::AppError, router::AppState};
+use crate::{auth::Claims, db, error::AppError, router::AppState};
 
 const D1_MAX_BYTES: i64 = 500 * 1024 * 1024;
 
@@ -32,11 +32,18 @@ async fn sum_i64(
 
 #[worker::send]
 pub async fn d1_usage(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
-    let user_id = q.user_id.as_deref();
+    claims.verify_security_stamp(&db).await?;
+    if q.user_id.as_deref().is_some_and(|id| id != claims.sub) {
+        return Err(AppError::Unauthorized(
+            "Cannot inspect another user's storage".to_string(),
+        ));
+    }
+    let user_id = Some(claims.sub.as_str());
 
     let (ciphers_bytes, sends_text_bytes, sends_file_meta_bytes) = match user_id {
         None => {
@@ -83,7 +90,18 @@ pub async fn d1_usage(
         }
     };
 
-    let send_files_bytes = 0_i64;
+    let send_files_bytes = sum_i64(
+        &db,
+        "SELECT COALESCE(SUM(size), 0) AS bytes FROM send_files WHERE user_id = ?1",
+        &[claims.sub.clone().into()],
+    )
+    .await?;
+    let cipher_attachments_bytes = sum_i64(
+        &db,
+        "SELECT COALESCE(SUM(size), 0) AS bytes FROM cipher_attachments WHERE user_id = ?1",
+        &[claims.sub.clone().into()],
+    )
+    .await?;
 
     let (folders_bytes, devices_bytes, totp_bytes, users_bytes) = match user_id {
         None => {
@@ -146,6 +164,8 @@ pub async fn d1_usage(
         json!({"key":"ciphers","name":"密码库（ciphers.data）","bytes":ciphers_bytes}),
         json!({"key":"sends_text","name":"Send 文本（sends.data, type=0）","bytes":sends_text_bytes}),
         json!({"key":"sends_file_meta","name":"Send 文件元数据（sends.data, type=1）","bytes":sends_file_meta_bytes}),
+        json!({"key":"send_files","name":"Send 文件（R2）","bytes":send_files_bytes}),
+        json!({"key":"cipher_attachments","name":"密码库附件（R2）","bytes":cipher_attachments_bytes}),
         json!({"key":"folders","name":"文件夹（folders.name）","bytes":folders_bytes}),
         json!({"key":"two_factor","name":"二次验证（two_factor_authenticator.secret_enc）","bytes":totp_bytes}),
         json!({"key":"devices","name":"设备（devices.*）","bytes":devices_bytes}),

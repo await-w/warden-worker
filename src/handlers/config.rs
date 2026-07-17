@@ -18,7 +18,7 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
     let domain = format!("{proto}://{host}");
     Json(json!({
         "version": "2025.12.0",
-        "gitHash": "25cf6119-dirty",
+        "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
           "url": "https://github.com/dani-garcia/vaultwarden"
@@ -39,13 +39,7 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
           "vapidPublicKey": null
         },
         "featureStates": {
-            "duo-redirect": true,
-            "email-verification": true,
-            "unauth-ui-refresh": true,
-            "enable-pm-flight-recorder": true,
-            "mobile-error-reporting": true,
-            "pm-19148-innovation-archive": true,
-            "pm-26340-linux-biometrics-v2": true
+            "pm-19148-innovation-archive": true
         },
         "object": "config",
     }))
@@ -75,7 +69,7 @@ pub async fn alive(State(_state): State<Arc<AppState>>) -> Json<String> {
 
 #[worker::send]
 pub async fn version(State(_state): State<Arc<AppState>>) -> Json<&'static str> {
-    Json("2025.12.0")
+    Json(env!("CARGO_PKG_VERSION"))
 }
 
 #[worker::send]

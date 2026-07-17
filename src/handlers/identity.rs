@@ -166,9 +166,11 @@ pub struct TokenRequest {
     #[serde(rename = "deviceResponse")]
     device_response: Option<String>,
     #[serde(rename = "scope")]
-    _scope: Option<String>,
+    scope: Option<String>,
     #[serde(rename = "client_id")]
     client_id: Option<String>,
+    #[serde(rename = "client_secret")]
+    client_secret: Option<String>,
     send_id: Option<String>,
     password_hash_b64: Option<String>,
     #[serde(
@@ -334,6 +336,76 @@ async fn generate_tokens_and_response(
         "refresh_token": refresh_token,
         "scope": "api offline_access",
         "token_type": "Bearer"
+    }))
+}
+
+async fn generate_api_key_tokens_response(
+    user: User,
+    state: &Arc<AppState>,
+    device_identifier: String,
+) -> Result<Value, AppError> {
+    let now = Utc::now();
+    let expires_in = Duration::hours(2);
+    let claims = Claims {
+        sub: user.id.clone(),
+        exp: (now + expires_in).timestamp() as usize,
+        nbf: now.timestamp() as usize,
+        premium: true,
+        name: user.name.clone().unwrap_or_else(|| "User".to_string()),
+        email: user.email.clone(),
+        email_verified: user.email_verified,
+        amr: vec!["Application".into()],
+        security_stamp: Some(user.security_stamp.clone()),
+        device: Some(device_identifier),
+    };
+    let access_token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.jwt_keys.access_secret.as_ref()),
+    )?;
+    let (kdf_memory, kdf_parallelism) = normalize_kdf_for_response(
+        user.kdf_type,
+        user.kdf_iterations,
+        user.kdf_memory,
+        user.kdf_parallelism,
+    );
+
+    Ok(json!({
+        "access_token": access_token,
+        "expires_in": expires_in.num_seconds(),
+        "token_type": "Bearer",
+        "Key": user.key,
+        "PrivateKey": user.private_key,
+        "Kdf": user.kdf_type,
+        "KdfIterations": user.kdf_iterations,
+        "KdfMemory": kdf_memory,
+        "KdfParallelism": kdf_parallelism,
+        "ResetMasterPassword": false,
+        "ForcePasswordReset": false,
+        "scope": "api",
+        "AccountKeys": {
+            "publicKeyEncryptionKeyPair": {
+                "wrappedPrivateKey": user.private_key,
+                "publicKey": user.public_key,
+                "Object": "publicKeyEncryptionKeyPair"
+            },
+            "Object": "privateKeys"
+        },
+        "UserDecryptionOptions": {
+            "HasMasterPassword": true,
+            "MasterPasswordUnlock": {
+                "Kdf": {
+                    "KdfType": user.kdf_type,
+                    "Iterations": user.kdf_iterations,
+                    "Memory": kdf_memory,
+                    "Parallelism": kdf_parallelism
+                },
+                "MasterKeyEncryptedUserKey": user.key,
+                "MasterKeyWrappedUserKey": user.key,
+                "Salt": user.email
+            },
+            "Object": "userDecryptionOptions"
+        }
     }))
 }
 
@@ -687,7 +759,126 @@ pub async fn token(
             sends::issue_send_access_token(&state, &headers, access_id, payload.password_hash_b64)
                 .await
         }
+        "client_credentials" => {
+            let client_id = payload
+                .client_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::BadRequest("client_id cannot be blank".to_string()))?;
+            let client_secret = payload
+                .client_secret
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::BadRequest("client_secret cannot be blank".to_string()))?;
+            if payload.scope.as_deref() != Some("api") {
+                return Err(AppError::BadRequest("Scope not supported".to_string()));
+            }
+            let user_id = client_id
+                .strip_prefix("user.")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::BadRequest("Malformed client_id".to_string()))?;
+            let device_identifier = payload
+                .device_identifier
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest("device_identifier cannot be blank".to_string())
+                })?;
+            let device_name = payload
+                .device_name
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::BadRequest("device_name cannot be blank".to_string()))?;
+            let device_type = payload
+                .device_type
+                .ok_or_else(|| AppError::BadRequest("device_type cannot be blank".to_string()))?;
+
+            enforce_login_rate_limit(&state, &headers, client_id).await?;
+            let user: User = db
+                .prepare("SELECT * FROM users WHERE id = ?1")
+                .bind(&[user_id.into()])?
+                .first::<Value>(None)
+                .await
+                .map_err(|_| AppError::Database)?
+                .ok_or_else(|| AppError::Unauthorized("Invalid client_id".to_string()))
+                .and_then(|value| serde_json::from_value(value).map_err(|_| AppError::Internal))?;
+            let stored_api_key = user.api_key.as_deref().unwrap_or_default();
+            if !constant_time_eq(stored_api_key.as_bytes(), client_secret.as_bytes()) {
+                notify::notify_background(
+                    &state.ctx,
+                    state.env.clone(),
+                    NotifyEvent::LoginFailed,
+                    NotifyContext {
+                        user_id: Some(user.id),
+                        user_email: Some(user.email),
+                        device_identifier: Some(device_identifier),
+                        device_name: Some(device_name),
+                        device_type: Some(device_type),
+                        meta: notify::extract_request_meta(&headers),
+                        ..Default::default()
+                    },
+                );
+                return Err(AppError::Unauthorized(
+                    "Incorrect client_secret".to_string(),
+                ));
+            }
+
+            let user_id = user.id.clone();
+            let user_email = user.email.clone();
+            let response =
+                generate_api_key_tokens_response(user, &state, device_identifier.clone()).await?;
+            update_device_background(
+                &state.ctx,
+                state.env.clone(),
+                user_id.clone(),
+                device_identifier.clone(),
+                Some(device_name.clone()),
+                Some(device_type),
+            );
+            notify::notify_background(
+                &state.ctx,
+                state.env.clone(),
+                NotifyEvent::Login,
+                NotifyContext {
+                    user_id: Some(user_id),
+                    user_email: Some(user_email),
+                    device_identifier: Some(device_identifier),
+                    device_name: Some(device_name),
+                    device_type: Some(device_type),
+                    meta: notify::extract_request_meta(&headers),
+                    ..Default::default()
+                },
+            );
+            Ok(Json(response).into_response())
+        }
         "password" => {
+            if payload.client_id.as_deref().is_none_or(str::is_empty) {
+                return Err(AppError::BadRequest(
+                    "client_id cannot be blank".to_string(),
+                ));
+            }
+            if payload.scope.as_deref() != Some("api offline_access") {
+                return Err(AppError::BadRequest("Scope not supported".to_string()));
+            }
+            if payload
+                .device_identifier
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                return Err(AppError::BadRequest(
+                    "device_identifier cannot be blank".to_string(),
+                ));
+            }
+            if payload.device_name.as_deref().is_none_or(str::is_empty) {
+                return Err(AppError::BadRequest(
+                    "device_name cannot be blank".to_string(),
+                ));
+            }
+            if payload.device_type.is_none() {
+                return Err(AppError::BadRequest(
+                    "device_type cannot be blank".to_string(),
+                ));
+            }
             let username = payload
                 .username
                 .ok_or_else(|| AppError::BadRequest("Missing username".to_string()))?;

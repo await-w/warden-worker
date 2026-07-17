@@ -10,8 +10,8 @@ use worker::{Context, Env};
 
 use crate::background::BackgroundExecutor;
 use crate::handlers::{
-    accounts, ciphers, compat, config, css, devices, events, folders, hibp, icons, identity,
-    import, sends, settings, sync, two_factor, usage, webauthn,
+    accounts, attachments, ciphers, compat, config, css, devices, events, folders, hibp, icons,
+    identity, import, sends, settings, sync, two_factor, usage, webauthn,
 };
 use crate::jwt_manager::JwtKeys;
 use crate::two_factor_key_manager::TwoFactorKey;
@@ -21,6 +21,21 @@ pub struct AppState {
     pub ctx: BackgroundExecutor,
     pub jwt_keys: Arc<JwtKeys>,
     pub two_factor_key: Arc<TwoFactorKey>,
+}
+
+impl AppState {
+    pub fn public_url(&self, path: &str) -> String {
+        let base = self.env.secret("DOMAIN").ok().and_then(|secret| {
+            secret
+                .as_ref()
+                .as_string()
+                .filter(|value| !value.trim().is_empty())
+        });
+        match base {
+            Some(base) => format!("{}{}", base.trim_end_matches('/'), path),
+            None => path.to_string(),
+        }
+    }
 }
 
 async fn demo_html(AxumState(_state): AxumState<Arc<AppState>>) -> Html<&'static str> {
@@ -71,6 +86,10 @@ pub fn api_router_with_keys(
         .route(
             "/identity/accounts/register/send-verification-email",
             post(accounts::send_verification_email),
+        )
+        .route(
+            "/identity/accounts/register/verification-email-clicked",
+            post(accounts::registration_verification_clicked),
         )
         .route(
             "/api/accounts/profile",
@@ -157,7 +176,12 @@ pub fn api_router_with_keys(
         )
         .route("/api/accounts/email", post(accounts::change_email))
         .route("/api/accounts/kdf", post(accounts::post_kdf))
+        .route(
+            "/api/accounts/key-management/rotate-user-account-keys",
+            post(accounts::rotate_user_account_keys),
+        )
         .route("/api/accounts/tasks", get(accounts::get_tasks))
+        .route("/api/tasks", get(accounts::get_tasks))
         .route("/api/accounts/delete", post(accounts::post_delete_account))
         .route("/api/accounts", delete(accounts::delete_account))
         .route(
@@ -169,6 +193,10 @@ pub fn api_router_with_keys(
             post(accounts::post_delete_recover_token),
         )
         .route("/api/accounts/keys", post(accounts::post_keys))
+        .route(
+            "/api/users/{user_id}/public-key",
+            get(accounts::get_public_key),
+        )
         .route("/api/accounts/api-key", post(accounts::post_api_key))
         .route(
             "/api/accounts/rotate-api-key",
@@ -191,6 +219,10 @@ pub fn api_router_with_keys(
             post(accounts::post_set_password),
         )
         .route("/api/two-factor", get(two_factor::two_factor_status))
+        .route(
+            "/api/two-factor/get-device-verification-settings",
+            get(two_factor::get_device_verification_settings),
+        )
         .route(
             "/api/two-factor/get-authenticator",
             post(two_factor::get_authenticator),
@@ -248,6 +280,10 @@ pub fn api_router_with_keys(
             post(two_factor::send_email_login),
         )
         .route("/api/sends", get(sends::get_sends).post(sends::post_send))
+        .route(
+            "/api/sends/file",
+            post(sends::post_send_file_legacy).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+        )
         .route("/api/sends/file/v2", post(sends::post_send_file_v2))
         .route("/api/sends/access", post(sends::post_access))
         .route(
@@ -288,6 +324,36 @@ pub fn api_router_with_keys(
         .route("/api/sync", get(sync::sync))
         // Ciphers CRUD
         .route("/api/ciphers/create", post(ciphers::create_cipher))
+        .route("/api/ciphers/purge", post(ciphers::purge_personal_vault))
+        .route(
+            "/api/ciphers/{cipher_id}/attachment/v2",
+            post(attachments::create_attachment_v2),
+        )
+        .route(
+            "/api/ciphers/{cipher_id}/attachment",
+            post(attachments::create_attachment_legacy)
+                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+        )
+        .route(
+            "/api/ciphers/{cipher_id}/attachment/{attachment_id}",
+            get(attachments::attachment_metadata)
+                .post(attachments::upload_attachment_v2)
+                .delete(attachments::delete_attachment)
+                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+        )
+        .route(
+            "/api/ciphers/{cipher_id}/attachment/{attachment_id}/delete",
+            post(attachments::delete_attachment_post),
+        )
+        .route(
+            "/ciphers/{cipher_id}/attachment/{attachment_id}",
+            post(attachments::upload_attachment_v2)
+                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+        )
+        .route(
+            "/attachments/{cipher_id}/{attachment_id}",
+            get(attachments::download_attachment),
+        )
         .route(
             "/api/ciphers",
             get(ciphers::get_ciphers)

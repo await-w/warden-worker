@@ -1,3 +1,4 @@
+use chrono::{DateTime, SecondsFormat};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value, json};
 
@@ -17,11 +18,58 @@ pub struct CipherData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secure_note: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_history: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reprompt: Option<i32>,
+}
+
+impl CipherData {
+    pub fn from_request(request: &CipherRequestData) -> Self {
+        Self {
+            name: request.name.clone(),
+            notes: request.notes.clone(),
+            login: request.login.clone(),
+            card: request.card.clone(),
+            identity: request.identity.clone(),
+            secure_note: request.secure_note.clone(),
+            ssh_key: request.ssh_key.clone(),
+            fields: request.fields.clone(),
+            password_history: request.password_history.clone(),
+            reprompt: request.reprompt,
+        }
+    }
+}
+
+pub fn normalize_optional_rfc3339(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+pub fn client_revision_is_stale(server_revision: &str, client_revision: Option<&str>) -> bool {
+    let Some(client_revision) = client_revision else {
+        return false;
+    };
+    let (Ok(server_revision), Ok(client_revision)) = (
+        DateTime::parse_from_rfc3339(server_revision),
+        DateTime::parse_from_rfc3339(client_revision),
+    ) else {
+        return false;
+    };
+
+    server_revision
+        .signed_duration_since(client_revision)
+        .num_seconds()
+        > 1
 }
 
 // Custom deserialization function for booleans
@@ -118,6 +166,8 @@ pub struct Cipher {
     pub view_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collection_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub attachments: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -158,6 +208,7 @@ impl From<CipherDBModel> for Cipher {
             edit: true,
             view_password: true,
             collection_ids: None,
+            attachments: None,
         }
     }
 }
@@ -174,8 +225,8 @@ impl Serialize for Cipher {
 
         let name = data_obj.get("name").cloned().unwrap_or(Value::Null);
         let notes = data_obj.get("notes").cloned().unwrap_or(Value::Null);
-        let fields = array_or_empty(data_obj.get("fields"));
-        let password_history = array_or_empty(data_obj.get("passwordHistory"));
+        let fields = normalize_fields(data_obj.get("fields"));
+        let password_history = normalize_password_history(data_obj.get("passwordHistory"));
         let reprompt = data_obj
             .get("reprompt")
             .and_then(Value::as_i64)
@@ -212,7 +263,8 @@ impl Serialize for Cipher {
                 value
             }
             5 => {
-                let value = data_obj.get("sshKey").cloned().unwrap_or(Value::Null);
+                let mut value = data_obj.get("sshKey").cloned().unwrap_or(Value::Null);
+                normalize_ssh_key(&mut value);
                 ssh_key = value.clone();
                 value
             }
@@ -240,7 +292,10 @@ impl Serialize for Cipher {
         response_map.insert("reprompt".to_string(), json!(reprompt));
         response_map.insert("organizationId".to_string(), json!(self.organization_id));
         response_map.insert("key".to_string(), json!(self.key));
-        response_map.insert("attachments".to_string(), Value::Null);
+        response_map.insert(
+            "attachments".to_string(),
+            self.attachments.clone().unwrap_or(Value::Null),
+        );
         response_map.insert(
             "organizationUseTotp".to_string(),
             json!(self.organization_use_totp),
@@ -281,17 +336,83 @@ fn default_true() -> bool {
     true
 }
 
-fn array_or_empty(value: Option<&Value>) -> Value {
-    match value {
-        Some(Value::Array(_)) => value.cloned().unwrap_or(Value::Array(Vec::new())),
-        _ => Value::Array(Vec::new()),
-    }
+fn normalize_fields(value: Option<&Value>) -> Value {
+    let Some(fields) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+
+    Value::Array(
+        fields
+            .iter()
+            .filter_map(|field| {
+                let mut field = field.as_object()?.clone();
+                match field.get("type") {
+                    Some(Value::Number(_)) => {}
+                    Some(Value::String(value)) => {
+                        let field_type = value.parse::<u8>().unwrap_or(1);
+                        field.insert("type".to_string(), json!(field_type));
+                    }
+                    _ => {
+                        field.insert("type".to_string(), json!(1));
+                    }
+                }
+                Some(Value::Object(field))
+            })
+            .collect(),
+    )
+}
+
+fn normalize_password_history(value: Option<&Value>) -> Value {
+    let Some(history) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+
+    Value::Array(
+        history
+            .iter()
+            .filter_map(|entry| {
+                let mut entry = entry.as_object()?.clone();
+                if !entry.get("password").is_some_and(Value::is_string) {
+                    return None;
+                }
+
+                let last_used_date = entry
+                    .get("lastUsedDate")
+                    .and_then(Value::as_str)
+                    .and_then(|value| normalize_optional_rfc3339(Some(value)))
+                    .unwrap_or_else(|| "1970-01-01T00:00:00.000000Z".to_string());
+                entry.insert("lastUsedDate".to_string(), json!(last_used_date));
+                Some(Value::Object(entry))
+            })
+            .collect(),
+    )
 }
 
 fn normalize_login(login: &mut Value) {
     let Value::Object(map) = login else {
         return;
     };
+
+    if let Some(uris) = map.get_mut("uris").and_then(Value::as_array_mut) {
+        for uri in uris {
+            let Some(uri) = uri.as_object_mut() else {
+                continue;
+            };
+            if let Some(Value::String(match_value)) = uri.get("match") {
+                let match_value = match_value.parse::<u8>().map_or(Value::Null, |v| json!(v));
+                uri.insert("match".to_string(), match_value);
+            }
+        }
+    }
+
+    if let Some(Value::String(password_revision_date)) = map.get("passwordRevisionDate") {
+        let password_revision_date = normalize_optional_rfc3339(Some(password_revision_date))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000000Z".to_string());
+        map.insert(
+            "passwordRevisionDate".to_string(),
+            json!(password_revision_date),
+        );
+    }
 
     let first_uri = map
         .get("uris")
@@ -301,6 +422,23 @@ fn normalize_login(login: &mut Value) {
         .cloned();
 
     map.insert("uri".to_string(), first_uri.unwrap_or(Value::Null));
+}
+
+fn normalize_ssh_key(ssh_key: &mut Value) {
+    let is_valid = ssh_key.as_object().is_some_and(|ssh_key| {
+        ["keyFingerprint", "privateKey", "publicKey"]
+            .iter()
+            .all(|field| {
+                ssh_key
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+    });
+
+    if !is_valid {
+        *ssh_key = Value::Null;
+    }
 }
 
 fn normalize_secure_note(secure_note: &mut Value) {
@@ -316,7 +454,10 @@ fn normalize_secure_note(secure_note: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cipher, CipherDBModel, CipherRequestFlat, CreateCipherRequest};
+    use super::{
+        Cipher, CipherDBModel, CipherData, CipherRequestFlat, CreateCipherRequest,
+        client_revision_is_stale, normalize_optional_rfc3339,
+    };
     use serde_json::{Value, json};
 
     #[test]
@@ -343,6 +484,7 @@ mod tests {
             edit: true,
             view_password: true,
             collection_ids: None,
+            attachments: None,
         };
 
         let value = serde_json::to_value(cipher).expect("serialize cipher");
@@ -428,6 +570,227 @@ mod tests {
     }
 
     #[test]
+    fn current_android_ssh_key_request_round_trips_all_core_data() {
+        let body = json!({
+            "type": 5,
+            "name": "2.name",
+            "key": "2.cipher-key",
+            "sshKey": {
+                "publicKey": "2.public",
+                "privateKey": "2.private",
+                "keyFingerprint": "2.fingerprint"
+            },
+            "attachments2": {},
+            "bankAccount": null,
+            "driversLicense": null,
+            "passport": null,
+            "encryptedFor": "user-1",
+            "collectionIds": []
+        });
+
+        let req: CipherRequestFlat = serde_json::from_value(body).expect("deserialize");
+        req.cipher
+            .validate_for_personal_vault("user-1")
+            .expect("valid SSH key request");
+        let stored = serde_json::to_value(CipherData::from_request(&req.cipher))
+            .expect("serialize stored cipher data");
+
+        assert_eq!(
+            stored.pointer("/sshKey/publicKey"),
+            Some(&json!("2.public"))
+        );
+        assert_eq!(
+            stored.pointer("/sshKey/privateKey"),
+            Some(&json!("2.private"))
+        );
+        assert_eq!(
+            stored.pointer("/sshKey/keyFingerprint"),
+            Some(&json!("2.fingerprint"))
+        );
+
+        let response = serde_json::to_value(Cipher {
+            id: "ssh-1".to_string(),
+            user_id: Some("user-1".to_string()),
+            organization_id: None,
+            r#type: 5,
+            data: stored,
+            key: Some("2.cipher-key".to_string()),
+            favorite: false,
+            folder_id: None,
+            deleted_at: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            object: "cipherDetails".to_string(),
+            organization_use_totp: true,
+            edit: true,
+            view_password: true,
+            collection_ids: None,
+            attachments: None,
+        })
+        .expect("serialize SSH cipher response");
+        assert_eq!(
+            response.pointer("/sshKey/publicKey"),
+            Some(&json!("2.public"))
+        );
+        assert_eq!(response.get("key"), Some(&json!("2.cipher-key")));
+    }
+
+    #[test]
+    fn cipher_validation_rejects_blank_and_unsupported_types() {
+        let missing_login: CipherRequestFlat = serde_json::from_value(json!({
+            "type": 1,
+            "name": "2.name"
+        }))
+        .expect("deserialize missing login request");
+        assert_eq!(
+            missing_login.cipher.validate_for_personal_vault("user-1"),
+            Err("Cipher type data is missing")
+        );
+
+        let future_type: CipherRequestFlat = serde_json::from_value(json!({
+            "type": 6,
+            "name": "2.name",
+            "bankAccount": { "accountNumber": "2.number" }
+        }))
+        .expect("deserialize future type request");
+        assert_eq!(
+            future_type.cipher.validate_for_personal_vault("user-1"),
+            Err("This cipher type is not supported by the configured server version")
+        );
+
+        let attachment_rotation: CipherRequestFlat = serde_json::from_value(json!({
+            "type": 1,
+            "name": "2.name",
+            "login": {},
+            "attachments2": { "attachment-1": { "key": "2.key" } }
+        }))
+        .expect("deserialize attachment rotation request");
+        assert!(
+            attachment_rotation
+                .cipher
+                .validate_for_personal_vault("user-1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_ssh_key_is_returned_as_null_for_mobile_decoder_safety() {
+        let value = serde_json::to_value(Cipher {
+            id: "ssh-invalid".to_string(),
+            user_id: Some("user-1".to_string()),
+            organization_id: None,
+            r#type: 5,
+            data: json!({
+                "name": "2.name",
+                "sshKey": { "publicKey": "2.public" }
+            }),
+            key: None,
+            favorite: false,
+            folder_id: None,
+            deleted_at: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            object: "cipherDetails".to_string(),
+            organization_use_totp: true,
+            edit: true,
+            view_password: true,
+            collection_ids: None,
+            attachments: None,
+        })
+        .expect("serialize invalid SSH cipher");
+
+        assert_eq!(value.get("sshKey"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn cipher_serialization_normalizes_strict_android_fields() {
+        let cipher = Cipher {
+            id: "test-id".to_string(),
+            user_id: Some("user-1".to_string()),
+            organization_id: None,
+            r#type: 1,
+            data: json!({
+                "name": "2.name",
+                "login": {
+                    "username": "2.user",
+                    "password": "2.password",
+                    "passwordRevisionDate": "not-a-date",
+                    "uris": [
+                        { "uri": "2.uri", "match": "1" },
+                        { "uri": "2.uri-2", "match": "invalid" }
+                    ]
+                },
+                "fields": [
+                    { "name": "2.field", "value": "2.value", "type": "0" },
+                    { "name": "2.hidden", "value": "2.secret", "type": null },
+                    "invalid"
+                ],
+                "passwordHistory": [
+                    { "password": "2.old", "lastUsedDate": "not-a-date" },
+                    { "password": null, "lastUsedDate": "2026-01-01T00:00:00Z" }
+                ]
+            }),
+            key: None,
+            favorite: false,
+            folder_id: None,
+            deleted_at: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            object: "cipherDetails".to_string(),
+            organization_use_totp: true,
+            edit: true,
+            view_password: true,
+            collection_ids: None,
+            attachments: None,
+        };
+
+        let value = serde_json::to_value(cipher).expect("serialize cipher");
+
+        assert_eq!(value.pointer("/fields/0/type"), Some(&json!(0)));
+        assert_eq!(value.pointer("/fields/1/type"), Some(&json!(1)));
+        assert_eq!(value.pointer("/fields/2"), None);
+        assert_eq!(
+            value.pointer("/passwordHistory/0/password"),
+            Some(&json!("2.old"))
+        );
+        assert_eq!(value.pointer("/passwordHistory/1"), None);
+        assert_eq!(
+            value.pointer("/passwordHistory/0/lastUsedDate"),
+            Some(&json!("1970-01-01T00:00:00.000000Z"))
+        );
+        assert_eq!(value.pointer("/login/uris/0/match"), Some(&json!(1)));
+        assert_eq!(value.pointer("/login/uris/1/match"), Some(&Value::Null));
+        assert_eq!(
+            value.pointer("/login/passwordRevisionDate"),
+            Some(&json!("1970-01-01T00:00:00.000000Z"))
+        );
+    }
+
+    #[test]
+    fn cipher_dates_are_normalized_and_stale_updates_are_detected() {
+        assert_eq!(
+            normalize_optional_rfc3339(Some("2026-01-01T08:00:00+08:00")),
+            Some("2026-01-01T08:00:00.000000+08:00".to_string())
+        );
+        assert_eq!(normalize_optional_rfc3339(Some("invalid")), None);
+        assert!(client_revision_is_stale(
+            "2026-01-01T00:00:03.000Z",
+            Some("2026-01-01T00:00:00.000Z")
+        ));
+        assert!(!client_revision_is_stale(
+            "2026-01-01T00:00:01.500Z",
+            Some("2026-01-01T00:00:00.000Z")
+        ));
+        assert!(!client_revision_is_stale(
+            "2026-01-01T00:00:03.000Z",
+            Some("invalid")
+        ));
+    }
+
+    #[test]
     fn create_cipher_request_deserializes_pascalcase_compat() {
         let body = json!({
             "Cipher": { "type": 1, "name": "n" },
@@ -474,6 +837,8 @@ mod tests {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CipherRequestData {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(rename = "type")]
     pub r#type: i32,
     #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
@@ -496,6 +861,16 @@ pub struct CipherRequestData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secure_note: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments2: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bank_account: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drivers_license: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passport: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_history: Option<Value>,
@@ -506,6 +881,57 @@ pub struct CipherRequestData {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_for: Option<String>,
+}
+
+impl CipherRequestData {
+    pub fn validate_for_personal_vault(&self, user_id: &str) -> Result<(), &'static str> {
+        if self.organization_id.is_some() {
+            return Err("Organization ciphers are not supported by this personal vault");
+        }
+        if self
+            .encrypted_for
+            .as_deref()
+            .is_some_and(|encrypted_for| encrypted_for != user_id)
+        {
+            return Err("Cipher is encrypted for a different user");
+        }
+        if self
+            .attachments2
+            .as_ref()
+            .is_some_and(|attachments| !attachments.is_object())
+        {
+            return Err("Invalid cipher attachment key rotation data");
+        }
+        if self.bank_account.is_some() || self.drivers_license.is_some() || self.passport.is_some()
+        {
+            return Err("This cipher type is not supported by the configured server version");
+        }
+
+        let type_data = match self.r#type {
+            1 => self.login.as_ref(),
+            2 => self.secure_note.as_ref(),
+            3 => self.card.as_ref(),
+            4 => self.identity.as_ref(),
+            5 => self.ssh_key.as_ref(),
+            _ => return Err("Invalid cipher type"),
+        };
+
+        let Some(type_data) = type_data.filter(|value| value.is_object()) else {
+            return Err("Cipher type data is missing");
+        };
+
+        if self.r#type == 5 {
+            let mut ssh_key = type_data.clone();
+            normalize_ssh_key(&mut ssh_key);
+            if ssh_key.is_null() {
+                return Err("SSH key is missing required encrypted fields");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // Represents the full request payload for creating a cipher.
