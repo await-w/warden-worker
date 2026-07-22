@@ -155,8 +155,8 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 当前项目状态
 
-- 分支/提交：`main`，审计基线 HEAD 为 `f9141b45ded9cd1086a562c0d1a732119f6200b5`（“依赖升级”），审计开始时业务工作树干净。
-- Vaultwarden 对照基线：`D:\gitrepo\vaultwarden` 的 `169aa5efcc8d94684ff3bc813a00e6bcc0cc537a`（2026-07-08）。
+- 分支/提交：`main`，本次任务开始时 HEAD 为 `3017b480c8d3aa849fc64cd27356de4094780593`（“修复编译报错”），工作树干净。
+- Vaultwarden 最新三次提交审阅基线：`D:\gitrepo\vaultwarden` 的 `660faee68e3406d33244b67eadc18524c47674c2`（2026-07-21）。
 - Bitwarden Android 对照基线：`C:\Users\MINI\AppData\Local\Temp\bitwarden-android-2026.6.1-bwpm` 的 `2026.6.1` 客户端实现。
 - 2026-07-22 已实施审计确认的个人密码库兼容性修复；业务代码、schema、配置、测试和文档均有改动，静态 Web Vault 未改变。
 - 当前实现覆盖账户认证、密码库同步、Ciphers、Folders、附件、Send、导入、设备、2FA、WebAuthn、实时通知和动态 Vaultwarden CSS。
@@ -164,6 +164,8 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
   - 将 worker-rs/worker-build 升级到 `0.8.5`、Wrangler 升级到 `4.111.0`，并刷新低风险直接依赖和完整锁文件。
   - GitHub Actions 的 Rust 工具链固定为已验证的 `1.97.0`，避免移动的 `stable` 引入未验证 lint 后使部署突然失败。
   - 本机全局 Wrangler CLI 已从 `4.104.0` 升级到 `4.111.0`，与 GitHub Actions 固定版本一致。
+  - 动态 Vaultwarden CSS 的 Custom Role 规则同时兼容 `<bit-dialog>` 与 `[bit-dialog]` 两种新版 Web Vault DOM 形态。
+  - Cipher `cipherDetails` 响应已移除上游废弃的顶层 `data` 兼容字段，类型数据继续由 `login`、`secureNote`、`card`、`identity`、`sshKey` 等标准字段返回。
   - 增加附件 API 与附件元数据迁移。
   - 加强新版 Bitwarden 客户端的 Cipher key、请求字段、序列化、revision 与通知兼容。
   - 历史 SQL 已收敛到 `sql/schema.sql` 基线；后续顺序迁移统一由 `sql/migrations/` 和 Wrangler `d1_migrations` 追踪。
@@ -515,6 +517,37 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `actionlint .github/workflows/push-cloudflare.yaml` 与 `git diff --check`：通过。
 - 未重新运行远程 GitHub Actions，也未部署 Worker 或修改远程 Cloudflare 资源。
 
+### 2026-07-22：审阅 Vaultwarden 最近三次提交并同步适用修复
+
+#### 用户需求
+
+确认 `D:\gitrepo\vaultwarden` 最近三次提交的修改内容，检查当前 `warden-worker` 是否存在相同问题，存在时予以修复。
+
+#### 审阅结论
+
+- `660faee6`（Fix custom role dialog selectors）：Vaultwarden 将 Custom Role 隐藏规则的根选择器从 `bit-dialog` 扩展为 `:is(bit-dialog, [bit-dialog])`，兼容新版 Web Vault 的属性式 dialog DOM。当前仓库存在相同旧选择器，问题适用。
+- `683a23e4`（Fix compilation with newer `rust-musl` version）：Vaultwarden 的 Alpine Docker 构建将写入 `CARGO_TARGET` 的来源从 `RUST_MUSL_CROSS_TARGET` 改为新版镜像提供的 `CARGO_BUILD_TARGET`。当前仓库没有 Dockerfile、musl 构建目标或这些环境变量，使用 Cloudflare Wasm 构建链，问题不适用。
+- `4a9bcb06`（Remove old compatibility code）：Vaultwarden 删除 `cipherDetails` 响应中重复类型数据及 `name`、`notes`、`fields`、`passwordHistory` 的旧顶层 `data` 字段。当前仓库仍生成该字段，问题适用。
+
+#### 修改内容
+
+- `src/handlers/css.rs`：Custom Role 两条 CSS 规则改用 `:is(bit-dialog, [bit-dialog])`，并增加同时覆盖元素式和属性式 dialog 的回归测试。
+- `src/models/cipher.rs`：删除仅用于构建旧 `data` 字段的克隆与拼装逻辑，不再序列化该字段；标准类型字段和顶层公共字段保持不变，并将既有序列化测试更新为明确断言 `data` 不存在。
+
+#### 验证情况
+
+- `cargo +1.97.0 test --all-targets`：58 passed、0 failed。
+- `cargo +1.97.0 clippy --all-targets -- -D warnings`：通过。
+- `cargo +1.97.0 fmt --all -- --check`：通过。
+- `node --test tests/*.test.mjs`：20 passed、0 failed。
+- `worker-build --release`：通过。
+- `git diff --check`：通过，仅显示工作树 LF 将来可能转换为 CRLF 的提示。
+- 未执行远程 Cloudflare 部署或真实 Web/Desktop/Mobile 客户端端到端验证。
+
+#### 遗留事项
+
+- 无本次任务的阻塞遗留项；属性式 dialog 的实际 UI 行为仍可在下一次真实 Web Vault 客户端回归中一并确认。
+
 ## 待处理事项
 
 - [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
@@ -526,7 +559,6 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 最近一次任务摘要
 
-- 任务：修复 Rust 1.97 CI 因 `clippy::manual_filter` 导致的自动部署失败。
-- 结论：手写空字符串筛选已改为语义等价的 `Option::filter`，并将 Workflow Rust 固定为已验证的 `1.97.0`，不再跟随移动的 `stable`。
-- 验证结果：Rust 1.97 严格 Clippy、57 项 Rust 测试、fmt、20 项 Node 测试、actionlint 和 diff check 全部通过。
-- 未执行：远程 GitHub Actions 重跑、Cloudflare 部署或任何远程资源修改。
+- 任务：审阅 Vaultwarden 最近三次提交并同步当前仓库适用的修复。
+- 结论：三次提交中，Custom Role dialog 选择器与 Cipher 顶层旧 `data` 字段问题适用于本仓库并已修复；新版 `rust-musl` 的 Docker 编译变量问题不适用。
+- 验证结果：Rust 1.97 严格 Clippy、58 项 Rust 测试、fmt、20 项 Node 测试、release Wasm 构建和 diff check 全部通过。

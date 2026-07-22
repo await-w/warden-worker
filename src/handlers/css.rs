@@ -140,8 +140,8 @@ app-security > app-two-factor-setup > form {
 }
 
 /* 隐藏不支持的 Custom Role 选项 */
-bit-dialog div.tw-ml-4:has(bit-form-control input),
-bit-dialog div.tw-col-span-4:has(input[formcontrolname*="access"], input[formcontrolname*="manage"]) {
+:is(bit-dialog, [bit-dialog]) div.tw-ml-4:has(bit-form-control input),
+:is(bit-dialog, [bit-dialog]) div.tw-col-span-4:has(input[formcontrolname*="access"], input[formcontrolname*="manage"]) {
     display: none !important;
 }
 
@@ -346,4 +346,21 @@ pub async fn vaultwarden_css(State(state): State<Arc<AppState>>) -> Response {
     );
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_BASE_CSS;
+
+    #[test]
+    fn custom_role_rules_match_element_and_attribute_dialogs() {
+        assert!(
+            DEFAULT_BASE_CSS
+                .contains(":is(bit-dialog, [bit-dialog]) div.tw-ml-4:has(bit-form-control input)")
+        );
+        assert!(DEFAULT_BASE_CSS.contains(
+            ":is(bit-dialog, [bit-dialog]) div.tw-col-span-4:has(input[formcontrolname*=\"access\"], input[formcontrolname*=\"manage\"])",
+        ));
+        assert!(!DEFAULT_BASE_CSS.contains("\nbit-dialog div.tw-ml-4"));
+    }
 }

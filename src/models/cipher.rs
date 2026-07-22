@@ -238,48 +238,29 @@ impl Serialize for Cipher {
         let mut identity = Value::Null;
         let mut ssh_key = Value::Null;
 
-        let type_data = match self.r#type {
+        match self.r#type {
             1 => {
                 let mut value = data_obj.get("login").cloned().unwrap_or(Value::Null);
                 normalize_login(&mut value);
-                login = value.clone();
-                value
+                login = value;
             }
             2 => {
                 let mut value = data_obj.get("secureNote").cloned().unwrap_or(Value::Null);
                 normalize_secure_note(&mut value);
-                secure_note = value.clone();
-                value
+                secure_note = value;
             }
             3 => {
-                let value = data_obj.get("card").cloned().unwrap_or(Value::Null);
-                card = value.clone();
-                value
+                card = data_obj.get("card").cloned().unwrap_or(Value::Null);
             }
             4 => {
-                let value = data_obj.get("identity").cloned().unwrap_or(Value::Null);
-                identity = value.clone();
-                value
+                identity = data_obj.get("identity").cloned().unwrap_or(Value::Null);
             }
             5 => {
                 let mut value = data_obj.get("sshKey").cloned().unwrap_or(Value::Null);
                 normalize_ssh_key(&mut value);
-                ssh_key = value.clone();
-                value
+                ssh_key = value;
             }
-            _ => Value::Null,
-        };
-
-        let mut response_data = match type_data {
-            Value::Object(map) => Value::Object(map),
-            _ => Value::Object(Map::new()),
-        };
-
-        if let Value::Object(ref mut map) = response_data {
-            map.insert("fields".to_string(), fields.clone());
-            map.insert("name".to_string(), name.clone());
-            map.insert("notes".to_string(), notes.clone());
-            map.insert("passwordHistory".to_string(), password_history.clone());
+            _ => {}
         }
 
         response_map.insert("object".to_string(), json!(self.object));
@@ -306,7 +287,6 @@ impl Serialize for Cipher {
         response_map.insert("name".to_string(), name);
         response_map.insert("notes".to_string(), notes);
         response_map.insert("fields".to_string(), fields);
-        response_map.insert("data".to_string(), response_data);
         response_map.insert("passwordHistory".to_string(), password_history);
         response_map.insert("login".to_string(), login);
         response_map.insert("secureNote".to_string(), secure_note);
@@ -460,7 +440,7 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn cipher_serialization_includes_permissions_delete() {
+    fn cipher_serialization_matches_current_details_shape() {
         let cipher = Cipher {
             id: "test-id".to_string(),
             user_id: Some("user-1".to_string()),
@@ -508,8 +488,10 @@ mod tests {
         assert_eq!(value.get("key"), Some(&json!("2.cipher-key")));
         assert_eq!(value.get("collectionIds"), Some(&json!([])));
         assert_eq!(value.get("fields"), Some(&json!([])));
-        assert_eq!(value.pointer("/data/name"), Some(&json!("Example")));
-        assert_eq!(value.pointer("/data/fields"), Some(&json!([])));
+        assert!(
+            value.get("data").is_none(),
+            "current cipherDetails responses must not expose the legacy data field"
+        );
         assert_eq!(value.pointer("/login/uri"), Some(&Value::Null));
         assert!(
             value.get("userId").is_none(),
