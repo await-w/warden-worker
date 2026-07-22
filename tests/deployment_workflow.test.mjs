@@ -14,6 +14,15 @@ test("deployment workflow supports private repositories and serializes upgrades"
   assert.doesNotMatch(workflow, /pull_request:/);
 });
 
+test("deployment workflow pins the validated Rust toolchain", () => {
+  assert.match(workflow, /RUST_TOOLCHAIN: 1\.97\.0/);
+  assert.match(
+    workflow,
+    /rustup toolchain install "\$\{\{ env\.RUST_TOOLCHAIN \}\}" --no-self-update/,
+  );
+  assert.doesNotMatch(workflow, /rustup toolchain install stable/);
+});
+
 test("deployment workflow requires only the API token and can discover account ID", () => {
   assert.match(workflow, /Missing required repository secret CLOUDFLARE_API_TOKEN/);
   assert.match(

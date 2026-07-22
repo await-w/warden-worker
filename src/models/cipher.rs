@@ -122,8 +122,7 @@ pub fn deserialize_optional_nonempty_string<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?
-        .and_then(|s| if s.is_empty() { None } else { Some(s) }))
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|s| !s.is_empty()))
 }
 
 // The struct that is stored in the database and used in handlers.

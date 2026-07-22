@@ -15,14 +15,14 @@
 - 主要技术栈：Rust 2024、WebAssembly、worker-rs、Axum、JavaScript、Cloudflare Workers、D1、R2、Durable Objects
 - 数据与鉴权：SQLite/D1、JWT、PBKDF2-HMAC-SHA256、Argon2id 兼容、TOTP、WebAuthn
 - 构建工具：Cargo、`worker-build`、Node.js、Wrangler
-- CI 固定版本：Wrangler `4.111.0`、`worker-build` `0.8.5`
+- CI 固定版本：Rust `1.97.0`、Wrangler `4.111.0`、`worker-build` `0.8.5`
 - Worker 兼容日期：`2026-02-28`
 - 构建命令：`node ./scripts/patch-webvault-turnstile.mjs && worker-build --release`
 - 测试命令：
   - `cargo test`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo fmt --all -- --check`
-  - `node --test tests/heavy_do_routing.test.mjs`
+  - `node --test tests/*.test.mjs`
 - 手动部署命令：`wrangler deploy`
 - 最后更新时间：2026-07-22
 
@@ -43,9 +43,15 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `wrangler.jsonc`
   - Worker 入口、Cron、变量、D1/R2/限流/DO 绑定、D1 增量迁移目录、日志、构建与静态资源配置。
 - `.github/workflows/push-cloudflare.yaml`
-  - 对 `main`、`uat`、`release*` 的 CI/CD；执行预检、基础设施创建或复用、新库基线初始化、D1 待处理迁移、DO 绑定协调和 Worker 部署。
+  - 对 `main`、`uat`、`release*` 的无人值守首次部署与自动升级；执行预检、Cloudflare 资源创建或复用、真实 D1 ID 写入、新库基线初始化、待处理迁移、Worker 部署和健康检查。
+- `scripts/cloudflare-provision.mjs`
+  - 自动发现 Cloudflare 账户和 Workers 子域，精确创建或复用 D1/R2，并将真实 D1 `database_id` 更新到 Wrangler 配置。
 - `scripts/patch-webvault-turnstile.mjs`
   - 构建前在 Web Vault 入口注入匿名 Send 的 Turnstile 导航保护；通过版本标记避免重复注入。
+- `tests/cloudflare_provision.test.mjs`
+  - 验证首次部署与升级时的 Cloudflare 资源发现、创建、复用和 D1 配置更新行为。
+- `tests/deployment_workflow.test.mjs`
+  - 验证 Workflow 的触发条件、权限、并发、固定工具链、数据库执行顺序与 DO 生命周期合约。
 - `tests/heavy_do_routing.test.mjs`
   - 验证高 CPU/密码相关路径被分流到固定的 `personal-vault` HeavyDo。
 - `static/web-vault/`
@@ -138,7 +144,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 - 项目定位是个人单用户密码库；`users_single_user_before_insert` 触发器是数据库层最终约束，注册处理也应在昂贵哈希前快速拒绝第二个用户。
 - 不得在仓库、日志或 `memory.md` 中记录 API Token、Webhook、Bot Token、Turnstile Secret 或用户密码。
-- `DOMAIN` 影响 WebAuthn RP ID、Origin 和外部 URL，部署时必须与真实 HTTPS 域名一致。
+- `DOMAIN` 是可选的公开域名覆盖；未设置时附件/Send 使用相对 URL，WebAuthn 从请求头推导 Origin 与 RP ID。若显式设置自定义域名，应与真实 HTTPS Origin 一致。
 - `wrangler.jsonc` 中的 D1、R2、DO、Assets 与路由意图不能为了消除配置漂移警告而随意删除。
 - Workers 本地模拟器通过不等于生产路由通过；生产故障应优先检查部署版本和远程日志。
 - 上游兼容合并必须先确认本地路由、数据模型和 Workers/DO 调用链是否适用，不能机械 cherry-pick Vaultwarden 原生实现。
@@ -156,6 +162,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - 当前实现覆盖账户认证、密码库同步、Ciphers、Folders、附件、Send、导入、设备、2FA、WebAuthn、实时通知和动态 Vaultwarden CSS。
 - 最近主要变化：
   - 将 worker-rs/worker-build 升级到 `0.8.5`、Wrangler 升级到 `4.111.0`，并刷新低风险直接依赖和完整锁文件。
+  - GitHub Actions 的 Rust 工具链固定为已验证的 `1.97.0`，避免移动的 `stable` 引入未验证 lint 后使部署突然失败。
   - 本机全局 Wrangler CLI 已从 `4.104.0` 升级到 `4.111.0`，与 GitHub Actions 固定版本一致。
   - 增加附件 API 与附件元数据迁移。
   - 加强新版 Bitwarden 客户端的 Cipher key、请求字段、序列化、revision 与通知兼容。
@@ -479,6 +486,35 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - Token 应将 Account Resources 限定为唯一目标账户，并包含 Account Settings Read、Workers Scripts Edit、D1 Edit、Workers R2 Storage Edit。旧式 Global API Key 需要邮箱，不属于单 Secret 自动流程。
 - 2026-07-22 统一基线之前创建且尚未手动对齐的旧 D1，仍须按 README 先完成一次基线重建；全新数据库和已对齐数据库之后可完全自动升级。
 
+### 2026-07-22：修复 Rust 1.97 CI 的 `manual_filter` 失败
+
+#### 用户需求
+
+修复 GitHub Actions 在 Rust 1.97 严格 Clippy 检查中报告的 `clippy::manual_filter` 错误，恢复自动部署脚本运行。
+
+#### 原因与修改内容
+
+- Workflow 原来安装移动的 `stable` 工具链；本地 Rust 1.96 未报告该 lint，而 CI 升到 Rust 1.97 后因 `-D warnings` 将其视为编译错误。
+- `src/models/cipher.rs` 将手写的 `Option::and_then` 空字符串筛选改为 `Option::filter`；缺失值、空字符串和非空字符串的反序列化语义保持不变。
+- Workflow 新增 `RUST_TOOLCHAIN: 1.97.0` 并按该版本安装/设为默认，避免后续 `stable` 漂移造成未经验证的 CI 变化。
+- `tests/deployment_workflow.test.mjs` 新增固定 Rust 工具链的静态合约测试，并禁止恢复 `rustup toolchain install stable`。
+
+#### 涉及文件
+
+- `src/models/cipher.rs`
+- `.github/workflows/push-cloudflare.yaml`
+- `tests/deployment_workflow.test.mjs`
+- `memory.md`
+
+#### 本地验证
+
+- `cargo +1.97.0 clippy --all-targets -- -D warnings`：通过，已复现并消除用户日志中的失败点。
+- `cargo +1.97.0 test --all-targets`：57 passed、0 failed。
+- `cargo +1.97.0 fmt --all -- --check`：通过。
+- `node --test tests/*.test.mjs`：20 passed、0 failed。
+- `actionlint .github/workflows/push-cloudflare.yaml` 与 `git diff --check`：通过。
+- 未重新运行远程 GitHub Actions，也未部署 Worker 或修改远程 Cloudflare 资源。
+
 ## 待处理事项
 
 - [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
@@ -490,8 +526,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 最近一次任务摘要
 
-- 任务：全面统一 GitHub Actions 的无人值守首次部署和后续自动升级，重点修复 Account ID 依赖与 D1 `database_id` 填写。
-- 结论：仅 `CLOUDFLARE_API_TOKEN` 必选；单账户 Token 自动发现 Account ID、创建或精确复用 Workers 子域/D1/R2、验证并写入真实 D1 UUID。多账户 Token 可额外设置 Account ID。
-- 关键流程：串行部署；release dry-run 先于远程数据库变更；新库 schema → 全部增量，旧库仅待处理增量；之后单次 Wrangler deploy 原生协调 DO，最后验证 `/alive`。
-- 验证结果：首次/升级 API 模拟、19 项 Node 测试、57 项 Rust 测试、fmt、严格 clippy、actionlint、YAML 解析、diff check、release 构建和 Wrangler dry-run 全部通过。
-- 未执行：真实 Cloudflare 资源创建、远程 D1 迁移、Worker 部署和远程健康检查。
+- 任务：修复 Rust 1.97 CI 因 `clippy::manual_filter` 导致的自动部署失败。
+- 结论：手写空字符串筛选已改为语义等价的 `Option::filter`，并将 Workflow Rust 固定为已验证的 `1.97.0`，不再跟随移动的 `stable`。
+- 验证结果：Rust 1.97 严格 Clippy、57 项 Rust 测试、fmt、20 项 Node 测试、actionlint 和 diff check 全部通过。
+- 未执行：远程 GitHub Actions 重跑、Cloudflare 部署或任何远程资源修改。
