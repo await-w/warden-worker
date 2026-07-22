@@ -1,12 +1,25 @@
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::router::AppState;
+use crate::{db, error::AppError, router::AppState};
 
 #[worker::send]
-pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+pub async fn config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    let user_exists: Option<i64> = db
+        .prepare("SELECT 1 AS ok FROM users LIMIT 1")
+        .first(Some("ok"))
+        .await
+        .map_err(|_| AppError::Database)?;
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -16,7 +29,7 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("https");
     let domain = format!("{proto}://{host}");
-    Json(json!({
+    Ok(Json(json!({
         "version": "2025.12.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
@@ -24,7 +37,7 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
           "url": "https://github.com/dani-garcia/vaultwarden"
         },
         "settings": {
-            "disableUserRegistration": false,
+            "disableUserRegistration": user_exists.is_some(),
         },
         "environment": {
           "vault": domain,
@@ -42,7 +55,7 @@ pub async fn config(State(_state): State<Arc<AppState>>, headers: HeaderMap) -> 
             "pm-19148-innovation-archive": true
         },
         "object": "config",
-    }))
+    })))
 }
 
 #[worker::send]
@@ -63,8 +76,25 @@ pub async fn now(State(_state): State<Arc<AppState>>) -> Json<String> {
 }
 
 #[worker::send]
-pub async fn alive(State(_state): State<Arc<AppState>>) -> Json<String> {
-    now(State(_state)).await
+pub async fn alive(State(state): State<Arc<AppState>>) -> Result<Json<String>, AppError> {
+    let db = db::get_db(&state.env)?;
+    db.prepare("SELECT 1 AS ok")
+        .first::<i64>(Some("ok"))
+        .await
+        .map_err(|_| AppError::Database)?
+        .ok_or(AppError::Database)?;
+    Ok(Json(Utc::now().to_rfc3339()))
+}
+
+#[worker::send]
+pub async fn alive_head(State(state): State<Arc<AppState>>) -> Result<StatusCode, AppError> {
+    let db = db::get_db(&state.env)?;
+    db.prepare("SELECT 1 AS ok")
+        .first::<i64>(Some("ok"))
+        .await
+        .map_err(|_| AppError::Database)?
+        .ok_or(AppError::Database)?;
+    Ok(StatusCode::OK)
 }
 
 #[worker::send]

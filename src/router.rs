@@ -14,6 +14,7 @@ use crate::handlers::{
     identity, import, sends, settings, sync, two_factor, usage, webauthn,
 };
 use crate::jwt_manager::JwtKeys;
+use crate::r2_file::REQUEST_BODY_LIMIT_BYTES;
 use crate::two_factor_key_manager::TwoFactorKey;
 
 pub struct AppState {
@@ -282,7 +283,8 @@ pub fn api_router_with_keys(
         .route("/api/sends", get(sends::get_sends).post(sends::post_send))
         .route(
             "/api/sends/file",
-            post(sends::post_send_file_legacy).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(sends::post_send_file_legacy)
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/api/sends/file/v2", post(sends::post_send_file_v2))
         .route("/api/sends/access", post(sends::post_access))
@@ -311,11 +313,13 @@ pub fn api_router_with_keys(
         .route("/api/sends/{send_id}/{file_id}", get(sends::download_send))
         .route(
             "/api/sends/{send_id}/file/{file_id}",
-            post(sends::post_send_file_v2_data).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(sends::post_send_file_v2_data)
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/sends/{send_id}/file/{file_id}",
-            post(sends::post_send_file_v2_data).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(sends::post_send_file_v2_data)
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/api/collections", get(compat::get_collections))
         .route("/api/policies", get(compat::get_policies))
@@ -332,14 +336,14 @@ pub fn api_router_with_keys(
         .route(
             "/api/ciphers/{cipher_id}/attachment",
             post(attachments::create_attachment_legacy)
-                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/ciphers/{cipher_id}/attachment/{attachment_id}",
             get(attachments::attachment_metadata)
                 .post(attachments::upload_attachment_v2)
                 .delete(attachments::delete_attachment)
-                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/ciphers/{cipher_id}/attachment/{attachment_id}/delete",
@@ -348,7 +352,7 @@ pub fn api_router_with_keys(
         .route(
             "/ciphers/{cipher_id}/attachment/{attachment_id}",
             post(attachments::upload_attachment_v2)
-                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/attachments/{cipher_id}/{attachment_id}",
@@ -420,7 +424,8 @@ pub fn api_router_with_keys(
                 .put(settings::put_domains),
         )
         .route("/api/config", get(config::config))
-        .route("/api/alive", get(config::alive))
+        .route("/alive", get(config::alive).head(config::alive_head))
+        .route("/api/alive", get(config::alive).head(config::alive_head))
         .route("/api/now", get(config::now))
         .route("/api/version", get(config::version))
         .route("/api/hibp/breach", get(hibp::hibp_breach))

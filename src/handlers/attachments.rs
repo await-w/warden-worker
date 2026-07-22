@@ -1,6 +1,5 @@
 use axum::{
     Json,
-    body::Body,
     extract::{Multipart, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
@@ -17,6 +16,7 @@ use crate::{
     error::AppError,
     models::cipher::Cipher,
     notifications::{self, UpdateType},
+    r2_file,
     router::AppState,
 };
 
@@ -208,11 +208,7 @@ pub async fn create_attachment_v2(
         super::ciphers::get_cipher_dbmodel_from_db(&db, &cipher_id, &claims.sub).await?;
 
     let file_size = payload.file_size.into_i64()?;
-    if file_size < 0 {
-        return Err(AppError::BadRequest(
-            "Attachment size can't be negative".to_string(),
-        ));
-    }
+    r2_file::validate_declared_size(file_size, "Attachment")?;
     let file_name = payload.file_name;
     let attachment_id = Uuid::new_v4().to_string();
     let now = db::now_rfc3339_millis();
@@ -227,7 +223,7 @@ pub async fn create_attachment_v2(
         cipher_id.clone().into(),
         claims.sub.clone().into(),
         file_name.into(),
-        file_size.into(),
+        (file_size as f64).into(),
         payload.key.into(),
         object_key.into(),
         now.clone().into(),
@@ -270,64 +266,63 @@ pub async fn create_attachment_legacy(
     claims.verify_security_stamp(&db).await?;
     super::ciphers::get_cipher_dbmodel_from_db(&db, &cipher_id, &claims.sub).await?;
 
-    let mut encrypted_file_name = None;
-    let mut attachment_key = None;
-    let mut uploaded_bytes = None;
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| AppError::BadRequest("Invalid multipart".to_string()))?
-    {
-        match field.name() {
-            Some("key") => {
-                attachment_key = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|_| AppError::BadRequest("Invalid attachment key".to_string()))?,
-                );
-            }
-            Some("data") => {
-                encrypted_file_name = field.file_name().map(str::to_string);
-                let mut bytes = Vec::new();
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|err| AppError::BadRequest(format!("Invalid multipart data: {err}")))?
-                {
-                    bytes.extend_from_slice(&chunk);
-                }
-                uploaded_bytes = Some(bytes);
-            }
-            _ => {}
-        }
-    }
-
-    let encrypted_file_name = encrypted_file_name
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest("No filename provided".to_string()))?;
-    let attachment_key = attachment_key
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest("No attachment key provided".to_string()))?;
-    let bytes =
-        uploaded_bytes.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?;
-    let actual_size = i64::try_from(bytes.len())
-        .map_err(|_| AppError::BadRequest("Attachment size overflow".to_string()))?;
     let attachment_id = Uuid::new_v4().to_string();
     let object_key = format!("attachments/{}/{}/{}", claims.sub, cipher_id, attachment_id);
     let bucket = state
         .env
         .bucket(BUCKET_BINDING)
         .map_err(|_| AppError::Internal)?;
-    bucket
-        .put(object_key.clone(), bytes)
-        .execute()
-        .await
-        .map_err(|_| AppError::Internal)?;
+    let parsed = async {
+        let mut encrypted_file_name = None;
+        let mut attachment_key = None;
+        let mut uploaded_size = None;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid multipart".to_string()))?
+        {
+            match field.name() {
+                Some("key") => {
+                    attachment_key =
+                        Some(field.text().await.map_err(|_| {
+                            AppError::BadRequest("Invalid attachment key".to_string())
+                        })?);
+                }
+                Some("data") => {
+                    if uploaded_size.is_some() {
+                        return Err(AppError::BadRequest(
+                            "Multiple file data fields are not supported".to_string(),
+                        ));
+                    }
+                    encrypted_file_name = field.file_name().map(str::to_string);
+                    uploaded_size =
+                        Some(r2_file::upload_field(&bucket, &object_key, &mut field).await?);
+                }
+                _ => {}
+            }
+        }
+        let encrypted_file_name = encrypted_file_name
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::BadRequest("No filename provided".to_string()))?;
+        let attachment_key = attachment_key
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::BadRequest("No attachment key provided".to_string()))?;
+        let actual_size =
+            uploaded_size.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?;
+        Ok::<_, AppError>((encrypted_file_name, attachment_key, actual_size as i64))
+    }
+    .await;
+    let (encrypted_file_name, attachment_key, actual_size) = match parsed {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = bucket.delete(object_key.clone()).await;
+            return Err(err);
+        }
+    };
 
     let now = db::now_rfc3339_millis();
-    let insert_result = db
-        .prepare(
+    let insert_result: Result<(), AppError> = async {
+        db.prepare(
             "INSERT INTO cipher_attachments (id, cipher_id, user_id, file_name, size, key, r2_object_key, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
@@ -336,17 +331,25 @@ pub async fn create_attachment_legacy(
             cipher_id.clone().into(),
             claims.sub.clone().into(),
             encrypted_file_name.into(),
-            actual_size.into(),
+            (actual_size as f64).into(),
             attachment_key.into(),
             object_key.clone().into(),
             now.clone().into(),
             now.clone().into(),
         ])?
         .run()
-        .await;
-    if insert_result.is_err() {
+        .await
+        .map_err(|err| {
+            log::error!("failed to insert attachment metadata: {err}");
+            AppError::Database
+        })?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = insert_result {
+        log::error!("attachment metadata transaction failed: {err}");
         let _ = bucket.delete(object_key).await;
-        return Err(AppError::Database);
+        return Err(err);
     }
     db.prepare("UPDATE ciphers SET updated_at = ?1 WHERE id = ?2 AND user_id = ?3")
         .bind(&[
@@ -380,8 +383,14 @@ pub async fn upload_attachment_v2(
     claims.verify_security_stamp(&db).await?;
     super::ciphers::get_cipher_dbmodel_from_db(&db, &cipher_id, &claims.sub).await?;
     let attachment = get_attachment(&db, &cipher_id, &attachment_id, &claims.sub).await?;
+    r2_file::validate_declared_size(attachment.size, "Attachment")?;
 
-    let mut uploaded_bytes = None;
+    let bucket = state
+        .env
+        .bucket(BUCKET_BINDING)
+        .map_err(|_| AppError::Internal)?;
+
+    let mut uploaded_size = None;
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -390,27 +399,19 @@ pub async fn upload_attachment_v2(
         if field.name() != Some("data") {
             continue;
         }
-        let mut bytes = Vec::with_capacity(attachment.size.max(0) as usize);
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|err| AppError::BadRequest(format!("Invalid multipart data: {err}")))?
-        {
-            bytes.extend_from_slice(&chunk);
-        }
-        uploaded_bytes = Some(bytes);
+        uploaded_size =
+            Some(r2_file::upload_field(&bucket, &attachment.r2_object_key, &mut field).await?);
         break;
     }
-    let bytes =
-        uploaded_bytes.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?;
-    let actual_size = i64::try_from(bytes.len())
-        .map_err(|_| AppError::BadRequest("Attachment size overflow".to_string()))?;
+    let actual_size =
+        uploaded_size.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))? as i64;
     let min_size = attachment
         .size
         .saturating_sub(ATTACHMENT_SIZE_LEEWAY)
         .max(0);
     let max_size = attachment.size.saturating_add(ATTACHMENT_SIZE_LEEWAY);
     if !(min_size..=max_size).contains(&actual_size) {
+        let _ = bucket.delete(attachment.r2_object_key).await;
         db.prepare("DELETE FROM cipher_attachments WHERE id = ?1 AND user_id = ?2")
             .bind(&[attachment_id.into(), claims.sub.clone().into()])?
             .run()
@@ -421,29 +422,23 @@ pub async fn upload_attachment_v2(
         )));
     }
 
-    let bucket = state
-        .env
-        .bucket(BUCKET_BINDING)
-        .map_err(|_| AppError::Internal)?;
-    bucket
-        .put(attachment.r2_object_key.clone(), bytes)
-        .execute()
-        .await
-        .map_err(|_| AppError::Internal)?;
     let now = db::now_rfc3339_millis();
-    if db
-        .prepare("UPDATE cipher_attachments SET size = ?1, updated_at = ?2 WHERE id = ?3 AND cipher_id = ?4 AND user_id = ?5")
-        .bind(&[
-            actual_size.into(),
-            now.clone().into(),
-            attachment.id.clone().into(),
-            cipher_id.clone().into(),
-            claims.sub.clone().into(),
-        ])?
-        .run()
-        .await
-        .is_err()
-    {
+    let update_result: Result<(), AppError> = async {
+        db.prepare("UPDATE cipher_attachments SET size = ?1, updated_at = ?2 WHERE id = ?3 AND cipher_id = ?4 AND user_id = ?5")
+            .bind(&[
+                (actual_size as f64).into(),
+                now.clone().into(),
+                attachment.id.clone().into(),
+                cipher_id.clone().into(),
+                claims.sub.clone().into(),
+            ])?
+            .run()
+            .await
+            .map_err(|_| AppError::Database)?;
+        Ok(())
+    }
+    .await;
+    if update_result.is_err() {
         let _ = bucket.delete(attachment.r2_object_key).await;
         return Err(AppError::Database);
     }
@@ -566,13 +561,14 @@ pub async fn download_attachment(
         .await
         .map_err(|_| AppError::Internal)?
         .ok_or_else(|| AppError::NotFound("Attachment doesn't exist".to_string()))?;
-    let bytes = object
+    let object_size = object.size();
+    let body = object
         .body()
         .ok_or(AppError::Internal)?
-        .bytes()
-        .await
+        .response_body()
         .map_err(|_| AppError::Internal)?;
-    let mut response = Response::new(Body::from(bytes));
+    let worker_response = worker::Response::from_body(body).map_err(|_| AppError::Internal)?;
+    let mut response: Response = worker_response.into();
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -582,6 +578,10 @@ pub async fn download_attachment(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{}\"", row.file_name))
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    response.headers_mut().insert(
+        r2_file::FIXED_LENGTH_HEADER,
+        HeaderValue::from_str(&object_size.to_string()).map_err(|_| AppError::Internal)?,
     );
     Ok(response)
 }

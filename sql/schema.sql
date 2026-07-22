@@ -1,4 +1,5 @@
--- Full schema for a fresh install.
+-- Consolidated database baseline as of 2026-07-22.
+-- Future schema changes belong in sql/migrations and are applied after this file.
 -- WARNING: This script DROPs existing tables and data.
 
 PRAGMA foreign_keys = ON;
@@ -7,9 +8,12 @@ DROP TABLE IF EXISTS devices;
 DROP TABLE IF EXISTS auth_requests;
 DROP TABLE IF EXISTS protected_action_otp;
 DROP TABLE IF EXISTS two_factor_email;
+DROP TABLE IF EXISTS two_factor_authenticator_new;
 DROP TABLE IF EXISTS two_factor_authenticator;
 DROP TABLE IF EXISTS webauthn_challenges;
+DROP TABLE IF EXISTS two_factor_webauthn_challenges;
 DROP TABLE IF EXISTS two_factor_webauthn_settings;
+DROP TABLE IF EXISTS two_factor_webauthn_new;
 DROP TABLE IF EXISTS two_factor_webauthn;
 DROP TABLE IF EXISTS archives;
 DROP TABLE IF EXISTS cipher_attachments;
@@ -18,7 +22,10 @@ DROP TABLE IF EXISTS ciphers;
 DROP TABLE IF EXISTS send_file_chunks;
 DROP TABLE IF EXISTS send_files;
 DROP TABLE IF EXISTS sends;
+DROP TABLE IF EXISTS two_factor_keys;
+DROP TABLE IF EXISTS jwt_keys;
 DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS d1_migrations;
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY NOT NULL,
@@ -158,6 +165,7 @@ CREATE TABLE IF NOT EXISTS two_factor_authenticator (
     user_id TEXT PRIMARY KEY NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT 0,
     secret_enc TEXT NOT NULL,
+    last_used INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

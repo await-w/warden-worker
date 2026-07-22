@@ -1,11 +1,14 @@
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use axum::{Form, Json, extract::State, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{RawForm, State},
+    response::IntoResponse,
+};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::Deserialize;
-use serde::de::{self, Deserializer};
+use semver::Version;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -120,82 +123,102 @@ fn update_device_background(
     });
 }
 
-fn deserialize_trimmed_i32_opt<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    match opt {
-        None => Ok(None),
-        Some(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                return Ok(None);
-            }
-            s.parse::<i32>().map(Some).map_err(de::Error::custom)
-        }
-    }
-}
-
-fn deserialize_truthy_i32_opt<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    let Some(s) = opt else { return Ok(None) };
-    let s = s.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    if matches!(s, "1" | "true" | "True" | "TRUE") {
-        return Ok(Some(1));
-    }
-    if matches!(s, "0" | "false" | "False" | "FALSE") {
-        return Ok(Some(0));
-    }
-    s.parse::<i32>().map(Some).map_err(de::Error::custom)
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 pub struct TokenRequest {
     grant_type: String,
     username: Option<String>,
     password: Option<String>, // This is the masterPasswordHash
     refresh_token: Option<String>,
     token: Option<String>,
-    #[serde(rename = "deviceResponse")]
     device_response: Option<String>,
-    #[serde(rename = "scope")]
     scope: Option<String>,
-    #[serde(rename = "client_id")]
     client_id: Option<String>,
-    #[serde(rename = "client_secret")]
     client_secret: Option<String>,
     send_id: Option<String>,
     password_hash_b64: Option<String>,
-    #[serde(
-        rename = "deviceIdentifier",
-        alias = "device_identifier",
-        alias = "deviceId"
-    )]
     device_identifier: Option<String>,
-    #[serde(rename = "deviceName", alias = "device_name")]
     device_name: Option<String>,
-    #[serde(rename = "deviceType", alias = "device_type")]
-    #[serde(default, deserialize_with = "deserialize_trimmed_i32_opt")]
     device_type: Option<i32>,
-    #[serde(rename = "twoFactorToken")]
     two_factor_token: Option<String>,
-    #[serde(rename = "twoFactorProvider", alias = "two_factor_provider")]
-    #[serde(default, deserialize_with = "deserialize_trimmed_i32_opt")]
     two_factor_provider: Option<i32>,
-    #[serde(rename = "twoFactorRemember")]
-    #[serde(default, deserialize_with = "deserialize_truthy_i32_opt")]
     two_factor_remember: Option<i32>,
-    #[serde(rename = "authRequest")]
     auth_request: Option<String>,
-    #[serde(rename = "code")] // Used for auth-request flow
     access_code: Option<String>,
+}
+
+fn normalize_form_key(key: &str) -> String {
+    key.bytes()
+        .filter(|byte| *byte != b'_')
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
+}
+
+fn parse_optional_i32(value: &str, field: &str) -> Result<Option<i32>, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|_| AppError::BadRequest(format!("Invalid {field}")))
+}
+
+fn parse_truthy_i32(value: &str) -> Result<Option<i32>, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.eq_ignore_ascii_case("true") || value == "1" {
+        return Ok(Some(1));
+    }
+    if value.eq_ignore_ascii_case("false") || value == "0" {
+        return Ok(Some(0));
+    }
+    parse_optional_i32(value, "twoFactorRemember")
+}
+
+fn parse_token_request(raw: &[u8]) -> Result<TokenRequest, AppError> {
+    let mut request = TokenRequest::default();
+    for (key, value) in url::form_urlencoded::parse(raw) {
+        let value = value.into_owned();
+        match normalize_form_key(&key).as_str() {
+            "granttype" => request.grant_type = value,
+            "username" => request.username = Some(value),
+            "password" => request.password = Some(value),
+            "refreshtoken" => request.refresh_token = Some(value),
+            "token" => request.token = Some(value),
+            "deviceresponse" => request.device_response = Some(value),
+            "scope" => request.scope = Some(value),
+            "clientid" => request.client_id = Some(value),
+            "clientsecret" => request.client_secret = Some(value),
+            "sendid" => request.send_id = Some(value),
+            "passwordhashb64" => request.password_hash_b64 = Some(value),
+            "deviceidentifier" | "deviceid" => request.device_identifier = Some(value),
+            "devicename" => request.device_name = Some(value),
+            "devicetype" => {
+                let value = value.trim();
+                request.device_type = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.parse::<i32>().unwrap_or(14))
+                };
+            }
+            "twofactortoken" => request.two_factor_token = Some(value),
+            "twofactorprovider" => {
+                request.two_factor_provider = parse_optional_i32(&value, "twoFactorProvider")?
+            }
+            "twofactorremember" => request.two_factor_remember = parse_truthy_i32(&value)?,
+            "authrequest" => request.auth_request = Some(value),
+            "code" | "accesscode" => request.access_code = Some(value),
+            _ => {}
+        }
+    }
+    request.grant_type = request.grant_type.trim().to_string();
+    if request.grant_type.is_empty() {
+        return Err(AppError::BadRequest("Missing grant_type".to_string()));
+    }
+    Ok(request)
 }
 
 fn js_opt_string(v: Option<String>) -> JsValue {
@@ -219,6 +242,25 @@ fn normalize_kdf_for_response(
     kdf_parallelism: Option<i32>,
 ) -> (Option<i32>, Option<i32>) {
     crypto::normalize_kdf_params(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)
+}
+
+fn effective_device_identifier(
+    request_device: Option<String>,
+    token_device: Option<String>,
+) -> Option<String> {
+    request_device
+        .filter(|value| !value.trim().is_empty())
+        .or(token_device)
+}
+
+fn standard_refresh_response(full_response: &Value) -> Value {
+    json!({
+        "access_token": full_response["access_token"],
+        "expires_in": full_response["expires_in"],
+        "refresh_token": full_response["refresh_token"],
+        "scope": full_response["scope"],
+        "token_type": full_response["token_type"]
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -508,7 +550,7 @@ fn set_cookie(
     Ok(())
 }
 
-fn client_ip_from_headers(headers: &HeaderMap) -> String {
+pub(crate) fn client_ip_from_headers(headers: &HeaderMap) -> String {
     if let Some(ip) = headers
         .get("cf-connecting-ip")
         .or_else(|| headers.get("CF-Connecting-IP"))
@@ -533,9 +575,10 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
     "0.0.0.0".to_string()
 }
 
-async fn enforce_login_rate_limit(
+pub(crate) async fn enforce_login_rate_limit_for(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    namespace: &str,
     username: &str,
 ) -> Result<(), AppError> {
     let limiter = match state.env.rate_limiter(LOGIN_RATE_LIMITER_BINDING) {
@@ -543,7 +586,7 @@ async fn enforce_login_rate_limit(
         Err(_) => return Ok(()),
     };
     let ip = client_ip_from_headers(headers);
-    let key = format!("login:{}:{}", ip, username.trim().to_lowercase());
+    let key = format!("{namespace}:{}:{}", ip, username.trim().to_lowercase());
     let outcome = limiter.limit(key).await.map_err(|_| AppError::Internal)?;
     if !outcome.success {
         return Err(AppError::TooManyRequests(
@@ -551,6 +594,14 @@ async fn enforce_login_rate_limit(
         ));
     }
     Ok(())
+}
+
+async fn enforce_login_rate_limit(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    username: &str,
+) -> Result<(), AppError> {
+    enforce_login_rate_limit_for(state, headers, "login", username).await
 }
 
 async fn get_email_2fa_display_info(
@@ -579,6 +630,35 @@ async fn get_email_2fa_display_info(
 
     let obscured = obscure_email(&email_data.email);
     Some((obscured, email_data.email))
+}
+
+fn client_needs_legacy_email_2fa_send(headers: &HeaderMap) -> bool {
+    let Some(version) = headers
+        .get("bitwarden-client-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    Version::parse(version)
+        .map(|version| version < Version::new(2025, 5, 0))
+        .unwrap_or(true)
+}
+
+async fn maybe_send_legacy_email_2fa(
+    providers: &[i32],
+    user_id: &str,
+    headers: &HeaderMap,
+    state: &Arc<AppState>,
+    db: &worker::D1Database,
+) -> Result<(), AppError> {
+    if providers == [two_factor::TWO_FACTOR_PROVIDER_EMAIL]
+        && client_needs_legacy_email_2fa_send(headers)
+    {
+        super::two_factor::issue_email_login_token(db, state, user_id).await?;
+    }
+    Ok(())
 }
 
 fn obscure_email(email: &str) -> String {
@@ -729,8 +809,9 @@ async fn invalid_two_factor_response(
 pub async fn token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Form(payload): Form<TokenRequest>,
+    RawForm(raw_form): RawForm,
 ) -> Result<Response, AppError> {
+    let payload = parse_token_request(&raw_form)?;
     let db = db::get_db(&state.env)?;
     match payload.grant_type.as_str() {
         "send_access" => {
@@ -879,9 +960,14 @@ pub async fn token(
                     "device_type cannot be blank".to_string(),
                 ));
             }
-            let username = payload
-                .username
-                .ok_or_else(|| AppError::BadRequest("Missing username".to_string()))?;
+            let username = crate::auth::normalize_email(
+                &payload
+                    .username
+                    .ok_or_else(|| AppError::BadRequest("Missing username".to_string()))?,
+            );
+            if username.is_empty() {
+                return Err(AppError::BadRequest("Missing username".to_string()));
+            }
             enforce_login_rate_limit(&state, &headers, &username).await?;
             let password_hash = if payload.auth_request.is_some() {
                 payload.password.unwrap_or_default()
@@ -893,7 +979,7 @@ pub async fn token(
 
             let user_val: Value = match db
                 .prepare("SELECT * FROM users WHERE email = ?1")
-                .bind(&[username.to_lowercase().into()])?
+                .bind(&[username.clone().into()])?
                 .first(None)
                 .await
                 .map_err(|_| AppError::Unauthorized("Invalid credentials".to_string()))?
@@ -1106,6 +1192,8 @@ pub async fn token(
 
                 if provider.is_none() && token.is_none() {
                     let Some(device_identifier) = payload.device_identifier.as_deref() else {
+                        maybe_send_legacy_email_2fa(&providers, &user.id, &headers, &state, &db)
+                            .await?;
                         let email_data =
                             get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(
@@ -1116,6 +1204,8 @@ pub async fn token(
                     let cookie_token = get_cookie(&headers, "twoFactorRemember")
                         .or_else(|| get_cookie(&headers, "TwoFactorRemember"));
                     let Some(cookie_token) = cookie_token.as_deref() else {
+                        maybe_send_legacy_email_2fa(&providers, &user.id, &headers, &state, &db)
+                            .await?;
                         let email_data =
                             get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(
@@ -1132,6 +1222,8 @@ pub async fn token(
                     )
                     .await?;
                     if !valid {
+                        maybe_send_legacy_email_2fa(&providers, &user.id, &headers, &state, &db)
+                            .await?;
                         let email_data =
                             get_email_2fa_display_info(&providers, &user.id, &state).await;
                         return Ok(two_factor_required_response(
@@ -1203,7 +1295,8 @@ pub async fn token(
                         &user.id,
                         &secret_enc,
                     )?;
-                    if !two_factor::verify_totp_code(&secret_encoded, token)? {
+                    if !two_factor::consume_totp_code(&db, &user.id, &secret_encoded, token).await?
+                    {
                         notify::notify_background(
                             &state.ctx,
                             state.env.clone(),
@@ -1607,7 +1700,12 @@ pub async fn token(
                 }
             };
 
-            let user_id = token_data.claims.sub;
+            let refresh_claims = token_data.claims;
+            let effective_device_identifier = effective_device_identifier(
+                payload.device_identifier.clone(),
+                refresh_claims.device.clone(),
+            );
+            let user_id = refresh_claims.sub;
             let user: Value = match db
                 .prepare("SELECT * FROM users WHERE id = ?1")
                 .bind(&[user_id.into()])?
@@ -1640,7 +1738,7 @@ pub async fn token(
                 }
             };
 
-            let stamp = match token_data.claims.security_stamp {
+            let stamp = match refresh_claims.security_stamp {
                 Some(s) => s,
                 None => {
                     return Ok((
@@ -1665,13 +1763,14 @@ pub async fn token(
                     .into_response());
             }
 
-            let response = generate_tokens_and_response(
+            let full_response = generate_tokens_and_response(
                 user.clone(),
                 &state,
-                payload.device_identifier.clone(),
+                effective_device_identifier.clone(),
                 None,
             )
             .await?;
+            let response = standard_refresh_response(&full_response);
             let mut resp = Json(response.clone()).into_response();
             if let Some(v) = response.get("access_token").and_then(|v| v.as_str()) {
                 set_cookie(
@@ -1690,6 +1789,17 @@ pub async fn token(
                 )?;
             }
 
+            if let Some(device_identifier) = effective_device_identifier.clone() {
+                update_device_background(
+                    &state.ctx,
+                    state.env.clone(),
+                    user.id.clone(),
+                    device_identifier,
+                    payload.device_name.clone(),
+                    payload.device_type,
+                );
+            }
+
             notify::notify_background(
                 &state.ctx,
                 state.env.clone(),
@@ -1697,7 +1807,7 @@ pub async fn token(
                 NotifyContext {
                     user_id: Some(user.id.clone()),
                     user_email: Some(user.email.clone()),
-                    device_identifier: payload.device_identifier.clone(),
+                    device_identifier: effective_device_identifier,
                     device_name: payload.device_name.clone(),
                     device_type: payload.device_type,
                     meta: notify::extract_request_meta(&headers),
@@ -1876,5 +1986,82 @@ pub async fn token(
             Ok(resp)
         }
         _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        client_needs_legacy_email_2fa_send, effective_device_identifier, parse_token_request,
+        standard_refresh_response,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    #[test]
+    fn token_form_accepts_case_insensitive_compact_aliases() {
+        let request = parse_token_request(
+            b"GrAnTtYpE=password&CLIENTID=mobile&deviceidentifier=device-1&DEVICENAME=phone&DEVICETYPE=iOS&twofactortoken=123456&twofactorprovider=1&twofactorremember=true",
+        )
+        .unwrap();
+        assert_eq!(request.grant_type, "password");
+        assert_eq!(request.client_id.as_deref(), Some("mobile"));
+        assert_eq!(request.device_identifier.as_deref(), Some("device-1"));
+        assert_eq!(request.device_name.as_deref(), Some("phone"));
+        assert_eq!(request.device_type, Some(14));
+        assert_eq!(request.two_factor_token.as_deref(), Some("123456"));
+        assert_eq!(request.two_factor_provider, Some(1));
+        assert_eq!(request.two_factor_remember, Some(1));
+    }
+
+    #[test]
+    fn token_form_accepts_underscored_refresh_aliases() {
+        let request = parse_token_request(
+            b"grant_type=refresh_token&refresh_token=refresh&client_id=web&device_identifier=device-2",
+        )
+        .unwrap();
+        assert_eq!(request.grant_type, "refresh_token");
+        assert_eq!(request.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(request.client_id.as_deref(), Some("web"));
+        assert_eq!(request.device_identifier.as_deref(), Some("device-2"));
+    }
+
+    #[test]
+    fn refresh_inherits_device_and_returns_only_standard_fields() {
+        assert_eq!(
+            effective_device_identifier(None, Some("claim-device".to_string())).as_deref(),
+            Some("claim-device")
+        );
+        let response = standard_refresh_response(&json!({
+            "access_token": "access",
+            "expires_in": 7200,
+            "refresh_token": "refresh",
+            "scope": "api offline_access",
+            "token_type": "Bearer",
+            "Key": "must-not-leak"
+        }));
+        assert_eq!(response.as_object().unwrap().len(), 5);
+        assert!(response.get("Key").is_none());
+    }
+
+    #[test]
+    fn legacy_email_2fa_send_version_boundary() {
+        let mut headers = HeaderMap::new();
+        assert!(client_needs_legacy_email_2fa_send(&headers));
+        headers.insert(
+            "bitwarden-client-version",
+            HeaderValue::from_static("2025.4.9"),
+        );
+        assert!(client_needs_legacy_email_2fa_send(&headers));
+        headers.insert(
+            "bitwarden-client-version",
+            HeaderValue::from_static("2025.5.0"),
+        );
+        assert!(!client_needs_legacy_email_2fa_send(&headers));
+        headers.insert(
+            "bitwarden-client-version",
+            HeaderValue::from_static("2026.6.1"),
+        );
+        assert!(!client_needs_legacy_email_2fa_send(&headers));
     }
 }

@@ -28,6 +28,9 @@ pub enum AppError {
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
 
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error(transparent)]
     JsonWebToken(#[from] jsonwebtoken::errors::Error),
 
@@ -45,11 +48,13 @@ struct ErrorModel<'a> {
 /// API Error response compatible with Bitwarden clients
 /// This format ensures clients properly handle authentication failures
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiErrorResponse<'a> {
     message: &'a str,
     validation_errors: std::collections::HashMap<&'static str, Vec<&'a str>>,
     error_model: ErrorModel<'a>,
     error: &'static str,
+    #[serde(rename = "error_description")]
     error_description: &'static str,
     exception_message: Option<()>,
     exception_stack_trace: Option<()>,
@@ -95,6 +100,7 @@ impl IntoResponse for AppError {
             AppError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             AppError::JsonWebToken(_) => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
             AppError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,5 +113,21 @@ impl IntoResponse for AppError {
         let error_response = ApiErrorResponse::new(&error_message);
         let body = Json(json!(error_response));
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiErrorResponse;
+
+    #[test]
+    fn api_error_uses_bitwarden_field_names() {
+        let value = serde_json::to_value(ApiErrorResponse::new("too large")).unwrap();
+        assert_eq!(value["message"], "too large");
+        assert_eq!(value["errorModel"]["object"], "error");
+        assert!(value.get("validationErrors").is_some());
+        assert!(value.get("exceptionMessage").is_some());
+        assert!(value.get("error_description").is_some());
+        assert!(value.get("error_model").is_none());
     }
 }

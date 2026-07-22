@@ -278,21 +278,8 @@ pub struct AvatarData {
     pub avatar_color: Option<String>,
 }
 
-#[worker::send]
-pub async fn profile(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, AppError> {
-    let db = db::get_db(&state.env)?;
-    claims.verify_security_stamp(&db).await?;
-    let two_factor_enabled = two_factor::is_any_enabled(&db, &claims.sub).await?;
-    let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
-        .map_err(|_| AppError::Database)?
-        .first(None)
-        .await?
-        .ok_or(AppError::NotFound("User not found".to_string()))?;
-
-    Ok(Json(json!({
+fn profile_json(user: User, two_factor_enabled: bool) -> Value {
+    json!({
         "id": user.id,
         "name": user.name.unwrap_or_default(),
         "email": user.email,
@@ -307,8 +294,31 @@ pub async fn profile(
         "privateKey": user.private_key,
         "securityStamp": user.security_stamp,
         "organizations": [],
+        "providers": [],
+        "providerOrganizations": [],
+        "forcePasswordReset": false,
+        "usesKeyConnector": false,
+        "creationDate": user.created_at,
+        "_status": 0,
         "object": "profile"
-    })))
+    })
+}
+
+#[worker::send]
+pub async fn profile(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    let two_factor_enabled = two_factor::is_any_enabled(&db, &claims.sub).await?;
+    let user: User = query!(&db, "SELECT * FROM users WHERE id = ?1", claims.sub)
+        .map_err(|_| AppError::Database)?
+        .first(None)
+        .await?
+        .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+    Ok(Json(profile_json(user, two_factor_enabled)))
 }
 
 #[worker::send]
@@ -425,23 +435,7 @@ pub async fn post_security_stamp(
         }
     });
 
-    Ok(Json(json!({
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "emailVerified": user.email_verified,
-        "avatarColor": user.avatar_color,
-        "premium": true,
-        "premiumFromOrganization": false,
-        "masterPasswordHint": user.master_password_hint,
-        "culture": "en-US",
-        "twoFactorEnabled": two_factor_enabled,
-        "key": user.key,
-        "privateKey": user.private_key,
-        "securityStamp": user.security_stamp,
-        "organizations": [],
-        "object": "profile"
-    })))
+    Ok(Json(profile_json(user, two_factor_enabled)))
 }
 
 #[worker::send]
@@ -463,15 +457,20 @@ pub async fn prelogin(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<PreloginResponse>, AppError> {
-    let email = payload["email"]
-        .as_str()
-        .ok_or_else(|| AppError::BadRequest("Missing email".to_string()))?;
+    let email = crate::auth::normalize_email(
+        payload["email"]
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest("Missing email".to_string()))?,
+    );
+    if email.is_empty() {
+        return Err(AppError::BadRequest("Missing email".to_string()));
+    }
     let db = db::get_db(&state.env)?;
 
     let stmt = db.prepare(
         "SELECT kdf_type, kdf_iterations, kdf_memory, kdf_parallelism FROM users WHERE email = ?1",
     );
-    let query = stmt.bind(&[email.into()])?;
+    let query = stmt.bind(&[email.clone().into()])?;
     let row: Option<Value> = query.first(None).await.map_err(|_| AppError::Database)?;
     let (kdf_type, kdf_iterations, kdf_memory, kdf_parallelism) = match row {
         Some(v) => {
@@ -551,7 +550,7 @@ pub async fn register(
 
     reject_registration_if_user_exists(&db).await?;
 
-    let email = payload.email.trim().to_lowercase();
+    let email = crate::auth::normalize_email(&payload.email);
     if !payload.current_format_is_valid(&email) {
         return Err(AppError::UnprocessableEntity(
             "Unexpected RegisterData format".to_string(),
@@ -1314,14 +1313,14 @@ pub async fn password_hint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(payload): Json<PasswordHintRequest>,
-) -> Result<(StatusCode, Json<Value>), AppError> {
+) -> Result<StatusCode, AppError> {
     if !notify::is_webhook_configured(&state.env) {
         return Err(AppError::BadRequest(
             "This server is not configured to provide password hints.".to_string(),
         ));
     }
 
-    let email = payload.email.trim().to_lowercase();
+    let email = crate::auth::normalize_email(&payload.email);
     if email.is_empty() {
         return Err(AppError::BadRequest("Missing email".to_string()));
     }
@@ -1335,21 +1334,20 @@ pub async fn password_hint(
         .map_err(|_| AppError::Database)?;
 
     const NO_HINT: &str = "当前未配置密码提示词";
-    let (registered, detail) = match row {
-        None => {
-            let sleep_ms = rand::thread_rng().gen_range(900..=1100);
-            Delay::from(std::time::Duration::from_millis(sleep_ms as u64)).await;
-            (false, NO_HINT.to_string())
-        }
+    let detail = match row {
+        None => NO_HINT.to_string(),
         Some(row) => {
             let hint = row
                 .get("master_password_hint")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let hint = clean_password_hint(hint);
-            (true, hint.unwrap_or_else(|| NO_HINT.to_string()))
+            hint.unwrap_or_else(|| NO_HINT.to_string())
         }
     };
+
+    let sleep_ms = rand::thread_rng().gen_range(900..=1100);
+    Delay::from(std::time::Duration::from_millis(sleep_ms as u64)).await;
 
     notify::send_password_hint_background(
         &state.ctx,
@@ -1362,12 +1360,7 @@ pub async fn password_hint(
         },
     );
 
-    let status = if registered {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    };
-    Ok((status, Json(json!({ "hint": detail }))))
+    Ok(StatusCode::OK)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1482,7 +1475,7 @@ pub async fn verify_password(
 
     verify_user_password(&db, &claims.sub, master_password_hash).await?;
 
-    Ok(Json(json!({})))
+    Ok(Json(json!({ "Object": "masterPasswordPolicy" })))
 }
 
 #[worker::send]
@@ -2160,5 +2153,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload.user_symmetric_key, "wrapped-user-key");
+    }
+
+    #[test]
+    fn profile_contains_current_bitwarden_non_null_contract_fields() {
+        let profile = profile_json(
+            User {
+                id: "user-id".to_string(),
+                name: None,
+                email: "user@example.com".to_string(),
+                email_verified: true,
+                avatar_color: None,
+                master_password_hash: "hash".to_string(),
+                master_password_hint: None,
+                key: "key".to_string(),
+                private_key: "private".to_string(),
+                public_key: "public".to_string(),
+                kdf_type: 0,
+                kdf_iterations: 600_000,
+                kdf_memory: None,
+                kdf_parallelism: None,
+                security_stamp: "stamp".to_string(),
+                password_salt: None,
+                password_iterations: None,
+                api_key: None,
+                email_new: None,
+                email_new_token: None,
+                email_new_token_sent_at: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            false,
+        );
+        assert_eq!(profile["_status"], 0);
+        assert_eq!(profile["providers"], json!([]));
+        assert_eq!(profile["providerOrganizations"], json!([]));
+        assert_eq!(profile["forcePasswordReset"], false);
+        assert_eq!(profile["usesKeyConnector"], false);
+        assert_eq!(profile["creationDate"], "2026-01-01T00:00:00Z");
     }
 }

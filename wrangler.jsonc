@@ -3,6 +3,7 @@
 	"name": "warden-worker",
 	"main": "src/entry.js",
 	"compatibility_date": "2026-02-28",
+	"workers_dev": true,
 	"triggers": {
 		"crons": ["0 3 * * *"]
 	},
@@ -71,7 +72,7 @@
 			"binding": "vaultsql",
 			"database_name": "vaultsql",
 			"database_id": "02c3cba2-dec4-4aad-98d6-a443069eb9a8",
-			"migrations_dir": "sql/d1-migrations"
+			"migrations_dir": "sql/migrations"
 		}
 	],
 	"r2_buckets": [
@@ -142,7 +143,9 @@
 		"run_worker_first": [
 			"/css/*",
 			"/api/*",
+			"/alive",
 			"/identity/*",
+			"/two-factor/*",
 			"/ciphers/*",
 			"/attachments/*",
 			"/sends/*",

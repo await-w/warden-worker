@@ -15,6 +15,8 @@ const INTERNAL_AUTH_HEADER: &str = "x-internal-notify";
 
 const RECORD_SEPARATOR: u8 = 0x1e;
 const INITIAL_RESPONSE: [u8; 3] = [0x7b, 0x7d, RECORD_SEPARATOR];
+const SIGNALR_MESSAGEPACK_PING: [u8; 3] = [0x02, 0x91, 0x06];
+const KEEPALIVE_INTERVAL_MS: i64 = 15_000;
 
 const UPDATE_TYPE_AUTH_REQUEST: i32 = 15;
 const UPDATE_TYPE_AUTH_REQUEST_RESPONSE: i32 = 16;
@@ -90,7 +92,7 @@ pub enum UpdateType {
     SyncSendDelete = 14,
 }
 
-#[durable_object(websocket)]
+#[durable_object]
 pub struct NotificationsHub {
     state: State,
     env: Env,
@@ -112,7 +114,7 @@ impl DurableObject for NotificationsHub {
         if req.method() == Method::Get
             && (path == ANONYMOUS_HUB_PATH || path == ANONYMOUS_HUB_PATH_WITH_PREFIX)
         {
-            return self.handle_anonymous_hub(&req);
+            return self.handle_anonymous_hub(&req).await;
         }
 
         if req.method() == Method::Post && path == INTERNAL_AUTH_REQUEST_PATH {
@@ -151,10 +153,12 @@ impl DurableObject for NotificationsHub {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
-        if let WebSocketIncomingMessage::String(text) = message
-            && is_signalr_messagepack_handshake(&text)
-        {
-            ws.send_with_bytes(INITIAL_RESPONSE)?;
+        match message {
+            WebSocketIncomingMessage::String(text) if is_signalr_messagepack_handshake(&text) => {
+                ws.send_with_bytes(INITIAL_RESPONSE)?;
+            }
+            WebSocketIncomingMessage::Binary(bytes) => ws.send_with_bytes(bytes)?,
+            WebSocketIncomingMessage::String(_) => {}
         }
         Ok(())
     }
@@ -166,12 +170,33 @@ impl DurableObject for NotificationsHub {
         _reason: String,
         _was_clean: bool,
     ) -> Result<()> {
+        if self.state.get_websockets().is_empty() {
+            self.state.storage().delete_alarm().await?;
+        }
         Ok(())
     }
 
     async fn websocket_error(&self, _ws: WebSocket, err: Error) -> Result<()> {
         log::warn!("notifications websocket error: {err}");
         Ok(())
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let sockets = self.state.get_websockets();
+        if sockets.is_empty() {
+            self.state.storage().delete_alarm().await?;
+        } else {
+            for socket in sockets {
+                if let Err(err) = socket.send_with_bytes(SIGNALR_MESSAGEPACK_PING) {
+                    log::warn!("notifications keepalive failed: {err}");
+                }
+            }
+            self.state
+                .storage()
+                .set_alarm(KEEPALIVE_INTERVAL_MS)
+                .await?;
+        }
+        Response::empty().map(|response| response.with_status(204))
     }
 }
 
@@ -229,22 +254,28 @@ impl NotificationsHub {
 
         let tag = user_tag(&token_data.claims.sub);
         let tags = [tag.as_str()];
-        self.accept_with_tags(&tags)
+        self.accept_with_tags(&tags).await
     }
 
-    fn handle_anonymous_hub(&self, req: &Request) -> Result<Response> {
+    async fn handle_anonymous_hub(&self, req: &Request) -> Result<Response> {
         let token = query_param(req, "token")
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Error::RustError("Missing token".to_string()))?;
 
         let tag = anon_tag(&token);
         let tags = [tag.as_str()];
-        self.accept_with_tags(&tags)
+        self.accept_with_tags(&tags).await
     }
 
-    fn accept_with_tags(&self, tags: &[&str]) -> Result<Response> {
+    async fn accept_with_tags(&self, tags: &[&str]) -> Result<Response> {
         let pair = WebSocketPair::new()?;
         self.state.accept_websocket_with_tags(&pair.server, tags);
+        if self.state.storage().get_alarm().await?.is_none() {
+            self.state
+                .storage()
+                .set_alarm(KEEPALIVE_INTERVAL_MS)
+                .await?;
+        }
         Response::from_websocket(pair.client)
     }
 

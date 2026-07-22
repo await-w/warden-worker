@@ -1,610 +1,153 @@
 name: Build and Deploy to Cloudflare
-permissions: {}
+
+permissions:
+    contents: read
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-    cancel-in-progress: true
+    group: ${{ github.repository }}-cloudflare-deploy
+    cancel-in-progress: false
 
 on:
     push:
-        branches: [main, uat, release*]
-    pull_request:
         branches: [main, uat, release*]
     workflow_dispatch:
 
 env:
     D1_DATABASE_NAME: vaultsql
+    D1_BINDING: vaultsql
     R2_BUCKET_NAME: warden-send-files
     WORKER_NAME: warden-worker
     WRANGLER_VERSION: 4.111.0
     WORKER_BUILD_VERSION: 0.8.5
 
 jobs:
-    preflight:
-        name: Preflight Checks
-        runs-on: ubuntu-latest
-        outputs:
-            r2_bucket_exists: ${{ steps.check_r2.outputs.bucket_exists }}
-        steps:
-            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-              with:
-                  persist-credentials: false
-
-            - name: Validate HeavyDo routing
-              run: node --test tests/heavy_do_routing.test.mjs
-
-            - name: Check required secrets
-              run: |
-                  missing_secrets=""
-                  
-                  if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
-                      missing_secrets="${missing_secrets}CLOUDFLARE_API_TOKEN, "
-                  fi
-                  
-                  if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
-                      missing_secrets="${missing_secrets}CLOUDFLARE_ACCOUNT_ID, "
-                  fi
-                  
-                  if [ -n "$missing_secrets" ]; then
-                      echo "::error::Missing required secrets: ${missing_secrets%,*}"
-                      echo ""
-                      echo "Please configure the following secrets in your repository settings:"
-                      echo "  - CLOUDFLARE_API_TOKEN: Cloudflare API token with appropriate permissions"
-                      echo "  - CLOUDFLARE_ACCOUNT_ID: Your Cloudflare account ID"
-                      exit 1
-                  fi
-                  
-                  echo "All required secrets are configured."
-
-            - name: Validate Cloudflare API Token Permissions
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Validating Cloudflare API Token permissions..."
-                  
-                  # Test 1: Check if we can access account info (requires Account Settings > Read)
-                  echo "Checking Account Settings > Read permission..."
-                  account_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
-                  
-                  if ! echo "$account_response" | grep -q '"success":true'; then
-                      echo "::error::Failed to access account info. Missing 'Account > Account Settings > Read' permission."
-                      echo "Response: $account_response"
-                      exit 1
-                  fi
-                  echo "✓ Account Settings > Read permission OK"
-                  
-                  # Test 2: Check if we can list D1 databases (requires Workers D1 > Edit)
-                  echo "Checking Workers D1 > Edit permission..."
-                  d1_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/d1/database" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
-                  
-                  # Check if response contains valid data
-                  if echo "$d1_response" | grep -qE '"result"|"success":true|^\s*\['; then
-                      echo "✓ Workers D1 > Edit permission OK"
-                  else
-                      echo "::error::Failed to list D1 databases. Missing 'Account > Workers D1 > Edit' permission."
-                      echo "Response (first 500 chars): ${d1_response:0:500}"
-                      exit 1
-                  fi
-                  
-                  # Test 3: Check if we can list R2 buckets (requires R2 > Edit)
-                  echo "Checking R2 > Edit permission..."
-                  r2_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/r2/buckets" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
-                  
-                  # Check if response contains valid data
-                  if echo "$r2_response" | grep -qE '"result"|"success":true|^\s*\['; then
-                      echo "✓ R2 > Edit permission OK"
-                  else
-                      echo "::error::Failed to list R2 buckets. Missing 'Account > R2 > Edit' permission."
-                      echo "Response (first 500 chars): ${r2_response:0:500}"
-                      exit 1
-                  fi
-                  
-                  # Test 4: Check if we can access Workers scripts (requires Workers Scripts > Edit)
-                  echo "Checking Workers Scripts > Edit permission..."
-                  workers_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
-                  
-                  # Check if response contains valid data (result array or success:true)
-                  if echo "$workers_response" | grep -q '"result"'; then
-                      echo "✓ Workers Scripts > Edit permission OK"
-                  else
-                      echo "::error::Failed to access Workers scripts. Missing 'Account > Workers Scripts > Edit' permission."
-                      echo "Response (first 500 chars): ${workers_response:0:500}"
-                      exit 1
-                  fi
-                  
-                  # Test 5: Check user membership access (requires User > Memberships > Read)
-                  echo "Checking User > Memberships > Read permission..."
-                  membership_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/memberships" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}")
-                  
-                  # Check if response contains valid data
-                  if echo "$membership_response" | grep -qE '"result"|"success":true'; then
-                      echo "✓ User > Memberships > Read permission OK"
-                  else
-                      echo "::error::Failed to access user memberships. Missing 'User > Memberships > Read' permission."
-                      echo "This permission is required for wrangler CLI authentication."
-                      echo "Response (first 500 chars): ${membership_response:0:500}"
-                      exit 1
-                  fi
-                  
-                  echo ""
-                  echo "✅ All required API Token permissions validated successfully!"
-                  echo ""
-                  echo "Validated permissions:"
-                  echo "  ✓ Account > Account Settings > Read"
-                  echo "  ✓ Account > Workers D1 > Edit"
-                  echo "  ✓ Account > R2 > Edit"
-                  echo "  ✓ Account > Workers Scripts > Edit"
-                  echo "  ✓ User > User Details > Read"
-                  echo "  ✓ User > Memberships > Read"
-
-            - name: Setup Wrangler
-              run: npm install -g wrangler@${{ env.WRANGLER_VERSION }}
-
-            - name: Check R2 Bucket
-              id: check_r2
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Checking if R2 bucket '${{ env.R2_BUCKET_NAME }}' exists..."
-                  
-                  bucket_list_output=$(wrangler r2 bucket list 2>&1) || true
-                  echo "R2 bucket list output:"
-                  echo "$bucket_list_output"
-                  
-                  if echo "$bucket_list_output" | grep -wE "${{ env.R2_BUCKET_NAME }}" | grep -q .; then
-                      echo "R2 bucket '${{ env.R2_BUCKET_NAME }}' already exists."
-                      echo "bucket_exists=true" >> $GITHUB_OUTPUT
-                  else
-                      echo "R2 bucket '${{ env.R2_BUCKET_NAME }}' does not exist, will create."
-                      echo "bucket_exists=false" >> $GITHUB_OUTPUT
-                  fi
-
-    setup-infrastructure:
-        name: Setup Infrastructure
-        needs: preflight
-        runs-on: ubuntu-latest
-        outputs:
-            d1_database_id: ${{ steps.setup_d1.outputs.database_id }}
-            d1_is_new: ${{ steps.setup_d1.outputs.is_new }}
-        steps:
-            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-              with:
-                  persist-credentials: false
-
-            - name: Setup Wrangler
-              run: npm install -g wrangler@${{ env.WRANGLER_VERSION }}
-
-            - name: Setup D1 Database (create if not exists)
-              id: setup_d1
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Setting up D1 database '${{ env.D1_DATABASE_NAME }}'..."
-                  
-                  # 先尝试列出数据库，查找是否已存在
-                  echo "Step 1: Listing existing D1 databases..."
-                  db_list=$(wrangler d1 list 2>&1) || true
-                  echo "Database list output:"
-                  echo "$db_list"
-                  echo ""
-                  
-                  # 从列表中检查是否存在并提取 ID
-                  if echo "$db_list" | grep -q "${{ env.D1_DATABASE_NAME }}"; then
-                      echo "D1 database '${{ env.D1_DATABASE_NAME }}' already exists."
-                      echo "is_new=false" >> $GITHUB_OUTPUT
-                      
-                      # 从列表中提取对应数据库的 ID
-                      db_id=$(echo "$db_list" | grep "${{ env.D1_DATABASE_NAME }}" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -1 || echo "")
-                      
-                      if [ -z "$db_id" ]; then
-                          echo "::error::Failed to extract database ID from list"
-                          echo "Database list: $db_list"
-                          exit 1
-                      fi
-                      
-                      echo "Found existing database ID: $db_id"
-                  else
-                      # 数据库不存在，创建新的
-                      echo "Step 2: Creating new D1 database..."
-                      db_output=$(wrangler d1 create ${{ env.D1_DATABASE_NAME }} 2>&1) || true
-                      echo "Create output:"
-                      echo "$db_output"
-                      echo ""
-                      
-                      # 从输出中提取 UUID
-                      db_id=$(echo "$db_output" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -1 || echo "")
-                      
-                      if [ -z "$db_id" ]; then
-                          echo "::error::Failed to create D1 database or extract database ID"
-                          echo "Full output: $db_output"
-                          exit 1
-                      fi
-                      
-                      echo "Created new D1 database '${{ env.D1_DATABASE_NAME }}'."
-                      echo "is_new=true" >> $GITHUB_OUTPUT
-                  fi
-                  
-                  echo ""
-                  echo "=== Database Setup Complete ==="
-                  echo "Database Name: ${{ env.D1_DATABASE_NAME }}"
-                  echo "Database ID: $db_id"
-                  echo "database_id=$db_id" >> $GITHUB_OUTPUT
-
-            - name: Initialize D1 Database Schema (only for new databases)
-              if: steps.setup_d1.outputs.is_new == 'true'
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Initializing new D1 database schema..."
-                  wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --file=./sql/schema.sql --remote
-                  echo "Database schema initialized successfully."
-
-            # 仅用于把原生 D1 migrations 启用前创建的数据库提升到当前基线。
-            # 后续数据库变更请只在 sql/d1-migrations 中新增迁移文件，不要继续扩展此步骤。
-            - name: Bring existing database to migration baseline (legacy)
-              if: steps.setup_d1.outputs.is_new != 'true'
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Checking password_iterations migration..."
-                  column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('users') WHERE name = 'password_iterations'" | jq -r '.[0].results[0].column_count // 0')
-                  if [ "$column_count" = "0" ]; then
-                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_add_password_iterations.sql
-                      echo "Password verifier migration applied."
-                  else
-                      echo "Password verifier migration already applied."
-                  fi
-
-                  echo "Checking cipher key migration..."
-                  cipher_key_column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('ciphers') WHERE name = 'key'" | jq -r '.[0].results[0].column_count // 0')
-                  if [ "$cipher_key_column_count" = "0" ]; then
-                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260716_add_cipher_key.sql
-                      echo "Cipher key migration applied."
-                  else
-                      echo "Cipher key migration already applied."
-                  fi
-
-                  echo "Checking account compatibility columns..."
-                  for column in api_key email_new email_new_token email_new_token_sent_at; do
-                      column_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS column_count FROM pragma_table_info('users') WHERE name = '$column'" | jq -r '.[0].results[0].column_count // 0')
-                      if [ "$column_count" = "0" ]; then
-                          wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --command "ALTER TABLE users ADD COLUMN $column TEXT"
-                          echo "Added users.$column."
-                      else
-                          echo "users.$column already exists."
-                      fi
-                  done
-
-                  echo "Checking cipher attachments migration..."
-                  attachments_table_count=$(wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --json --command "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type = 'table' AND name = 'cipher_attachments'" | jq -r '.[0].results[0].table_count // 0')
-                  if [ "$attachments_table_count" = "0" ]; then
-                      wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260716_add_cipher_attachments.sql
-                      echo "Cipher attachments migration applied."
-                  else
-                      echo "Cipher attachments migration already applied."
-                  fi
-
-                  echo "Ensuring single-user registration constraint..."
-                  wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./sql/migrations/20260713_enforce_single_user.sql
-                  echo "Single-user registration constraint is active."
-
-            - name: Apply pending D1 migrations
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Applying pending migrations from sql/d1-migrations..."
-                  wrangler d1 migrations apply ${{ env.D1_DATABASE_NAME }} --remote
-                  echo "All pending D1 migrations applied successfully."
-
-            - name: Create R2 Bucket (only if not exists)
-              if: needs.preflight.outputs.r2_bucket_exists != 'true'
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Creating R2 bucket '${{ env.R2_BUCKET_NAME }}'..."
-                  wrangler r2 bucket create ${{ env.R2_BUCKET_NAME }}
-                  echo "R2 bucket created successfully."
-
-            - name: Verify Infrastructure
-              env:
-                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "=== Infrastructure Verification ==="
-                  echo ""
-                  echo "D1 Database:"
-                  wrangler d1 list || echo "Warning: Failed to list D1 databases"
-                  echo ""
-                  echo "R2 Buckets:"
-                  wrangler r2 bucket list || echo "Warning: Failed to list R2 buckets"
-                  echo ""
-                  echo "=== All infrastructure components are ready ==="
-
     deploy:
-        name: Deploy to Cloudflare
-        needs: [preflight, setup-infrastructure]
+        name: Provision, Migrate and Deploy
         runs-on: ubuntu-latest
+        timeout-minutes: 60
 
         steps:
-            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            - name: Check out repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
                   persist-credentials: false
+
+            - name: Require Cloudflare API token
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+              run: |
+                  if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+                      echo "::error::Missing required repository secret CLOUDFLARE_API_TOKEN"
+                      exit 1
+                  fi
+
+            - name: Run deployment helper tests
+              run: node --test tests/*.test.mjs
+
+            - name: Install Wrangler
+              run: npm install --global "wrangler@${{ env.WRANGLER_VERSION }}"
+
+            - name: Discover account and provision Cloudflare resources
+              id: provision
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+                  WRANGLER_CONFIG: wrangler.jsonc
+              run: node scripts/cloudflare-provision.mjs
+
+            - name: Verify database_id was written to Wrangler config
+              env:
+                  EXPECTED_DATABASE_ID: ${{ steps.provision.outputs.d1_database_id }}
+              run: |
+                  node --input-type=module -e '
+                    import { readFileSync } from "node:fs";
+                    import { updateD1DatabaseId } from "./scripts/cloudflare-provision.mjs";
+                    const config = readFileSync("wrangler.jsonc", "utf8");
+                    const expected = process.env.EXPECTED_DATABASE_ID;
+                    if (updateD1DatabaseId(config, "vaultsql", expected) !== config) {
+                      throw new Error("wrangler.jsonc does not contain the resolved D1 database_id");
+                    }
+                  '
 
             - name: Install Rust toolchain
               run: |
-                  rustup toolchain install stable --profile minimal
+                  rustup set profile minimal
+                  rustup toolchain install stable --no-self-update
+                  rustup default stable
                   rustup target add wasm32-unknown-unknown
+                  rustup component add rustfmt clippy
 
-            - name: Install lld
-              run: sudo apt install -y lld clang gcc llvm
+            - name: Install native build dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --yes lld clang gcc llvm
 
-            - name: Clean Cargo cache
-              run: cargo clean
+            - name: Validate Rust project
+              run: |
+                  cargo fmt --all -- --check
+                  cargo test --all-targets
+                  cargo clippy --all-targets -- -D warnings
 
             - name: Install worker-build
-              run: cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}" --locked --force
+              run: cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}" --locked
 
-            - name: Update wrangler.jsonc with database ID
-              run: |
-                  db_id="${{ needs.setup-infrastructure.outputs.d1_database_id }}"
-                  if [ -z "$db_id" ]; then
-                      echo "::error::Database ID is empty, cannot update wrangler.jsonc"
-                      exit 1
-                  fi
-                  sed -i "s/\"database_id\": \"[^\"]*\"/\"database_id\": \"$db_id\"/g" wrangler.jsonc
-                  echo "Updated wrangler.jsonc with database ID: $db_id"
-
-            - name: Check if Worker exists and reconcile Durable Objects
-              id: check_worker
+            - name: Validate release Worker build
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-              run: |
-                  echo "Checking if Worker '${{ env.WORKER_NAME }}' exists..."
-                  
-                  workers_list=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
-                  
-                  echo "Workers list response (first 500 chars):"
-                  echo "${workers_list:0:500}"
-                  echo ""
-                  
-                  if echo "$workers_list" | grep -q "${{ env.WORKER_NAME }}"; then
-                      echo "Worker '${{ env.WORKER_NAME }}' already exists."
-                      echo "worker_exists=true" >> $GITHUB_OUTPUT
-                      
-                      # Read DO class_names from local wrangler.jsonc
-                      local_do_classes=$(node -e "
-                      const fs = require('fs');
-                      const raw = fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, '');
-                      const config = JSON.parse(raw);
-                      if (config.durable_objects && config.durable_objects.bindings) {
-                          config.durable_objects.bindings.forEach(b => console.log(b.class_name));
-                      }
-                      " | sort -u)
-                      
-                      if [ -n "$local_do_classes" ]; then
-                          echo "=== Durable Objects configured in wrangler.jsonc ==="
-                          echo "$local_do_classes"
-                          echo "do_classes=$(echo "$local_do_classes" | tr '\n' ',')" >> $GITHUB_OUTPUT
-                      else
-                          echo "No Durable Objects configured in wrangler.jsonc."
-                          echo "do_classes=" >> $GITHUB_OUTPUT
-                      fi
-                      
-                      # Fetch cloud DO bindings via Worker subdomain settings API
-                      echo ""
-                      echo "Fetching current DO bindings from cloud..."
-                      cloud_settings=$(curl -s -X GET \
-                          "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}/settings" \
-                          -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" | tr -d '\0')
-                      
-                      echo "Cloud settings response (first 1000 chars):"
-                      echo "${cloud_settings:0:1000}"
-                      echo ""
-                      
-                      # Extract DO class_names from cloud bindings
-                      cloud_do_classes=$(echo "$cloud_settings" | node -e "
-                      const chunks = [];
-                      process.stdin.on('data', d => chunks.push(d));
-                      process.stdin.on('end', () => {
-                          try {
-                              const data = JSON.parse(Buffer.concat(chunks).toString());
-                              const bindings = data?.result?.bindings || [];
-                              const doBindings = bindings.filter(b => b.type === 'durable_object_namespace');
-                              doBindings.forEach(b => {
-                                  if (b.class_name) console.log(b.class_name);
-                              });
-                          } catch(e) {
-                              console.error('Failed to parse cloud settings:', e.message);
-                          }
-                      });
-                      " | sort -u)
-                      
-                      if [ -n "$cloud_do_classes" ]; then
-                          echo "=== Durable Objects bound on cloud ==="
-                          echo "$cloud_do_classes"
-                      else
-                          echo "No Durable Objects bound on cloud."
-                      fi
-                      
-                      # Find DO classes that exist on cloud but NOT in local config (stale bindings)
-                      stale_classes=""
-                      if [ -n "$cloud_do_classes" ]; then
-                          stale_classes=$(comm -23 <(echo "$cloud_do_classes") <(echo "$local_do_classes") || true)
-                      fi
-                      
-                      if [ -n "$stale_classes" ]; then
-                          echo ""
-                          echo "=== Stale DO bindings found (exist on cloud but not in local config) ==="
-                          echo "$stale_classes"
-                          echo "stale_bindings=true" >> $GITHUB_OUTPUT
-                          
-                          # Build JSON patch to remove stale DO bindings via API
-                          node -e "
-                          const chunks = [];
-                          process.stdin.on('data', d => chunks.push(d));
-                          process.stdin.on('end', () => {
-                              const stale = Buffer.concat(chunks).toString().trim().split('\n').filter(Boolean);
-                              const fs = require('fs');
-                              const raw = fs.readFileSync('wrangler.jsonc', 'utf8').replace(/\/\/[^\n]*/g, '');
-                              const config = JSON.parse(raw);
-                              
-                              // Build the bindings array for the API patch
-                              // We need to keep all non-DO bindings and only include DO bindings from local config
-                              const doBindings = (config.durable_objects?.bindings || []).map(b => ({
-                                  type: 'durable_object_namespace',
-                                  name: b.name,
-                                  class_name: b.class_name
-                              }));
-                              
-                              // Also include other binding types from config
-                              const allBindings = [];
-                              
-                              // D1 bindings
-                              if (config.d1_databases) {
-                                  config.d1_databases.forEach(db => {
-                                      allBindings.push({
-                                          type: 'd1',
-                                          name: db.binding,
-                                          id: db.database_id
-                                      });
-                                  });
-                              }
-                              
-                              // R2 bindings
-                              if (config.r2_buckets) {
-                                  config.r2_buckets.forEach(bucket => {
-                                      allBindings.push({
-                                          type: 'r2_bucket',
-                                          name: bucket.binding,
-                                          bucket_name: bucket.bucket_name
-                                      });
-                                  });
-                              }
-                              
-                              // Rate limiter bindings
-                              if (config.ratelimits) {
-                                  config.ratelimits.forEach(rl => {
-                                      allBindings.push({
-                                          type: 'ratelimit',
-                                          name: rl.name,
-                                          namespace_id: rl.namespace_id,
-                                          simple: rl.simple
-                                      });
-                                  });
-                              }
-                              
-                              // Add DO bindings (only from local config, excluding stale ones)
-                              allBindings.push(...doBindings);
-                              
-                              const patch = { bindings: allBindings };
-                              fs.writeFileSync('do_bindings_patch.json', JSON.stringify(patch, null, 2));
-                              console.log('Generated bindings patch with ' + allBindings.length + ' bindings');
-                              console.log('DO bindings in patch: ' + doBindings.map(b => b.class_name).join(', ') || 'none');
-                              console.log('Stale classes to remove: ' + stale.join(', '));
-                          });
-                          " <<< "$stale_classes"
-                          
-                          echo ""
-                          echo "Bindings patch generated:"
-                          cat do_bindings_patch.json
-                      else
-                          echo ""
-                          echo "No stale DO bindings found. Cloud and local DO configs are in sync."
-                          echo "stale_bindings=false" >> $GITHUB_OUTPUT
-                      fi
-                  else
-                      echo "Worker '${{ env.WORKER_NAME }}' does not exist, will create new deployment."
-                      echo "worker_exists=false" >> $GITHUB_OUTPUT
-                      echo "do_classes=" >> $GITHUB_OUTPUT
-                      echo "stale_bindings=false" >> $GITHUB_OUTPUT
-                  fi
+              run: wrangler deploy --dry-run --outdir .wrangler/deploy-check
 
-            - name: Clean stale Durable Object bindings via API
-              if: steps.check_worker.outputs.worker_exists == 'true' && steps.check_worker.outputs.stale_bindings == 'true'
+            - name: Initialize a newly created D1 database
+              if: steps.provision.outputs.d1_is_new == 'true'
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
               run: |
-                  echo "Cleaning stale DO bindings from Worker '${{ env.WORKER_NAME }}' via Cloudflare API..."
-                  
-                  patch_response=$(curl -s -X PATCH \
-                      "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ env.WORKER_NAME }}/settings" \
-                      -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
-                      -H "Content-Type: application/json" \
-                      --data-binary @do_bindings_patch.json | tr -d '\0')
-                  
-                  echo "Patch response:"
-                  echo "$patch_response"
-                  echo ""
-                  
-                  if echo "$patch_response" | grep -q '"success":true'; then
-                      echo "Successfully cleaned stale DO bindings via API."
-                  else
-                      echo "::warning::Failed to clean stale DO bindings via API. Attempting to continue with full redeployment."
-                      echo "The two-phase deployment will handle cleanup as fallback."
-                  fi
+                  wrangler d1 execute "${{ env.D1_DATABASE_NAME }}" --file=./sql/schema.sql --remote
 
-            - name: Deploy to Cloudflare (existing worker)
-              if: steps.check_worker.outputs.worker_exists == 'true'
-              uses: cloudflare/wrangler-action@v3
-              id: cf
-              with:
-                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  wranglerVersion: ${{ env.WRANGLER_VERSION }}
-
-            - name: Deploy to Cloudflare (first deployment)
-              if: steps.check_worker.outputs.worker_exists != 'true'
-              uses: cloudflare/wrangler-action@v3
-              id: cf_first
-              with:
-                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  wranglerVersion: ${{ env.WRANGLER_VERSION }}
-
-            - name: Deployment Summary
+            - name: Apply pending D1 migrations
+              if: ${{ hashFiles('sql/migrations/*.sql') != '' }}
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
               run: |
-                  echo "=== Deployment Complete ==="
-                  echo "Worker deployed successfully!"
-                  echo ""
-                  echo "Infrastructure:"
-                  echo "  - D1 Database: ${{ env.D1_DATABASE_NAME }} (${{ needs.setup-infrastructure.outputs.d1_database_id }})"
-                  echo "  - R2 Bucket: ${{ env.R2_BUCKET_NAME }}"
-                  echo ""
-                  if [ "${{ needs.setup-infrastructure.outputs.d1_is_new }}" == "true" ]; then
-                      echo "Note: New database was created and initialized with schema.sql"
-                  else
-                      echo "Note: Existing database was used (schema not re-initialized)"
-                  fi
-                  echo ""
-                  if [ "${{ steps.check_worker.outputs.worker_exists }}" == "true" ]; then
-                      echo "=== Durable Objects Update Summary ==="
-                      if [ "${{ steps.check_worker.outputs.stale_bindings }}" == "true" ]; then
-                          echo "✓ Cleaned stale DO bindings via Cloudflare API before deployment"
-                      else
-                          echo "✓ No stale DO bindings found, cloud and local configs are in sync"
+                  wrangler d1 migrations apply "${{ env.D1_DATABASE_NAME }}" --remote
+
+            - name: Report empty migration directory
+              if: ${{ hashFiles('sql/migrations/*.sql') == '' }}
+              run: echo "No incremental D1 migrations found in sql/migrations."
+
+            - name: Deploy Worker
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.jsonl
+              run: wrangler deploy
+
+            - name: Verify deployed health endpoint
+              env:
+                  WORKER_URL: ${{ steps.provision.outputs.worker_url }}
+              run: |
+                  for attempt in $(seq 1 12); do
+                      if curl --fail --silent --show-error --max-time 10 "$WORKER_URL/alive" > /dev/null; then
+                          echo "Health check passed: $WORKER_URL/alive"
+                          exit 0
                       fi
-                      echo "✓ Durable Objects themselves were NOT deleted"
-                      echo "✓ Other Workers using these Durable Objects are NOT affected"
-                      echo "✓ Data in Durable Objects is preserved"
-                      if [ -n "${{ steps.check_worker.outputs.do_classes }}" ]; then
-                          echo ""
-                          echo "Durable Objects bound to this Worker: ${{ steps.check_worker.outputs.do_classes }}"
-                      fi
-                  else
-                      echo "Note: New Worker was created"
-                  fi
+                      echo "Health check attempt $attempt/12 failed; retrying in 5 seconds..."
+                      sleep 5
+                  done
+                  echo "::error::Worker health check did not pass after deployment"
+                  exit 1
+
+            - name: Write deployment summary
+              env:
+                  DEPLOYMENT_MODE: ${{ steps.provision.outputs.deployment_mode }}
+                  DATABASE_ID: ${{ steps.provision.outputs.d1_database_id }}
+                  D1_IS_NEW: ${{ steps.provision.outputs.d1_is_new }}
+                  R2_IS_NEW: ${{ steps.provision.outputs.r2_is_new }}
+                  WORKER_URL: ${{ steps.provision.outputs.worker_url }}
+              run: |
+                  {
+                      echo "## Cloudflare deployment complete"
+                      echo ""
+                      echo "- Mode: $DEPLOYMENT_MODE"
+                      echo "- Worker: $WORKER_URL"
+                      echo "- D1: ${{ env.D1_DATABASE_NAME }} ($DATABASE_ID; new=$D1_IS_NEW)"
+                      echo "- R2: ${{ env.R2_BUCKET_NAME }} (new=$R2_IS_NEW)"
+                  } >> "$GITHUB_STEP_SUMMARY"

@@ -27,6 +27,7 @@ use crate::{
     },
     notifications::{self, UpdateType},
     notify::{self, NotifyContext, NotifyEvent},
+    r2_file,
     router::AppState,
 };
 
@@ -1261,145 +1262,140 @@ pub async fn post_send_file_legacy(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-
-    let mut model = None;
-    let mut encrypted_file_name = None;
-    let mut uploaded_bytes = None;
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| AppError::BadRequest("Invalid multipart".to_string()))?
-    {
-        match field.name() {
-            Some("model") => {
-                model = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|_| AppError::BadRequest("Invalid send model".to_string()))?,
-                );
-            }
-            Some("data") => {
-                encrypted_file_name = field.file_name().map(str::to_string);
-                let mut bytes = Vec::new();
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|err| AppError::BadRequest(format!("Invalid multipart data: {err}")))?
-                {
-                    bytes.extend_from_slice(&chunk);
-                }
-                uploaded_bytes = Some(bytes);
-            }
-            _ => {}
-        }
-    }
-
-    let model = model.ok_or_else(|| AppError::BadRequest("Missing send model".to_string()))?;
-    let payload: SendData = serde_json::from_str(&model)
-        .map_err(|_| AppError::BadRequest("Invalid send model".to_string()))?;
-    reject_unsupported_email_verification(&payload)?;
-    if payload.r#type != SEND_TYPE_FILE {
-        return Err(AppError::BadRequest(
-            "Send content is not a file".to_string(),
-        ));
-    }
-    validate_deletion_date(&payload.deletion_date)?;
-    let encrypted_file_name = encrypted_file_name
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest("No filename provided".to_string()))?;
-    let bytes =
-        uploaded_bytes.ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?;
-    let file_length = i64::try_from(bytes.len())
-        .map_err(|_| AppError::BadRequest("Invalid send size".to_string()))?;
-    check_storage_quota(&db, file_length).await?;
-
-    let name = payload.name.clone();
-    let notes = payload.notes.clone();
-    let password = payload.password.clone();
-    let max_access_count = payload.max_access_count;
-    let expiration_date = payload.expiration_date.clone();
-    let deletion_date = payload.deletion_date.clone();
-    let disabled = payload.disabled;
-    let hide_email = payload.hide_email;
-    let (send_type, key, mut data_value) = extract_send_payload_data(payload)?;
     let file_id = Uuid::new_v4().to_string();
-    if let Some(obj) = data_value.as_object_mut() {
-        obj.insert("id".to_string(), Value::String(file_id.clone()));
-        obj.insert("size".to_string(), Value::Number(file_length.into()));
-        obj.insert(
-            "sizeName".to_string(),
-            Value::String(display_size(file_length)),
-        );
-    }
-
     let send_id = Uuid::new_v4().to_string();
-    let now = now_rfc3339_millis();
-    let data_str = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
     let object_key = format!("sends/{}/{}/{}", claims.sub, send_id, file_id);
-    let password_salt = password
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|_| new_salt_b64());
-    let password_hash = match (password.as_deref(), password_salt.as_deref()) {
-        (Some(password), Some(salt)) => {
-            Some(hash_password(password, salt, SEND_PASSWORD_ITERATIONS)?)
-        }
-        _ => None,
-    };
-    let password_iter = password_hash.as_ref().map(|_| SEND_PASSWORD_ITERATIONS);
-
-    let send_stmt = query!(
-        &db,
-        "INSERT INTO sends (id, user_id, organization_id, type, name, notes, data, key, password_hash, password_salt, password_iter, max_access_count, access_count, created_at, updated_at, expiration_date, deletion_date, disabled, hide_email)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17)",
-        send_id,
-        claims.sub,
-        send_type,
-        name,
-        notes,
-        data_str,
-        key,
-        password_hash,
-        password_salt,
-        password_iter,
-        max_access_count,
-        now,
-        now,
-        expiration_date,
-        deletion_date,
-        if disabled { 1 } else { 0 },
-        hide_email.map(|value| if value { 1 } else { 0 })
-    )
-    .map_err(|_| AppError::Database)?;
-    let file_stmt = query!(
-        &db,
-        "INSERT INTO send_files (id, send_id, user_id, file_name, size, mime, data_base64, r2_object_key, storage_type, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, 'r2', ?7, ?8)",
-        file_id,
-        send_id,
-        claims.sub,
-        encrypted_file_name,
-        file_length,
-        object_key,
-        now,
-        now
-    )
-    .map_err(|_| AppError::Database)?;
-
     let bucket = state
         .env
         .bucket(SEND_FILES_BUCKET_BINDING)
         .map_err(|_| AppError::Internal)?;
-    bucket
-        .put(object_key.clone(), bytes)
-        .execute()
-        .await
-        .map_err(|_| AppError::Internal)?;
-    if db.batch(vec![send_stmt, file_stmt]).await.is_err() {
-        let _ = bucket.delete(object_key).await;
-        return Err(AppError::Database);
+    let committed = async {
+        let mut model = None;
+        let mut encrypted_file_name = None;
+        let mut uploaded_size = None;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid multipart".to_string()))?
+        {
+            match field.name() {
+                Some("model") => {
+                    model = Some(field.text().await.map_err(|_| {
+                        AppError::BadRequest("Invalid send model".to_string())
+                    })?);
+                }
+                Some("data") => {
+                    if uploaded_size.is_some() {
+                        return Err(AppError::BadRequest(
+                            "Multiple file data fields are not supported".to_string(),
+                        ));
+                    }
+                    encrypted_file_name = field.file_name().map(str::to_string);
+                    uploaded_size = Some(r2_file::upload_field(&bucket, &object_key, &mut field).await?);
+                }
+                _ => {}
+            }
+        }
+
+        let model = model.ok_or_else(|| AppError::BadRequest("Missing send model".to_string()))?;
+        let payload: SendData = serde_json::from_str(&model)
+            .map_err(|_| AppError::BadRequest("Invalid send model".to_string()))?;
+        reject_unsupported_email_verification(&payload)?;
+        if payload.r#type != SEND_TYPE_FILE {
+            return Err(AppError::BadRequest(
+                "Send content is not a file".to_string(),
+            ));
+        }
+        validate_deletion_date(&payload.deletion_date)?;
+        let encrypted_file_name = encrypted_file_name
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::BadRequest("No filename provided".to_string()))?;
+        let file_length = uploaded_size
+            .ok_or_else(|| AppError::BadRequest("Missing file data".to_string()))?
+            as i64;
+        check_storage_quota(&db, file_length).await?;
+
+        let name = payload.name.clone();
+        let notes = payload.notes.clone();
+        let password = payload.password.clone();
+        let max_access_count = payload.max_access_count;
+        let expiration_date = payload.expiration_date.clone();
+        let deletion_date = payload.deletion_date.clone();
+        let disabled = payload.disabled;
+        let hide_email = payload.hide_email;
+        let (send_type, key, mut data_value) = extract_send_payload_data(payload)?;
+        if let Some(obj) = data_value.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(file_id.clone()));
+            obj.insert("size".to_string(), Value::Number(file_length.into()));
+            obj.insert(
+                "sizeName".to_string(),
+                Value::String(display_size(file_length)),
+            );
+        }
+
+        let now = now_rfc3339_millis();
+        let data_str = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
+        let password_salt = password
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| new_salt_b64());
+        let password_hash = match (password.as_deref(), password_salt.as_deref()) {
+            (Some(password), Some(salt)) => {
+                Some(hash_password(password, salt, SEND_PASSWORD_ITERATIONS)?)
+            }
+            _ => None,
+        };
+        let password_iter = password_hash.as_ref().map(|_| SEND_PASSWORD_ITERATIONS);
+        let send_stmt = query!(
+            &db,
+            "INSERT INTO sends (id, user_id, organization_id, type, name, notes, data, key, password_hash, password_salt, password_iter, max_access_count, access_count, created_at, updated_at, expiration_date, deletion_date, disabled, hide_email)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17)",
+            send_id,
+            claims.sub,
+            send_type,
+            name,
+            notes,
+            data_str,
+            key,
+            password_hash,
+            password_salt,
+            password_iter,
+            max_access_count,
+            now,
+            now,
+            expiration_date,
+            deletion_date,
+            if disabled { 1 } else { 0 },
+            hide_email.map(|value| if value { 1 } else { 0 })
+        )
+        .map_err(|_| AppError::Database)?;
+        let file_stmt = query!(
+            &db,
+            "INSERT INTO send_files (id, send_id, user_id, file_name, size, mime, data_base64, r2_object_key, storage_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, 'r2', ?7, ?8)",
+            file_id,
+            send_id,
+            claims.sub,
+            encrypted_file_name,
+            file_length as f64,
+            object_key,
+            now,
+            now
+        )
+        .map_err(|_| AppError::Database)?;
+        db.batch(vec![send_stmt, file_stmt])
+            .await
+            .map_err(|_| AppError::Database)?;
+        Ok::<_, AppError>((send_type, encrypted_file_name))
     }
+    .await;
+    let (send_type, encrypted_file_name) = match committed {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = bucket.delete(object_key).await;
+            return Err(err);
+        }
+    };
 
     let send = get_send_by_id_and_user(&db, &send_id, &claims.sub)
         .await?
@@ -1698,11 +1694,7 @@ pub async fn post_send_file_v2(
     let file_length = payload
         .file_length
         .ok_or_else(|| AppError::BadRequest("Invalid send length".to_string()))?;
-    if file_length < 0 {
-        return Err(AppError::BadRequest(
-            "Send size can't be negative".to_string(),
-        ));
-    }
+    r2_file::validate_declared_size(file_length, "Send")?;
 
     // Reject early if D1 or R2 is nearly full
     check_storage_quota(&db, file_length).await?;
@@ -1783,7 +1775,7 @@ pub async fn post_send_file_v2(
             .and_then(|v| v.as_str())
             .unwrap_or("file")
             .to_string(),
-        file_length,
+        file_length as f64,
         object_key,
         "r2",
         now,
@@ -1852,11 +1844,7 @@ pub async fn post_send_file_v2_data(
         .get("size")
         .and_then(|v| v.as_i64())
         .ok_or(AppError::Internal)?;
-    if size < 0 {
-        return Err(AppError::BadRequest(
-            "Send size can't be negative".to_string(),
-        ));
-    }
+    r2_file::validate_declared_size(size, "Send")?;
     let object_key = file_row
         .get("r2_object_key")
         .and_then(|v| v.as_str())
@@ -1878,7 +1866,6 @@ pub async fn post_send_file_v2_data(
         .to_string();
 
     let now = now_rfc3339_millis();
-    let expected_size = size as usize;
     let bucket = state
         .env
         .bucket(SEND_FILES_BUCKET_BINDING)
@@ -1909,38 +1896,32 @@ pub async fn post_send_file_v2_data(
             )));
         }
 
+        let actual_size = r2_file::upload_field(&bucket, &object_key, &mut field).await?;
         uploaded = true;
-
-        let mut bytes = Vec::with_capacity(expected_size);
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|e| AppError::BadRequest(format!("Invalid multipart data: {e}")))?
-        {
-            bytes.extend_from_slice(&chunk);
-        }
-
-        if bytes.len() != expected_size {
+        if actual_size != size as u64 {
+            let _ = bucket.delete(object_key.clone()).await;
             return Err(AppError::BadRequest("Uploaded size mismatch".to_string()));
         }
-
-        bucket
-            .put(object_key.clone(), bytes)
-            .execute()
+        let update_result: Result<(), AppError> = async {
+            query!(
+                &db,
+                "UPDATE send_files SET updated_at = ?1 WHERE id = ?2 AND send_id = ?3 AND user_id = ?4",
+                now,
+                file_id,
+                send_id,
+                claims.sub
+            )
+            .map_err(|_| AppError::Database)?
+            .run()
             .await
-            .map_err(|_| AppError::Internal)?;
-
-        query!(
-            &db,
-            "UPDATE send_files SET updated_at = ?1 WHERE id = ?2 AND send_id = ?3 AND user_id = ?4",
-            now,
-            file_id,
-            send_id,
-            claims.sub
-        )
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await?;
+            .map_err(|_| AppError::Database)?;
+            Ok(())
+        }
+        .await;
+        if update_result.is_err() {
+            let _ = bucket.delete(object_key.clone()).await;
+            return Err(AppError::Database);
+        }
 
         break;
     }
@@ -2261,10 +2242,14 @@ pub async fn download_send(
         .await
         .map_err(|_| AppError::Internal)?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
-    let body = object.body().ok_or(AppError::Internal)?;
-    let bytes = body.bytes().await.map_err(|_| AppError::Internal)?;
-
-    let mut response = Response::new(axum::body::Body::from(bytes));
+    let object_size = object.size();
+    let body = object
+        .body()
+        .ok_or(AppError::Internal)?
+        .response_body()
+        .map_err(|_| AppError::Internal)?;
+    let worker_response = worker::Response::from_body(body).map_err(|_| AppError::Internal)?;
+    let mut response: Response = worker_response.into();
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -2274,6 +2259,11 @@ pub async fn download_send(
         axum::http::header::CONTENT_DISPOSITION,
         axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", file.file_name))
             .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+    );
+    response.headers_mut().insert(
+        r2_file::FIXED_LENGTH_HEADER,
+        axum::http::HeaderValue::from_str(&object_size.to_string())
+            .map_err(|_| AppError::Internal)?,
     );
     Ok(response)
 }

@@ -5,7 +5,7 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 本项目不接触你的明文密码：Bitwarden系列客户端会在本地完成加密，服务端只保存密文数据。
 
 # 特别注意
-请Fork本项目到你的GitHub账号，不要拉取本项目的代码到本地后创建新的仓库，否则部署脚本会缺失权限从而失败。
+建议 Fork 本项目到你的 GitHub 账号；使用私有镜像仓库也可以，但必须保留本项目的 Workflow，并在仓库设置中允许 GitHub Actions 运行。Workflow 已显式申请私有仓库检出所需的 `contents: read` 权限。
 
 ## 功能
 
@@ -20,7 +20,7 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 
 ## 自动部署（GitHub Actions）（推荐）
 
-本项目已内置 GitHub Actions 工作流（`.github/workflows/push-cloudflare.yaml`），支持代码推送时自动构建并部署。
+本项目已内置 GitHub Actions 工作流（`.github/workflows/push-cloudflare.yaml`），同时支持全新部署和后续自动升级。只要 API Token 仅授权给一个 Cloudflare 账户，配置一个 GitHub Secret 后即可无人值守完成资源创建、数据库初始化、构建、迁移、部署和健康检查。
 
 ### 1. Fork 本项目
 Fork 本仓库到你的 GitHub 账号。
@@ -30,8 +30,8 @@ Fork 本仓库到你的 GitHub 账号。
 
 | Secret Name | 说明 | 获取方式 |
 | :--- | :--- | :--- |
-| `CLOUDFLARE_API_TOKEN` | API 令牌 | Cloudflare 用户设置 -> API Tokens -> Create Token |
-| `CLOUDFLARE_ACCOUNT_ID` | 账户 ID | Cloudflare Workers 首页右侧边栏 Account ID |
+| `CLOUDFLARE_API_TOKEN` | **必选**，Cloudflare API Token（不是 Global API Key） | Cloudflare 用户设置 -> API Tokens -> Create Token |
+| `CLOUDFLARE_ACCOUNT_ID` | 可选；仅当同一 Token 能访问多个账户时用于消除歧义 | Cloudflare Workers 首页右侧边栏 Account ID |
 
 #### 创建 API Token 的详细步骤
 
@@ -48,12 +48,10 @@ Fork 本仓库到你的 GitHub 账号。
 |------|------|------|
 | **Account** | `Workers Scripts` > `Edit` | 部署和管理 Workers 脚本 |
 | **Account** | `Account Settings` > `Read` | 读取账户信息 |
-| **Account** | `Workers D1` > `Edit` | 创建和管理 D1 数据库 |
-| **Account** | `R2` > `Edit` | 创建和管理 R2 Bucket |
-| **User** | `User Details` > `Read` | 读取用户信息（用于 wrangler 认证） |
-| **User** | `Memberships` > `Read` | 读取成员资格（wrangler 必需） |
+| **Account** | `D1` > `Edit` | 创建和管理 D1 数据库 |
+| **Account** | `Workers R2 Storage` > `Edit` | 创建和管理 R2 Bucket |
 
-**Account Resources**: 选择你的账户
+**Account Resources**：选择目标账户，且建议只选择这一个账户。这样工作流可直接从 Token 自动发现 Account ID，无需配置 `CLOUDFLARE_ACCOUNT_ID`。
 
 **Zone Resources**: 保持为空（除非你需要管理特定 Zone）
 
@@ -63,10 +61,13 @@ Fork 本仓库到你的 GitHub 账号。
 
 > ⚠️ **重要提示**：
 > - 必须包含所有上述权限，否则 wrangler CLI 可能报错
-> - 如果缺少 `User > Memberships > Read` 权限，会看到 `Authentication failed [code: 9106]` 错误
+> - 工作流只接受 API Token；旧式 Global API Key 还需要账户邮箱，不能满足单 Secret 的无人值守部署要求
+> - 如果 Token 能访问多个账户，工作流会安全停止；请把 Token 的 Account Resources 限定为目标账户，或额外添加 `CLOUDFLARE_ACCOUNT_ID`
 > - Token 应妥善保管，泄露后需立即撤销并重新创建
 
-#### 获取 Account ID
+#### 可选：获取 Account ID
+
+只有 Token 能访问多个账户且不便重新限定资源范围时，才需要配置此项：
 
 1. 访问 [Cloudflare Dashboard](https://dash.cloudflare.com)
 2. 在首页右侧边栏找到 **Account ID**
@@ -75,27 +76,33 @@ Fork 本仓库到你的 GitHub 账号。
 ### 3. 首次部署（自动创建基础设施）
 
 首次部署时，GitHub Actions 工作流会自动：
-- ✅ **验证 API Token 权限**（新增！检查是否具备所有必需的权限）
+- ✅ 从 API Token 自动发现并验证唯一的 Cloudflare Account ID
+- ✅ 在账户尚无 Workers 子域时创建一个确定性的 `workers.dev` 子域，避免 Wrangler 交互提示
 - ✅ 检查 D1 数据库 `vaultsql` 是否存在，不存在则自动创建
-- ✅ 自动执行 `sql/schema.sql` 初始化数据库（仅首次）
+- ✅ 自动执行 `sql/schema.sql` 初始化数据库（仅首次），随后应用 `sql/migrations` 中尚未执行的增量迁移
 - ✅ 检查 R2 Bucket `warden-send-files` 是否存在，不存在则自动创建
-- ✅ 自动更新 `wrangler.jsonc` 中的数据库 ID
-- ✅ 部署 Worker 到 Cloudflare
+- ✅ 将 Cloudflare 返回的真实 `database_id` 精确写入 `wrangler.jsonc` 的 `vaultsql` 绑定并再次校验
+- ✅ 完成 Rust/Node 测试、release dry-run、Durable Objects 初始化和 Worker 部署
+- ✅ 重试检查根 `/alive`，确认 Worker 与 D1 都可访问
 
 > 💡 **提示**：整个过程全自动，无需手动创建数据库或配置 ID！
 
-> ⚠️ **权限验证**：工作流会在部署前自动验证 API Token 是否具备以下权限：
-> - Account > Account Settings > Read
-> - Account > Workers D1 > Edit
-> - Account > R2 > Edit
-> - Account > Workers Scripts > Edit
-> - User > User Details > Read
-> - User > Memberships > Read
-> 
-> 如果缺少任何权限，工作流会在第一步失败并给出明确的错误提示。
+资源查找全部使用精确名称匹配，不再从 Wrangler 的人类可读文本中 `grep` UUID；API 或权限错误也不会被当成“资源不存在”。仓库中原有的 `database_id` 只用于本地开发，Actions 每次都会用目标账户中 `vaultsql` 的真实 ID 覆盖当前 runner 的配置，不会把该临时值提交回仓库。
 
-### 4. 配置 Cloudflare Workers 运行环境密钥
-在 Cloudflare Dashboard -> Workers -> Settings -> Variables 中手动添加以下机密变量。
+### 4. 后续自动升级
+
+推送到 `main`、`uat` 或 `release*` 分支会自动触发部署；也可以从 Actions 页面手动触发。所有分支共用同一部署队列，新的运行不会取消正在执行的数据库迁移：
+
+1. 精确复用已有 D1、R2 和 Workers 子域，不执行 `schema.sql`。
+2. 先完成测试和 Worker release dry-run。
+3. 按顺序执行 `sql/migrations` 中尚未记录到 `d1_migrations` 的 SQL。
+4. 迁移成功后部署新 Worker；失败则不部署依赖新结构的代码。
+5. Wrangler 根据 `wrangler.jsonc` 原生处理 Durable Objects；工作流不会直接 PATCH 或删除 DO 绑定和数据。
+
+> 2026-07-22 统一基线之前创建的旧数据库，仍需先按下文“升级”章节完成一次手动基线对齐。全新数据库以及已经对齐的数据库不需要人工参与。
+
+### 5. 可选：配置 Cloudflare Workers 运行环境密钥
+基础密码库不依赖以下密钥即可运行。只有需要注册白名单、Turnstile 或 Webhook/Telegram/企业微信通知时，才在 Cloudflare Dashboard -> Workers -> Settings -> Variables 中添加对应机密变量。
 ```
 ALLOWED_EMAILS
 WEWORK_WEBHOOK_URL
@@ -130,8 +137,8 @@ Worker 已支持动态生成 `GET /css/vaultwarden.css`，可通过环境变量�
 - `VW_CSS_LOAD_USER_CSS`：是否加载自定义 CSS（默认 `true`）
 - `VW_CSS_USER`：自定义 CSS 文本（可放到 Worker Secret，优先读取 Secret）
 
-### 5. 部署
-在 GitHub 仓库的 **Actions** 中触发工作流，即可自动部署到 Cloudflare Workers。
+### 6. 部署
+保存 `CLOUDFLARE_API_TOKEN` 后，在 GitHub 仓库的 **Actions** 中手动运行一次工作流；此后上述分支每次出现新提交都会自动升级部署。
 
 > 💡 **提示**：首次部署可能需要 3-5 分钟，因为包含构建和基础设施创建过程。
 
@@ -164,6 +171,7 @@ wrangler d1 create vaultsql
 
 ```bash
 wrangler d1 execute vaultsql --remote --file=sql/schema.sql
+wrangler d1 migrations apply vaultsql --remote
 ```
 
 ### 3. 配置密钥（Secrets）
@@ -180,7 +188,7 @@ wrangler secret put TURNSTILE_SECRET_KEY
 ```
 
 - **ALLOWED_EMAILS**：首个账号注册白名单（仅在"数据库还没有任何用户"时启用），多个邮箱用英文逗号分隔。
-- **DOMAIN**：**必选**，你的服务域名，格式如 `https://vault.example.com`。用于 WebAuthn 安全密钥注册等功能。
+- **DOMAIN**：可选的公开域名覆盖，格式如 `https://vault.example.com`；未设置时附件和 Send 使用相对 URL，WebAuthn 从当前请求头确定安全来源。
 - **WEWORK_WEBHOOK_URL**：可选，企业微信群机器人的 Webhook 地址（形如 `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...`）。用于事件通知和邮箱二步验证验证码发送。
 - **TELEGRAM_BOT_TOKEN**：可选，Telegram Bot 的 Token。从 [@BotFather](https://t.me/BotFather) 获取。
 - **TELEGRAM_CHAT_ID**：可选，接收通知的 Chat ID。可以是个人用户 ID、群组 ID 或频道 ID。通过 [@userinfobot](https://t.me/userinfobot) 获取个人 ID。
@@ -192,6 +200,8 @@ wrangler secret put TURNSTILE_SECRET_KEY
 
 ### 5. 部署
 
+本次从旧版本升级时，请先按第 6 节手动把 D1 对齐到 2026-07-22 基线，再部署 Worker。完成这次对齐后，后续数据库升级由 GitHub Actions 在 Worker 部署前自动应用 `sql/migrations` 中尚未执行的增量迁移。
+
 ```bash
 wrangler deploy
 ```
@@ -199,38 +209,42 @@ wrangler deploy
 部署后，把 Workers URL 或自定义域名填入 Bitwarden 客户端的“自托管服务器 URL”。
 
 ### 6. 升级
-> 如果你曾经部署过旧版本并准备升级，建议在客户端 **导出密码库**  → **重新部署本项目（全新初始化数据库）** → **再导入密码库（可显著降低迁移/兼容成本）**。
+> `sql/schema.sql` 是 2026-07-22 统一后的完整数据库基线。它会删除并重建全部项目表，同时清除 Wrangler 的 `d1_migrations` 记录；执行后现有 D1 数据不可恢复。本次基线对齐不提供原地升级兼容。
 
-GitHub Actions 会先把旧数据库提升到原生迁移基线，再自动执行 `sql/d1-migrations/` 中尚未应用的迁移。Wrangler 使用数据库内的 `d1_migrations` 表记录执行状态，因此同一个迁移不会重复运行。
+手动升级步骤：
 
-手动部署时，完成下方旧版本基线迁移后，统一执行：
+1. 在 Bitwarden 客户端导出密码库，并按需另行备份 D1/R2。
+2. 用当前基线重建远程 D1：
 
-```bash
-wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_add_password_iterations.sql
-wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_cipher_key.sql
-wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_account_compat_columns.sql
-wrangler d1 execute vaultsql --remote --file=sql/migrations/20260716_add_cipher_attachments.sql
-wrangler d1 execute vaultsql --remote --file=sql/migrations/20260713_enforce_single_user.sql
-wrangler d1 migrations apply vaultsql --remote
-```
+   ```bash
+   wrangler d1 execute vaultsql --remote --file=sql/schema.sql
+   ```
 
-以后新增数据库结构或数据迁移时，不再修改 `.github/workflows/push-cloudflare.yaml`，也不再修改已经发布过的迁移文件。只需新增一个按顺序编号的 SQL 文件，例如：
+3. 部署当前 Worker，再把密码库导回客户端。完成后即可恢复使用 GitHub Actions 自动部署。
 
-```text
-sql/d1-migrations/0002_add_example_column.sql
-```
+当前基线已经合并全部历史数据库变更，包括 Argon2 KDF 字段、服务端密码哈希字段、账号兼容字段、单用户约束、设备与认证请求、TOTP 防重放时间步、Email/WebAuthn 2FA、归档、附件以及 Send 的 D1/R2 元数据。旧迁移已经删除，`sql/d1-migrations` 目录也不再使用。
 
-也可以用 Wrangler 创建编号文件：
+#### 后续数据库变更
+
+统一基线之后的每次数据库变更只新增到 `sql/migrations`。使用 Wrangler 创建顺序迁移：
 
 ```bash
 wrangler d1 migrations create vaultsql add_example_column
 ```
 
-在新文件中写入本次数据库变更即可。`sql/schema.sql` 是启用原生迁移时的基线结构，新数据库会先导入该基线，然后执行 `sql/d1-migrations/` 中的全部迁移；因此后续结构变化也只写入新的迁移文件，不再同步修改基线 schema。
+生成的文件形如 `sql/migrations/0001_add_example_column.sql`。写入并在本地验证 SQL 后随代码提交；GitHub Actions 会在部署 Worker 之前执行：
 
-`20260716_add_cipher_key.sql` 为密码项增加独立加密密钥列，使 2026.6.1 及更新版本的 Bitwarden 客户端可以正常创建和同步密码项。该迁移不会修改已有密码项；升级 Worker 前必须先应用，否则新建或更新密码项会因缺少数据库列而失败。
+```bash
+wrangler d1 migrations apply vaultsql --remote
+```
 
-`20260716_add_account_compat_columns.sql` 增加用户 API Key 与待确认邮箱字段；`20260716_add_cipher_attachments.sql` 增加附件元数据表，附件二进制数据仍存储在既有的 `SEND_FILES_BUCKET` R2 Bucket。GitHub Actions 会逐项检测这些列和表，已经迁移的数据库不会重复执行。`wrangler.jsonc` 中的每日 Cron 会清理已过删除日期的 Send，避免 D1 元数据与 R2 文件长期残留。
+Wrangler 使用 D1 的 `d1_migrations` 表记录已执行的文件，因此后续部署只会应用尚未执行的迁移。新数据库会先导入 `sql/schema.sql` 基线，再依次执行 `sql/migrations` 中的全部迁移；已有数据库只执行待处理迁移。迁移失败会使基础设施任务失败，从而阻止依赖新结构的 Worker 继续部署。
+
+已经应用的迁移不得修改、改名、重排或删除。为了避免新数据库重复创建同一结构，基线之后的变化不要同时写回 `sql/schema.sql`；需要再次收敛基线时，应单独安排一次和本次相同的手动重建。
+
+密码项独立加密密钥、用户 API Key 与待确认邮箱字段、附件元数据表均已直接包含在 `sql/schema.sql` 中。附件二进制数据仍存储在既有的 `SEND_FILES_BUCKET` R2 Bucket；`wrangler.jsonc` 中的每日 Cron 会清理已过删除日期的 Send，避免 D1 元数据与 R2 文件长期残留。
+
+附件和文件 Send 的单文件上限固定为 **95 MiB**。上传请求体上限为 100,000,000 字节，以适配 Cloudflare Free/Pro 的 100 MB 入口限制并给 multipart 边界留出余量；文件数据按约 8 MiB 分片写入 R2，下载通过 Cloudflare `FixedLengthStream` 直接流式返回并生成正确的 `Content-Length`，不会把完整文件读入 Worker 内存。
 
 密码迁移不会立即改写现有密码哈希。旧记录会在用户下一次成功输入主密码时自动迁移为独立的 PBKDF2-HMAC-SHA256（600,000 次迭代、64 字节随机 salt）；客户端 KDF 设置保持不变。单用户迁移会阻止继续向 `users` 表插入记录，但不会删除或修改已有用户。注册接口也会在检测到首个用户后立即返回错误，不再执行耗时的密码哈希。
 

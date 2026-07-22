@@ -167,28 +167,27 @@ pub async fn device_token(
 
     let inferred_name = infer_device_name(&headers);
     let inferred_type = infer_device_type(&headers);
-    let now = Utc::now().to_rfc3339();
-
-    db.prepare(
-        "INSERT INTO devices (id, user_id, device_identifier, device_name, device_type, remember_token_hash, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
-         ON CONFLICT(user_id, device_identifier) DO UPDATE SET
-           updated_at = excluded.updated_at,
-           device_name = COALESCE(excluded.device_name, devices.device_name),
-           device_type = COALESCE(excluded.device_type, devices.device_type)",
-    )
-    .bind(&[
-        Uuid::new_v4().to_string().into(),
-        claims.sub.into(),
-        device_identifier.into(),
-        js_opt_string(inferred_name),
-        js_opt_i64(inferred_type),
-        now.clone().into(),
-        now.into(),
-    ])?
-    .run()
-    .await
-    .map_err(|_| AppError::Database)?;
+    let result = db
+        .prepare(
+            "UPDATE devices SET
+           updated_at = ?1,
+           device_name = COALESCE(?2, device_name),
+           device_type = COALESCE(?3, device_type)
+         WHERE user_id = ?4 AND device_identifier = ?5",
+        )
+        .bind(&[
+            Utc::now().to_rfc3339().into(),
+            js_opt_string(inferred_name),
+            js_opt_i64(inferred_type),
+            claims.sub.into(),
+            device_identifier.into(),
+        ])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    if result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) == 0 {
+        return Err(AppError::NotFound("Device not found".to_string()));
+    }
 
     Ok(Json(()))
 }
@@ -197,27 +196,10 @@ pub async fn device_token(
 pub async fn clear_device_token(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-    Path(device_identifier): Path<String>,
+    Path(_device_identifier): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
-    ensure_devices_table(&db).await?;
-
-    db.prepare(
-        "UPDATE devices
-         SET remember_token_hash = NULL,
-             updated_at = ?3
-         WHERE user_id = ?1 AND device_identifier = ?2",
-    )
-    .bind(&[
-        claims.sub.into(),
-        device_identifier.into(),
-        Utc::now().to_rfc3339().into(),
-    ])?
-    .run()
-    .await
-    .map_err(|_| AppError::Database)?;
-
     Ok(Json(()))
 }
 
@@ -360,41 +342,8 @@ pub async fn get_device_by_identifier(
         .await
         .map_err(|_| AppError::Database)?;
 
+    let row = row.ok_or_else(|| AppError::NotFound("Device not found".to_string()))?;
     let now = Utc::now().to_rfc3339();
-    let row = match row {
-        Some(row) => row,
-        None => {
-            let device_id = Uuid::new_v4().to_string();
-            db.prepare(
-                "INSERT INTO devices (id, user_id, device_identifier, device_name, device_type, remember_token_hash, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-            )
-            .bind(&[
-                device_id.clone().into(),
-                claims.sub.clone().into(),
-                device_identifier.clone().into(),
-                js_opt_string(inferred_name.clone()),
-                js_opt_i64(inferred_type),
-                now.clone().into(),
-                now.clone().into(),
-            ])?
-            .run()
-            .await
-            .map_err(|_| AppError::Database)?;
-
-            db.prepare(
-                "SELECT id, device_identifier, device_name, device_type, remember_token_hash, created_at, updated_at
-                 FROM devices
-                 WHERE id = ?1
-                 LIMIT 1",
-            )
-            .bind(&[device_id.into()])?
-            .first(None)
-            .await
-            .map_err(|_| AppError::Database)?
-            .ok_or(AppError::Internal)?
-        }
-    };
 
     let row_device_type = row.get("device_type").and_then(|v| v.as_i64());
     let row_device_name = row

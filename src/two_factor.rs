@@ -58,6 +58,7 @@ pub async fn ensure_two_factor_authenticator_table(db: &D1Database) -> Result<()
             user_id TEXT PRIMARY KEY NOT NULL,
             enabled BOOLEAN NOT NULL DEFAULT 0,
             secret_enc TEXT NOT NULL,
+            last_used INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -99,18 +100,20 @@ pub async fn upsert_authenticator_secret(
     user_id: &str,
     secret_enc: String,
     enabled: bool,
+    last_used: i64,
     now: &str,
 ) -> Result<(), AppError> {
     ensure_two_factor_authenticator_table(db).await?;
     db.prepare(
-        "INSERT INTO two_factor_authenticator (user_id, enabled, secret_enc, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled, secret_enc = excluded.secret_enc, updated_at = excluded.updated_at",
+        "INSERT INTO two_factor_authenticator (user_id, enabled, secret_enc, last_used, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled, secret_enc = excluded.secret_enc, last_used = excluded.last_used, updated_at = excluded.updated_at",
     )
     .bind(&[
         user_id.into(),
         (if enabled { 1 } else { 0 }).into(),
         secret_enc.into(),
+        (last_used as f64).into(),
         now.into(),
         now.into(),
     ])?
@@ -246,25 +249,74 @@ pub fn decrypt_secret_with_key(
     decrypt_secret_with_optional_key(Some(&key.key_b64), user_id, secret_enc)
 }
 
-pub fn verify_totp_code(secret_encoded: &str, token: &str) -> Result<bool, AppError> {
+pub fn match_totp_time_step(
+    secret_encoded: &str,
+    token: &str,
+    unix_seconds: u64,
+) -> Result<Option<i64>, AppError> {
     let token = token.trim();
     if token.len() != 6 || !token.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let secret = Secret::Encoded(secret_encoded.to_string());
     let totp = TOTP::new(
         Algorithm::SHA1,
         6,
-        1,
+        0,
         30,
         secret.to_bytes().map_err(|_| AppError::Internal)?,
         None,
         "".to_string(),
     )
     .map_err(|_| AppError::Internal)?;
+    let current_step = (unix_seconds / 30) as i64;
+    for offset in [0_i64, -1, 1] {
+        let step = current_step + offset;
+        if step < 0 {
+            continue;
+        }
+        let generated = totp.generate(step as u64 * 30);
+        if constant_time_eq::constant_time_eq(token.as_bytes(), generated.as_bytes()) {
+            return Ok(Some(step));
+        }
+    }
+    Ok(None)
+}
+
+pub fn match_current_totp_time_step(
+    secret_encoded: &str,
+    token: &str,
+) -> Result<Option<i64>, AppError> {
     let unix_seconds = (Date::now() / 1000.0).floor() as u64;
-    Ok(totp.check(token, unix_seconds))
+    match_totp_time_step(secret_encoded, token, unix_seconds)
+}
+
+pub async fn consume_totp_code(
+    db: &D1Database,
+    user_id: &str,
+    secret_encoded: &str,
+    token: &str,
+) -> Result<bool, AppError> {
+    let Some(time_step) = match_current_totp_time_step(secret_encoded, token)? else {
+        return Ok(false);
+    };
+    ensure_two_factor_authenticator_table(db).await?;
+    let result = db
+        .prepare(
+            "UPDATE two_factor_authenticator
+             SET last_used = ?1, updated_at = ?2
+             WHERE user_id = ?3 AND enabled = 1 AND last_used < ?1",
+        )
+        .bind(&[
+            (time_step as f64).into(),
+            Utc::now().to_rfc3339().into(),
+            user_id.into(),
+        ])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) == 1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,13 +684,38 @@ pub async fn delete_all_two_factors(db: &D1Database, user_id: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::generate_totp_secret_base32_20;
-    use totp_rs::Secret;
+    use super::{generate_totp_secret_base32_20, match_totp_time_step};
+    use totp_rs::{Algorithm, Secret, TOTP};
 
     #[test]
     fn generated_totp_secret_is_20_bytes() {
         let secret = generate_totp_secret_base32_20();
         let bytes = Secret::Encoded(secret).to_bytes().expect("decode base32");
         assert_eq!(bytes.len(), 20);
+    }
+
+    #[test]
+    fn totp_match_returns_the_consumable_time_step() {
+        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            0,
+            30,
+            Secret::Encoded(secret.to_string()).to_bytes().unwrap(),
+            None,
+            String::new(),
+        )
+        .unwrap();
+        let timestamp = 1_700_000_000;
+        let token = totp.generate(timestamp);
+        assert_eq!(
+            match_totp_time_step(secret, &token, timestamp).unwrap(),
+            Some((timestamp / 30) as i64)
+        );
+        assert_eq!(
+            match_totp_time_step(secret, &token, timestamp + 30).unwrap(),
+            Some((timestamp / 30) as i64)
+        );
     }
 }

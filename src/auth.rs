@@ -11,6 +11,10 @@ use crate::router::AppState;
 use serde_json::Value;
 use worker::D1Database;
 
+pub(crate) fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -112,4 +116,17 @@ pub fn decode_delete(token: &str, jwt_secret: &str) -> Result<BasicJwtClaims, Ap
     decode::<BasicJwtClaims>(token, &decoding_key, &Validation::default())
         .map(|d| d.claims)
         .map_err(|_| AppError::Unauthorized("Invalid delete token".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_email;
+
+    #[test]
+    fn email_normalization_trims_and_lowercases() {
+        assert_eq!(
+            normalize_email("  User.Name+Tag@Example.COM \r\n"),
+            "user.name+tag@example.com"
+        );
+    }
 }

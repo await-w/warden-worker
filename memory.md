@@ -24,7 +24,7 @@
   - `cargo fmt --all -- --check`
   - `node --test tests/heavy_do_routing.test.mjs`
 - 手动部署命令：`wrangler deploy`
-- 最后更新时间：2026-07-17
+- 最后更新时间：2026-07-22
 
 ## 项目概述
 
@@ -41,9 +41,9 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `Cargo.toml` / `Cargo.lock`
   - Rust 包元数据、依赖版本、Wasm 发布配置和 lint 规则。
 - `wrangler.jsonc`
-  - Worker 入口、Cron、变量、D1/R2/限流/DO 绑定、迁移、日志、构建与静态资源配置。
+  - Worker 入口、Cron、变量、D1/R2/限流/DO 绑定、D1 增量迁移目录、日志、构建与静态资源配置。
 - `.github/workflows/push-cloudflare.yaml`
-  - 对 `main`、`uat`、`release*` 的 CI/CD；执行预检、基础设施创建或复用、旧库基线处理、D1 原生迁移、DO 绑定协调和 Worker 部署。
+  - 对 `main`、`uat`、`release*` 的 CI/CD；执行预检、基础设施创建或复用、新库基线初始化、D1 待处理迁移、DO 绑定协调和 Worker 部署。
 - `scripts/patch-webvault-turnstile.mjs`
   - 构建前在 Web Vault 入口注入匿名 Send 的 Turnstile 导航保护；通过版本标记避免重复注入。
 - `tests/heavy_do_routing.test.mjs`
@@ -77,6 +77,8 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
   - Bearer/JWT 鉴权、令牌签发与 D1 中的 JWT 密钥管理。
 - `src/password.rs`、`src/crypto.rs`
   - 服务端密码哈希、验证、旧哈希升级与客户端 KDF 参数校验。
+- `src/r2_file.rs`
+  - 附件与 Send 共用的 95 MiB 限制、约 8 MiB 分片、R2 multipart abort/complete 和声明大小校验。
 - `src/two_factor.rs`、`src/two_factor_key_manager.rs`
   - TOTP/2FA 核心逻辑和 D1 加密密钥管理。
 - `src/webauthn.rs`
@@ -89,11 +91,9 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 ### `sql`
 
 - `sql/schema.sql`
-  - 新数据库的完整基线结构；包含 `DROP TABLE`，对已有数据库执行会清空数据。
-- `sql/d1-migrations/`
-  - Wrangler 原生 D1 迁移目录；`0001_baseline.sql` 是兼容新旧数据库的 no-op 跟踪基线。
+  - 2026-07-22 统一后的完整数据库基线；已合并此前全部迁移的最终状态。包含 `DROP TABLE` 并清除 `d1_migrations`，对已有数据库执行会清空数据和迁移记录。
 - `sql/migrations/`
-  - 原生迁移启用前的历史/兼容迁移，以及 CI 对旧数据库做结构探测时使用的 SQL。
+  - 统一基线之后的 Wrangler 原生 D1 增量迁移目录；当前只有维护规则说明，未来按顺序新增 `.sql`，已应用文件不可修改、改名、重排或删除。
 
 ## 架构与关键流程
 
@@ -116,6 +116,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 - D1 绑定名固定为 `vaultsql`，保存用户、密码项、文件夹、Send、设备、2FA/WebAuthn、JWT/2FA 密钥和附件元数据。
 - R2 绑定名为 `SEND_FILES_BUCKET`，保存附件及 Send 文件二进制数据。
+- 标准客户端单文件上限固定为 95 MiB；请求总 body limit 为 100,000,000 字节。文件达到 8 MiB 后使用 R2 multipart，下载由 JS 入口把 R2 流 pipe 到 `FixedLengthStream`，从而保持流式并让运行时生成正确的 `Content-Length`。
 - `LOGIN_LIMITER` 与 `SEND_ACCESS_LIMITER` 分别保护登录和匿名 Send 访问。
 - 每日 `0 3 * * *` Cron 调用 Send 清理逻辑，删除过期元数据和相关 R2 文件。
 
@@ -123,13 +124,15 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 - `NOTIFICATIONS_HUB` 承担 WebSocket/SignalR 连接与内部事件广播。
 - vault 写操作的正确性不仅包括 D1 结果，还包括用户 revision 和相应的实时更新事件。
+- `NotificationsHub` 使用 SignalR MessagePack 握手/二进制语义，每 15 秒通过 Durable Object alarm 发送 ping；宏必须使用 `#[durable_object]` 才会同时导出 WebSocket 与 alarm 回调。
 
 ### 部署与迁移
 
-- GitHub Actions 会检查 Cloudflare 凭证权限，创建或复用 `vaultsql` 与 `warden-send-files`，再应用迁移并部署。
-- 新数据库先导入 `sql/schema.sql`，再由 Wrangler 应用 `sql/d1-migrations/`。
-- 已发布的迁移文件不得修改或重排；新增结构变化应创建新的顺序迁移文件。
-- 对已有生产数据库不得直接执行 `sql/schema.sql`；执行任何数据库操作前先确认 `--local`/`--remote` 和目标数据库。
+- `sql/schema.sql` 是 2026-07-22 统一基线；它会删除并重建项目表以及迁移追踪表，包括 D1 中的 JWT/2FA 密钥数据。执行前必须导出密码库并按需备份 D1/R2。
+- 基线之后的数据库变更只新增到 `sql/migrations/`，`wrangler.jsonc` 的 `migrations_dir` 固定指向该目录；不要同时把增量写回 schema，否则新库会重复执行同一结构变更。
+- GitHub Actions 对新库先导入 schema，再用 `wrangler d1 migrations apply` 应用全部增量；对已有库只应用 `d1_migrations` 未记录的文件。迁移失败会阻止后续 Worker 部署。
+- `sql/d1-migrations/` 已确认不再需要并删除；工作流不再包含历史列探测或硬编码旧迁移。
+- 执行任何数据库操作前必须确认 `--local`/`--remote` 和目标数据库；已发布迁移不得修改、改名、重排或删除。
 
 ## 特殊事项与项目约束
 
@@ -146,20 +149,25 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 当前项目状态
 
-- 分支/提交：`main`，当前 HEAD 为 `a5aa013`（“增强兼容性”），与 `origin/main` 一致。
-- 当前工作树包含本次依赖升级对 `.github/workflows/push-cloudflare.yaml`、`Cargo.toml`、`Cargo.lock` 和 `memory.md` 的修改。
+- 分支/提交：`main`，审计基线 HEAD 为 `f9141b45ded9cd1086a562c0d1a732119f6200b5`（“依赖升级”），审计开始时业务工作树干净。
+- Vaultwarden 对照基线：`D:\gitrepo\vaultwarden` 的 `169aa5efcc8d94684ff3bc813a00e6bcc0cc537a`（2026-07-08）。
+- Bitwarden Android 对照基线：`C:\Users\MINI\AppData\Local\Temp\bitwarden-android-2026.6.1-bwpm` 的 `2026.6.1` 客户端实现。
+- 2026-07-22 已实施审计确认的个人密码库兼容性修复；业务代码、schema、配置、测试和文档均有改动，静态 Web Vault 未改变。
 - 当前实现覆盖账户认证、密码库同步、Ciphers、Folders、附件、Send、导入、设备、2FA、WebAuthn、实时通知和动态 Vaultwarden CSS。
 - 最近主要变化：
   - 将 worker-rs/worker-build 升级到 `0.8.5`、Wrangler 升级到 `4.111.0`，并刷新低风险直接依赖和完整锁文件。
   - 本机全局 Wrangler CLI 已从 `4.104.0` 升级到 `4.111.0`，与 GitHub Actions 固定版本一致。
   - 增加附件 API 与附件元数据迁移。
   - 加强新版 Bitwarden 客户端的 Cipher key、请求字段、序列化、revision 与通知兼容。
-  - 引入 Wrangler 原生 D1 迁移基线，同时保留旧数据库兼容步骤。
-- 当前没有在本次依赖升级中复现到本地测试、lint、Wasm 构建或 Wrangler dry-run 失败。
+  - 历史 SQL 已收敛到 `sql/schema.sql` 基线；后续顺序迁移统一由 `sql/migrations/` 和 Wrangler `d1_migrations` 追踪。
+- 2026-07-22 已修复邮箱规范化、Token form 别名与 refresh 设备继承、profile/密码策略/config/密码提示响应、Email 2FA 鉴权与版本分支、TOTP 重放、设备 404/clear-token、健康检查、通知 keepalive 和文件流式 multipart 等已确认偏差。
+- Bitwarden/Vaultwarden API 错误体字段现为 `validationErrors`、`errorModel`、`exceptionMessage` 等 camelCase；OAuth `error_description` 保持规范名称。
+- 组织管理、SSO 与 Push 仍按项目边界不实现；组织字段保持兼容空值，Push 的设备 token 端点仅保持兼容语义。
+- `two_factor_authenticator.last_used` 已直接包含在唯一 schema 中；本次不提供保留旧 D1 数据的原地升级路径。
 - 尚未验证：
-  - 未部署到 Cloudflare，未检查远程 Worker 版本、绑定、D1/R2 实际状态或远程日志。
-  - 未执行真实 Bitwarden Android/Desktop/Web 客户端端到端验证。
-  - 未在本次依赖升级中重新做完整的上游 Vaultwarden 行为对等审计。
+    - 未部署到 Cloudflare，未检查远程 Worker 版本、绑定、D1/R2 实际状态或远程日志。
+    - 未执行真实 Bitwarden Android/Desktop/Web 客户端端到端验证。
+    - 未做远程大文件上传/下载、生产 Durable Object alarm 或完整旧版本客户端矩阵验证。
 
 ## 需求与修改记录
 
@@ -302,16 +310,188 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 - 无。
 
+### 2026-07-22：按端点审计 Vaultwarden/Bitwarden 兼容性
+
+#### 用户需求
+
+从 HTTP 端点入手，将本项目与本机 Vaultwarden 源码逐项比较；允许项目特殊功能和组织管理能力不同，但要求个人密码库逻辑及数据格式兼容 Bitwarden。
+
+#### 审计基线与范围
+
+- Warden Worker：`f9141b45ded9cd1086a562c0d1a732119f6200b5`。
+- Vaultwarden：`169aa5efcc8d94684ff3bc813a00e6bcc0cc537a`。
+- 对照路由、认证/账户、设备、同步、Cipher/Folder、导入、附件、Send、2FA/WebAuthn、通知、配置和健康检查；排除组织管理、SSO 和项目明确的 Turnstile/通知通道/单用户架构差异。
+
+#### 已确认结论
+
+- 不能确认完全兼容。个人密码库主要路由覆盖和 Cipher/Folder/Send/附件的核心 API 序列化总体对齐；组织字段保持空数组或 `null`，符合当前无组织能力的边界。
+- `prelogin` 未规范化邮箱，而注册和密码登录会转小写；大小写或首尾空格不同会返回错误 KDF 参数，导致客户端派生错误的主密码哈希。
+- `/api/accounts/profile` 缺少 Vaultwarden profile 中的 `_status`、`providers`、`providerOrganizations`、`forcePasswordReset`、`usesKeyConnector`、`creationDate`；`verify-password` 返回 `{}`，而 Vaultwarden 返回主密码策略。
+- 密码提示对未注册邮箱返回 404、对已注册邮箱返回 200，形成账号枚举；Vaultwarden 在可发邮件时刻意统一成功行为。
+- `/api/two-factor/send-email-login` 在按邮箱调用时允许既无主密码哈希、也无经校验的 AuthRequest 凭据，并且未使用登录限流；旧客户端仅有 Email 2FA 时登录错误响应也不会像 Vaultwarden 那样自动发码。
+- TOTP 验证只校验当前时间窗，未像 Vaultwarden 一样持久化 `last_used` 阻止同一时间步重复使用。
+- `clear-token` 清除的是 2FA remember token，而 Vaultwarden 该端点只清 push token；读取不存在的 device 会创建记录，而 Vaultwarden 返回不存在错误。
+- 根 `/alive` 和 HEAD `/alive` 缺失；`/api/alive` 只返回时间，不像 Vaultwarden 同时验证数据库连接。
+- 通知 Durable Object 没有 Vaultwarden 的 15 秒 WebSocket keepalive/ping；当前 Web Vault 内置 SignalR 默认 server timeout 为 30 秒，空闲连接行为没有对等保证。
+- 附件和 Send 文件上传、R2 下载会把整个文件读入 `Vec`/`bytes`；路由宣称 1 GiB body limit，但 Cloudflare Worker isolate 只有 128 MB 内存且入口请求体还有套餐上限，因此大文件路径与宣称不一致。
+- refresh token 路径从请求体而不是 refresh token/设备记录恢复 device identifier；请求未携带该字段时新 token 会丢失设备上下文。Token form 对 Vaultwarden 支持的部分无大小写/无下划线别名也未覆盖。
+- `/api/config` 固定 `disableUserRegistration=false`，与单用户数据库约束在首个用户注册后不一致。
+
+#### 验证情况
+
+- `cargo test --all-targets`：通过，48 passed、0 failed。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`：通过。
+- `node --test tests/heavy_do_routing.test.mjs`：通过，3 passed、0 failed。
+- `worker-build --release`：通过。
+- 未执行远程部署、生产 D1/R2 检查或真实 Bitwarden 客户端端到端回归。
+
+#### 涉及文件
+
+- 业务代码仅审计，未修改。
+- `memory.md`：记录审计基线、结论、验证和后续项。
+
+### 2026-07-22：实施 Bitwarden/Vaultwarden 个人密码库兼容性修复
+
+#### 用户需求
+
+以 Vaultwarden `169aa5e` 和 Bitwarden Android `2026.6.1` 为行为与数据契约基线，修复审计发现的全部个人密码库问题；保留单用户、Workers/D1/R2/DO、Turnstile、Webhook/Telegram/企业微信通知，以及不实现组织管理、SSO、Push 和 SMTP 的项目边界。
+
+#### 修改内容
+
+- 认证与账户：统一邮箱 `trim + lowercase`；Token form 键按无大小写、忽略下划线解析并支持 Android/iOS 别名；非数字 iOS device type 回退为 14；refresh 从 claim 继承设备且只输出标准字段；补全 profile、密码策略、动态注册开关、同态密码提示和 Vaultwarden camelCase 错误模型。
+- 2FA 与设备：Email 登录发码端点增加独立限流和主密码/AuthRequest 校验；仅 2025.5 前客户端自动发 Email 码；TOTP 通过 D1 `last_used` 条件更新原子消费时间步；设备读取/Push token 更新对不存在记录返回 404，`clear-token` 不再清除 remember token。
+- 健康检查与通知：根 `/alive` 和 `/api/alive` 的 GET/HEAD 均执行 `SELECT 1`；Assets 增加 `/alive` 与 `/two-factor/*` Worker 优先路由；NotificationsHub 回显二进制消息，并在存在连接时每 15 秒发送 MessagePack ping，最后连接关闭后删除 alarm。
+- 文件：附件和 Send 共用 95 MiB 限制、100,000,000 字节请求上限及约 8 MiB R2 multipart 流程；失败会 abort，元数据提交失败会清理对象；下载直接转交 R2 `ReadableStream`，JS 入口再用 `FixedLengthStream` 保留流式并生成 `Content-Length`，不再全量 `bytes()`。
+- 数据：`sql/schema.sql` 增加 `two_factor_authenticator.last_used`；当时新增过顺序迁移，随后在同日的 schema-only 基线收敛任务中并入唯一 schema 并删除。
+- 文档：README 增加迁移先于代码部署、文件限制和流式存储说明；本文件同步长期行为与验证结果。
+
+#### 涉及文件
+
+- `src/entry.js`、`src/auth.rs`、`src/error.rs`、`src/lib.rs`、`src/router.rs`、`src/notifications.rs`、`src/two_factor.rs`、`src/r2_file.rs`、`src/webauthn.rs`
+- `src/handlers/accounts.rs`、`attachments.rs`、`config.rs`、`devices.rs`、`identity.rs`、`sends.rs`、`two_factor.rs`
+- `sql/schema.sql`（当时还新增过、现已删除的 TOTP 顺序迁移）
+- `wrangler.jsonc`、`README.md`、`memory.md`
+
+#### 本地验证
+
+- `cargo test --all-targets`：57 passed、0 failed；包含邮箱、Token form、profile、refresh、客户端版本边界、TOTP 时间步、文件限制与错误模型合约。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`git diff --check`：通过。
+- `node --test tests/heavy_do_routing.test.mjs`：3 passed、0 failed。
+- `worker-build --release` 与 Wrangler `4.111.0 deploy --dry-run`：通过；dry-run 识别 335 个 Assets、D1、R2、两个 DO、两个限流绑定，未部署。
+- 本地 D1 迁移：当前 schema 与模拟旧 schema 两种路径均通过，旧 TOTP 记录保留并得到 `last_used=0`。
+- 本地 HTTP/D1/R2/DO：健康检查、动态 config、Token 别名/iOS、profile、密码提示同态延迟、设备 404/clear-token、Email 2FA 鉴权/限流/版本分支、refresh 设备继承均通过。
+- TOTP 实际启用后跨时间步登录：首次 200，同码重放 400；验证了 D1 原子消费。
+- WebSocket：SignalR 握手和自定义二进制消息回显成功，约 15 秒与 30 秒分别收到 MessagePack ping。
+- 文件：16 B 与 17 MiB+ 文件的附件上传/下载/删除通过；17 MiB+ Send 多分片上传/回读/删除通过，SHA-256 一致；声明超限和实际超限均为 413，实际超限 abort 后对象下载为 404；附件与 Send 下载均实测返回正确 `Content-Length`，内部桥接头不会泄漏。
+
+#### 特殊事项与遗留
+
+- 当时的迁移先于代码要求已被后续 schema-only 基线取代；当前升级方式是备份后用完整 schema 手动重建。
+- 未部署 Worker，未执行远程 D1 迁移或远程 D1/R2/DO 验证；本地通知使用无效占位 Webhook，后台投递失败符合测试配置且未改变现有通知实现。
+- 未运行真实 Android 2026.6.1 UI 端到端或 Desktop/Web/iOS/CLI 客户端矩阵；当前结论限于源码契约、单元测试和本地 HTTP/存储/DO 验证。
+
+### 2026-07-22：将 D1 SQL 收敛为唯一当前基线
+
+#### 用户需求
+
+确认所有历史升级 SQL 的最终结构均已正确进入 `sql/schema.sql`，随后删除除该文件以外的全部 SQL；数据库直接对齐到当天状态。本次由用户手动部署，不要求自动部署兼容或保留旧库原地升级能力。
+
+#### 修改内容
+
+- 逐一核对 17 个历史兼容迁移和 2 个 Wrangler 顺序迁移：KDF、密码 salt/迭代数、账号兼容列、单用户触发器、设备/认证请求、TOTP/Email/WebAuthn 2FA、保护操作 OTP、归档、Cipher key/附件、Send R2 字段及相应索引均已由完整 schema 表达。
+- `schema.sql` 的清理段补充旧版 `two_factor_webauthn_challenges`、两个迁移临时表，以及当前 `jwt_keys`/`two_factor_keys`，确保重建不会残留旧表、临时表、旧列或密钥数据。
+- 删除 `sql/d1-migrations/` 和 `sql/migrations/` 下全部 19 个 SQL 文件；仓库现在只有 `sql/schema.sql`。
+- 从 `wrangler.jsonc` 删除已不存在的 `migrations_dir`；README 改为 schema-only、手动、破坏性重建流程。
+- 按用户明确范围保留 `.github/workflows/push-cloudflare.yaml` 原状；其旧库迁移步骤仍引用已删除 SQL，因此本次不能用于自动数据库升级。
+
+#### 本地验证
+
+- Wrangler `4.111.0` 在隔离的本地 D1 中连续两次执行完整 schema，均为 57 条命令成功。
+- 人工加入旧版 WebAuthn/迁移临时表、遗留列和 JWT/2FA 密钥数据后再次执行 schema：最终为 18 个项目表，遗留表 0、遗留列 0、两张密钥表记录均为 0。
+- `PRAGMA foreign_key_check` 返回空结果；关键字段检查为 users 历史兼容列 10/10、Cipher key 1/1、Send R2 列 2/2、TOTP `last_used NOT NULL DEFAULT 0` 1/1。
+- D1/Miniflare 拒绝 `PRAGMA integrity_check`（`SQLITE_AUTH`）；这不是 schema 执行错误，已由重复导入、对象清单、关键列与外键检查覆盖。
+- `cargo test --all-targets`：57 passed、0 failed；`cargo fmt --all -- --check`、严格 clippy、3 个 Node 路由测试均通过。
+- Wrangler `4.111.0 deploy --dry-run` 和 release Worker 构建通过，识别 335 个 Assets、D1、R2、两个 DO 与两个限流绑定，未远程部署。
+
+#### 特殊事项与遗留
+
+- 未操作远程 D1、R2 或 Worker；手动远程执行 `schema.sql` 会清空密码库及 D1 密钥，必须先导出和备份。
+- 该任务当时按用户要求未修改 GitHub Actions；随后同日任务已恢复面向未来 `sql/migrations` 的自动增量迁移。
+
+### 2026-07-22：恢复统一基线之后的 D1 自动增量迁移
+
+#### 用户需求
+
+统一当前数据库基线后，后续数据库升级 SQL 放入 `sql/migrations` 并由自动部署执行；修改 GitHub Actions，并确认不再使用的 `sql/d1-migrations` 是否可以删除。
+
+#### 修改内容
+
+- `wrangler.jsonc` 将 `migrations_dir` 指向 `sql/migrations`；新增该目录的维护说明，约定从 `0001_*.sql` 开始顺序编号且已应用文件不可变。
+- GitHub Actions 删除所有硬编码历史 SQL、列探测和旧库兼容步骤；存在 `sql/migrations/*.sql` 时在 Worker 部署前运行 `wrangler d1 migrations apply --remote`，没有 SQL 时显式跳过。
+- 基础设施 job 获取真实 D1 ID 后立即更新本 job 的 `wrangler.jsonc`，避免新建数据库时 schema 或迁移命令误用仓库中的旧 ID；deploy job 原有的 ID 同步仍保留。
+- 新数据库的顺序固定为“导入 2026-07-22 schema 基线 → 应用全部增量迁移 → 部署 Worker”；已有数据库只应用 `d1_migrations` 尚未记录的文件。
+- `schema.sql` 增加清理 `d1_migrations`，保证本次手动破坏性对齐后从干净的迁移序列开始；确认并删除空的 `sql/d1-migrations` 目录。
+- README 说明本次手动基线对齐与后续自动增量升级的边界。
+
+#### 本地验证
+
+- Wrangler `4.111.0` 和本地 config schema 均确认支持 D1 binding 的 `migrations_dir`；Cloudflare 官方文档确认迁移文件按顺序应用并记录在 `d1_migrations`。
+- 空 `sql/migrations` 的 `wrangler d1 migrations list --local` 返回 “No migrations to apply” 且退出码为 0。
+- 临时加入 `0001_ci_validation.sql` 后，本地首次 apply 成功，第二次返回无待处理迁移；测试数据与追踪记录均为 1，证明同一文件只执行一次。验证后已删除临时 SQL，目录仅保留说明文件。
+- 再次执行 schema 后 `d1_migrations` 表数量为 0，确认本次手动基线会清理旧迁移状态。
+- PyYAML 成功解析 Workflow，并确认 D1 ID 同步、schema 初始化、应用迁移和空目录跳过步骤的顺序与 `hashFiles('sql/migrations/*.sql')` 条件正确；工作流和 Wrangler 配置中无旧迁移路径或硬编码历史 SQL 引用。
+- `git diff --check` 通过；Wrangler `deploy --dry-run` 和 release Worker 构建通过，识别 335 个 Assets、D1、R2、两个 DO 与两个限流绑定，未远程部署。
+
+#### 特殊事项与遗留
+
+- 未执行远程迁移或部署；现有生产库必须先按 README 完成本次手动基线对齐，之后才能依赖新的自动增量流程。
+- 基线后的变更只进入迁移目录，不同步回 schema；若未来再次合并基线，需要另行安排破坏性重建和迁移链重置。
+
+### 2026-07-22：统一首次部署与后续自动升级 Workflow
+
+#### 用户需求
+
+全面确认自动部署脚本同时支持两条无人值守路径：只提供 Cloudflare API Token 的全新部署，以及指定分支出现新提交后的自动升级；重点保证 D1 的真实 `database_id` 会被正确填入部署配置。
+
+#### 修改内容
+
+- Workflow 改为单一串行的“资源准备 → 测试/dry-run → schema/迁移 → 部署 → 健康检查”任务；私有仓库显式授予 `contents: read`，移除会修改远程资源的 PR 触发，保留 `main`、`uat`、`release*` push 和手动触发。
+- 同一仓库的所有部署共用固定并发组且 `cancel-in-progress=false`，避免不同分支同时修改同一 D1/R2/Worker，或新提交在迁移中途取消旧任务。
+- 唯一必选 Secret 改为 `CLOUDFLARE_API_TOKEN`。Token 只可见一个账户时自动发现 Account ID；多账户 Token 才需要可选的 `CLOUDFLARE_ACCOUNT_ID`，且歧义时安全失败而不猜测目标账户。
+- 新增 `scripts/cloudflare-provision.mjs`：使用 Cloudflare JSON API 精确查找/创建 Workers 子域、`vaultsql` D1 和 `warden-send-files` R2；未注册 Workers 子域兼容 API 错误码 `10007` 并用完整 Account ID 生成确定性名称，避免 Wrangler 交互提示。
+- D1 查找按完整名称匹配且支持分页；新建后再按返回 UUID 查询一次并核验名称/ID。随后只更新 `wrangler.jsonc` 中 `binding=vaultsql` 的对象，部署前再次验证 `database_id` 已等于 Cloudflare 返回值，不再使用人类可读输出、模糊 grep、全局 sed 或吞掉 API 错误。
+- 新 D1 仅执行一次 `schema.sql`，然后应用全部增量迁移；已有 D1 跳过 schema，只应用 `sql/migrations` 中未记录的迁移。release dry-run 在任何远程数据库变更之前完成，迁移成功后才执行真实 deploy。
+- 删除原 Workflow 中直接 PATCH Worker settings/DO bindings 的逻辑以及重复的首次/已有 Worker 部署分支；Durable Objects 生命周期继续由 `wrangler.jsonc` 的既有 SQLite migrations 和单次 `wrangler deploy` 原生处理。
+- `wrangler.jsonc` 显式设置 `workers_dev=true`；部署后对自动得出的 workers.dev URL 重试根 `/alive`。README 同步记录单 Secret 权限、可选 Account ID、首次与升级流程、真实 `database_id` 行为和旧基线的一次性人工边界。
+
+#### 本地验证
+
+- 新增 16 项部署辅助/Workflow 合约测试，与既有 3 项 HeavyDo 路由测试合计 `node --test tests/*.test.mjs` 为 19 passed、0 failed。
+- 首次部署 API 模拟确认会创建 Workers 子域、D1、R2，复核新 D1 UUID，写入 `database_id` 并输出 `d1_is_new=true`；升级模拟确认零 POST/PUT、资源全部复用且输出 `d1_is_new=false`。
+- `actionlint` 对 Workflow 无错误；PyYAML 成功解析 17 个步骤；静态合约确认 schema、migration、真实 deploy 顺序正确，且无 PR 远程部署、`sed -i`、`|| true`、`wrangler-action` 或 DO settings PATCH。
+- `cargo test --all-targets`：57 passed、0 failed；`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`git diff --check` 均通过。
+- Wrangler `4.111.0 deploy --dry-run` 和 release Worker 构建通过，识别 335 个 Assets、D1、R2、两个 SQLite DO、两个限流绑定及 `workers_dev` 路由；未执行远程部署或远程资源写入。
+
+#### 特殊事项与遗留
+
+- 本地没有使用真实 Cloudflare Token，因此未实际创建/复用远程 Account/D1/R2/Workers 子域，也未运行远程 `/alive`；这些由首次真实 Actions 运行验证。
+- Token 应将 Account Resources 限定为唯一目标账户，并包含 Account Settings Read、Workers Scripts Edit、D1 Edit、Workers R2 Storage Edit。旧式 Global API Key 需要邮箱，不属于单 Secret 自动流程。
+- 2026-07-22 统一基线之前创建且尚未手动对齐的旧 D1，仍须按 README 先完成一次基线重建；全新数据库和已对齐数据库之后可完全自动升级。
+
 ## 待处理事项
 
+- [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
+- [x] 修复设备 `clear-token`/不存在设备读取语义、profile/verify-password 响应、根 `/alive` 与通知 keepalive。
+- [ ] 将本次本地 HTTP/D1/R2/DO 验收脚本整理为仓库内可重复运行的自动化集成测试；目前新增的持久测试主要是 Rust 合约测试。
+- [ ] 使用当前 Web/Desktop/Android/iOS/CLI 和至少一个 2025.5 之前的客户端做端到端矩阵；远程验证 D1、R2、DO 和大文件限制。
 - [ ] 涉及生产行为时，按任务需要补充远程部署版本、D1/R2/DO 绑定和真实客户端验证。
-- [ ] 涉及上游同步时，重新按当前 Vaultwarden 提交窗口执行行为级兼容性审计。
 - [ ] 可选：为密码学和随机数依赖的下一主版本补齐端到端兼容测试后再单独升级。
 
 ## 最近一次任务摘要
 
-- 任务：将本机全局 Wrangler 与项目 CI 对齐到 `4.111.0`。
-- 完成内容：全局 Wrangler 从 `4.104.0` 升级到 `4.111.0`；确认 CI 已固定为同一版本。
-- 修改文件：`memory.md`；`.github/workflows/push-cloudflare.yaml` 仅核验。
-- 验证结果：版本检查和全局 Wrangler dry-run 均通过，未部署远程资源。
-- 下一步：无。
+- 任务：全面统一 GitHub Actions 的无人值守首次部署和后续自动升级，重点修复 Account ID 依赖与 D1 `database_id` 填写。
+- 结论：仅 `CLOUDFLARE_API_TOKEN` 必选；单账户 Token 自动发现 Account ID、创建或精确复用 Workers 子域/D1/R2、验证并写入真实 D1 UUID。多账户 Token 可额外设置 Account ID。
+- 关键流程：串行部署；release dry-run 先于远程数据库变更；新库 schema → 全部增量，旧库仅待处理增量；之后单次 Wrangler deploy 原生协调 DO，最后验证 `/alive`。
+- 验证结果：首次/升级 API 模拟、19 项 Node 测试、57 项 Rust 测试、fmt、严格 clippy、actionlint、YAML 解析、diff check、release 构建和 Wrangler dry-run 全部通过。
+- 未执行：真实 Cloudflare 资源创建、远程 D1 迁移、Worker 部署和远程健康检查。
