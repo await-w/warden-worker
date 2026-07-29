@@ -31,6 +31,7 @@ pub struct Profile {
     pub organizations: Vec<Value>,
     pub providers: Vec<Value>,
     pub provider_organizations: Vec<Value>,
+    pub account_keys: Value,
 }
 
 #[derive(Debug, Serialize)]

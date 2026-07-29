@@ -64,19 +64,8 @@ fn parse_rfc3339(s: &str) -> Result<DateTime<Utc>, AppError> {
 }
 
 fn request_client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("CF-Connecting-IP")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers
-                .get("X-Forwarded-For")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+    let ip = crate::auth::client_ip_from_headers(headers);
+    (ip != "0.0.0.0").then_some(ip)
 }
 
 /// Check whether Turnstile is configured. Returns `true` when both the site key
@@ -729,18 +718,24 @@ pub(crate) async fn purge_expired_sends(env: &worker::Env) -> Result<usize, AppE
     Ok(purged)
 }
 
-async fn update_send_access_count(
+async fn register_send_access(
     db: &worker::D1Database,
     send_id: &str,
-    delta: i32,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     let revision = now_rfc3339_millis();
-    db.prepare("UPDATE sends SET access_count = access_count + ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&[delta.into(), revision.clone().into(), send_id.into()])?
+    let result = db
+        .prepare(
+            "UPDATE sends
+             SET access_count = access_count + 1, updated_at = ?1
+             WHERE id = ?2
+               AND (max_access_count IS NULL OR access_count < max_access_count)",
+        )
+        .bind(&[revision.clone().into(), send_id.into()])?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
-    Ok(revision)
+    let changed = result.meta()?.and_then(|meta| meta.changes).unwrap_or(0);
+    Ok((changed == 1).then_some(revision))
 }
 
 async fn get_creator_identifier(
@@ -759,14 +754,8 @@ async fn get_creator_identifier(
     Ok(email)
 }
 
-fn validate_send_access(send: &SendDBModel) -> Result<(), AppError> {
+fn validate_send_lifetime(send: &SendDBModel) -> Result<(), AppError> {
     if send.disabled {
-        return Err(AppError::NotFound("Send not found".to_string()));
-    }
-
-    if let Some(max_access_count) = send.max_access_count
-        && send.access_count >= max_access_count
-    {
         return Err(AppError::NotFound("Send not found".to_string()));
     }
 
@@ -780,6 +769,18 @@ fn validate_send_access(send: &SendDBModel) -> Result<(), AppError> {
 
     let del = parse_rfc3339(&send.deletion_date)?;
     if now >= del {
+        return Err(AppError::NotFound("Send not found".to_string()));
+    }
+
+    Ok(())
+}
+
+fn validate_send_access(send: &SendDBModel) -> Result<(), AppError> {
+    validate_send_lifetime(send)?;
+
+    if let Some(max_access_count) = send.max_access_count
+        && send.access_count >= max_access_count
+    {
         return Err(AppError::NotFound("Send not found".to_string()));
     }
 
@@ -914,7 +915,14 @@ pub async fn issue_send_access_token(
         }
     }
 
-    let revision = update_send_access_count(&db, &send.id, 1).await?;
+    let Some(revision) = register_send_access(&db, &send.id).await? else {
+        return Ok(send_access_token_error(
+            StatusCode::NOT_FOUND,
+            "invalid_grant",
+            "send_id_invalid",
+            "Send has reached its maximum access count",
+        ));
+    };
     finish_send_mutation(
         &db,
         state,
@@ -1978,6 +1986,7 @@ pub async fn post_access(
     let send = get_send_by_id(&db, &send_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
+    validate_send_lifetime(&send)?;
     let creator_identifier = get_creator_identifier(&db, &send).await?;
 
     log::info!(target: targets::AUTH, "send.access_token.success send_id={} type={}", send.id, send.r#type);
@@ -2031,7 +2040,9 @@ pub async fn post_access_legacy(
     validate_send_password(&send, payload.password)?;
 
     if send.r#type == SEND_TYPE_TEXT {
-        let revision = update_send_access_count(&db, &send.id, 1).await?;
+        let revision = register_send_access(&db, &send.id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
         finish_send_mutation(
             &db,
             &state,
@@ -2059,6 +2070,7 @@ pub async fn post_access_file(
     let send = get_send_by_id(&db, &send_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
+    validate_send_lifetime(&send)?;
 
     let file_exists: Option<i64> = db
         .prepare("SELECT 1 AS ok FROM send_files WHERE id = ?1 AND send_id = ?2 LIMIT 1")
@@ -2137,7 +2149,9 @@ pub async fn post_access_file_legacy(
         return Err(AppError::NotFound("Send not found".to_string()));
     }
 
-    let revision = update_send_access_count(&db, &send.id, 1).await?;
+    let revision = register_send_access(&db, &send.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Send not found".to_string()))?;
     finish_send_mutation(
         &db,
         &state,
@@ -2270,7 +2284,11 @@ pub async fn download_send(
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_password, hash_password_legacy, new_salt_b64, validate_deletion_date};
+    use super::{
+        hash_password, hash_password_legacy, new_salt_b64, validate_deletion_date,
+        validate_send_access, validate_send_lifetime,
+    };
+    use crate::models::send::{SEND_TYPE_TEXT, SendDBModel};
     use base64::{Engine as _, engine::general_purpose};
     use chrono::{SecondsFormat, Utc};
 
@@ -2308,5 +2326,35 @@ mod tests {
             (Utc::now() + chrono::Duration::days(32)).to_rfc3339_opts(SecondsFormat::Millis, true);
         assert!(validate_deletion_date(&valid).is_ok());
         assert!(validate_deletion_date(&invalid).is_err());
+    }
+
+    #[test]
+    fn issued_send_token_remains_usable_at_access_limit() {
+        let future =
+            (Utc::now() + chrono::Duration::days(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let send = SendDBModel {
+            id: "send-id".to_string(),
+            user_id: "user-id".to_string(),
+            organization_id: None,
+            r#type: SEND_TYPE_TEXT,
+            name: "send".to_string(),
+            notes: None,
+            data: "{}".to_string(),
+            key: "key".to_string(),
+            password_hash: None,
+            password_salt: None,
+            password_iter: None,
+            max_access_count: Some(1),
+            access_count: 1,
+            created_at: future.clone(),
+            updated_at: future.clone(),
+            expiration_date: None,
+            deletion_date: future,
+            disabled: false,
+            hide_email: None,
+        };
+
+        assert!(validate_send_lifetime(&send).is_ok());
+        assert!(validate_send_access(&send).is_err());
     }
 }

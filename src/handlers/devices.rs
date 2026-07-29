@@ -468,28 +468,7 @@ pub(crate) async fn purge_expired_auth_requests(db: &worker::D1Database) -> Resu
 }
 
 fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("CF-Connecting-IP"))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return ip.to_string();
-    }
-
-    if let Some(ip) = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("X-Forwarded-For"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return ip.to_string();
-    }
-
-    "0.0.0.0".to_string()
+    crate::auth::client_ip_from_headers(headers)
 }
 
 fn origin_from_headers(headers: &HeaderMap) -> String {

@@ -17,7 +17,10 @@ use crate::{
     models::{
         cipher::{CipherData, CipherRequestData},
         send::SendData,
-        user::{KeyData, PreloginResponse, RegisterRequest, RegisterVerifyClaims, User},
+        user::{
+            KeyData, PreloginKdfSettings, PreloginResponse, RegisterRequest, RegisterVerifyClaims,
+            User,
+        },
     },
     notify::{self, NotifyContext, NotifyEvent},
     password,
@@ -113,12 +116,6 @@ pub struct UnlockData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeKdfRequest {
-    #[allow(dead_code)]
-    #[serde(alias = "newMasterPasswordHash", alias = "NewMasterPasswordHash")]
-    pub new_master_password_hash: String,
-    #[allow(dead_code)]
-    #[serde(alias = "Key")]
-    pub key: String,
     #[serde(
         alias = "authenticationData",
         alias = "authentication_data",
@@ -279,6 +276,18 @@ pub struct AvatarData {
 }
 
 fn profile_json(user: User, two_factor_enabled: bool) -> Value {
+    let account_keys = json!({
+        "publicKeyEncryptionKeyPair": {
+            "wrappedPrivateKey": user.private_key.clone(),
+            "publicKey": user.public_key.clone(),
+            "signedPublicKey": null,
+            "object": "publicKeyEncryptionKeyPair"
+        },
+        "securityState": null,
+        "signatureKeyPair": null,
+        "object": "privateKeys"
+    });
+
     json!({
         "id": user.id,
         "name": user.name.unwrap_or_default(),
@@ -300,6 +309,7 @@ fn profile_json(user: User, two_factor_enabled: bool) -> Value {
         "usesKeyConnector": false,
         "creationDate": user.created_at,
         "_status": 0,
+        "accountKeys": account_keys,
         "object": "profile"
     })
 }
@@ -531,6 +541,13 @@ pub async fn prelogin(
         kdf_iterations,
         kdf_memory,
         kdf_parallelism,
+        kdf_settings: PreloginKdfSettings {
+            iterations: kdf_iterations,
+            kdf_type,
+            memory: kdf_memory,
+            parallelism: kdf_parallelism,
+        },
+        salt: None,
     }))
 }
 
@@ -1314,6 +1331,8 @@ pub async fn password_hint(
     headers: HeaderMap,
     Json(payload): Json<PasswordHintRequest>,
 ) -> Result<StatusCode, AppError> {
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
+
     if !notify::is_webhook_configured(&state.env) {
         return Err(AppError::BadRequest(
             "This server is not configured to provide password hints.".to_string(),
@@ -1481,11 +1500,14 @@ pub async fn verify_password(
 #[worker::send]
 pub async fn send_verification_email(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<SendVerificationEmailRequest>,
 ) -> Result<Json<Value>, AppError> {
     use crate::models::user::RegisterVerifyClaims;
     use chrono::{Duration, Utc};
     use jsonwebtoken::{EncodingKey, Header, encode};
+
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
 
     log::info!(
         "Send verification email: name={:?}, email={}",
@@ -1559,8 +1581,11 @@ pub struct DeleteRecoverTokenData {
 #[worker::send]
 pub async fn post_delete_recover(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(data): Json<DeleteRecoverData>,
 ) -> Result<Json<Value>, AppError> {
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
+
     if notify::is_email_webhook_configured(&state.env) {
         let email = data.email.trim().to_lowercase();
         if !email.is_empty() {
@@ -2191,5 +2216,14 @@ mod tests {
         assert_eq!(profile["forcePasswordReset"], false);
         assert_eq!(profile["usesKeyConnector"], false);
         assert_eq!(profile["creationDate"], "2026-01-01T00:00:00Z");
+        assert_eq!(
+            profile["accountKeys"]["publicKeyEncryptionKeyPair"]["wrappedPrivateKey"],
+            "private"
+        );
+        assert_eq!(
+            profile["accountKeys"]["publicKeyEncryptionKeyPair"]["publicKey"],
+            "public"
+        );
+        assert_eq!(profile["accountKeys"]["securityState"], Value::Null);
     }
 }

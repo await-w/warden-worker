@@ -97,6 +97,14 @@
 				"limit": 5,
 				"period": 60
 			}
+		},
+		{
+			"name": "UNAUTHENTICATED_LIMITER",
+			"namespace_id": "2003",
+			"simple": {
+				"limit": 50,
+				"period": 60
+			}
 		}
 	],
 	"durable_objects": {

@@ -1,6 +1,6 @@
 use axum::{
     extract::FromRequestParts,
-    http::{header, request::Parts},
+    http::{HeaderMap, header, request::Parts},
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,35 @@ use worker::D1Database;
 
 pub(crate) fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+/// Returns the edge-authenticated client address used for security decisions.
+///
+/// Cloudflare Workers do not expose a peer socket address, so production
+/// requests use the `CF-Connecting-IP` value injected by Cloudflare. The
+/// forwarded-header fallback keeps local Worker development usable.
+pub(crate) fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    let parse_ip = |value: &str| {
+        value
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| ip.to_canonical().to_string())
+    };
+
+    if let Some(value) = headers
+        .get("cf-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+    {
+        return parse_ip(value).unwrap_or_else(|| "0.0.0.0".to_string());
+    }
+
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(parse_ip)
+        .unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,7 +149,8 @@ pub fn decode_delete(token: &str, jwt_secret: &str) -> Result<BasicJwtClaims, Ap
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_email;
+    use super::{client_ip_from_headers, normalize_email};
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn email_normalization_trims_and_lowercases() {
@@ -128,5 +158,16 @@ mod tests {
             normalize_email("  User.Name+Tag@Example.COM \r\n"),
             "user.name+tag@example.com"
         );
+    }
+
+    #[test]
+    fn cloudflare_client_ip_takes_precedence_and_is_validated() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.10"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.20"));
+        assert_eq!(client_ip_from_headers(&headers), "203.0.113.10");
+
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(client_ip_from_headers(&headers), "0.0.0.0");
     }
 }

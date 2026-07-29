@@ -17,6 +17,7 @@ const RECORD_SEPARATOR: u8 = 0x1e;
 const INITIAL_RESPONSE: [u8; 3] = [0x7b, 0x7d, RECORD_SEPARATOR];
 const SIGNALR_MESSAGEPACK_PING: [u8; 3] = [0x02, 0x91, 0x06];
 const KEEPALIVE_INTERVAL_MS: i64 = 15_000;
+const MAX_ANONYMOUS_CONNECTIONS_PER_IP: usize = 25;
 
 const UPDATE_TYPE_AUTH_REQUEST: i32 = 15;
 const UPDATE_TYPE_AUTH_REQUEST_RESPONSE: i32 = 16;
@@ -262,8 +263,13 @@ impl NotificationsHub {
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Error::RustError("Missing token".to_string()))?;
 
-        let tag = anon_tag(&token);
-        let tags = [tag.as_str()];
+        let token_tag = anon_tag(&token);
+        let ip_tag = anon_ip_tag(&client_ip(req));
+        if self.state.get_websockets_with_tag(&ip_tag).len() >= MAX_ANONYMOUS_CONNECTIONS_PER_IP {
+            return Response::error("Too many connections", 429);
+        }
+
+        let tags = [token_tag.as_str(), ip_tag.as_str()];
         self.accept_with_tags(&tags).await
     }
 
@@ -687,6 +693,20 @@ fn user_tag(user_id: &str) -> String {
 
 fn anon_tag(token: &str) -> String {
     format!("anon:{token}")
+}
+
+fn anon_ip_tag(ip: &str) -> String {
+    format!("anon-ip:{ip}")
+}
+
+fn client_ip(req: &Request) -> String {
+    req.headers()
+        .get("cf-connecting-ip")
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 fn is_signalr_messagepack_handshake(text: &str) -> bool {

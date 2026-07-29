@@ -15,7 +15,7 @@ test("deployment workflow supports private repositories and serializes upgrades"
 });
 
 test("deployment workflow pins the validated Rust toolchain", () => {
-  assert.match(workflow, /RUST_TOOLCHAIN: 1\.97\.0/);
+  assert.match(workflow, /RUST_TOOLCHAIN: 1\.97\.1/);
   assert.match(
     workflow,
     /rustup toolchain install "\$\{\{ env\.RUST_TOOLCHAIN \}\}" --no-self-update/,

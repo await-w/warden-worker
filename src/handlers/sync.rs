@@ -158,6 +158,17 @@ pub async fn sync(
         user.kdf_memory,
         user.kdf_parallelism,
     );
+    let account_keys = serde_json::json!({
+        "publicKeyEncryptionKeyPair": {
+            "wrappedPrivateKey": user.private_key.clone(),
+            "publicKey": user.public_key.clone(),
+            "signedPublicKey": null,
+            "object": "publicKeyEncryptionKeyPair"
+        },
+        "securityState": null,
+        "signatureKeyPair": null,
+        "object": "privateKeys"
+    });
     let profile = Profile {
         id: user.id,
         name: user.name.unwrap_or_default(),
@@ -179,6 +190,7 @@ pub async fn sync(
         organizations: Vec::new(),
         providers: Vec::new(),
         provider_organizations: Vec::new(),
+        account_keys,
     };
 
     let user_decryption = UserDecryption {

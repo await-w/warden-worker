@@ -20,6 +20,12 @@ pub struct CipherData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_account: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drivers_license: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passport: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_history: Option<Value>,
@@ -37,6 +43,9 @@ impl CipherData {
             identity: request.identity.clone(),
             secure_note: request.secure_note.clone(),
             ssh_key: request.ssh_key.clone(),
+            bank_account: request.bank_account.clone(),
+            drivers_license: request.drivers_license.clone(),
+            passport: request.passport.clone(),
             fields: request.fields.clone(),
             password_history: request.password_history.clone(),
             reprompt: request.reprompt,
@@ -237,6 +246,9 @@ impl Serialize for Cipher {
         let mut card = Value::Null;
         let mut identity = Value::Null;
         let mut ssh_key = Value::Null;
+        let mut bank_account = Value::Null;
+        let mut drivers_license = Value::Null;
+        let mut passport = Value::Null;
 
         match self.r#type {
             1 => {
@@ -259,6 +271,18 @@ impl Serialize for Cipher {
                 let mut value = data_obj.get("sshKey").cloned().unwrap_or(Value::Null);
                 normalize_ssh_key(&mut value);
                 ssh_key = value;
+            }
+            6 => {
+                bank_account = data_obj.get("bankAccount").cloned().unwrap_or(Value::Null);
+            }
+            7 => {
+                drivers_license = data_obj
+                    .get("driversLicense")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            8 => {
+                passport = data_obj.get("passport").cloned().unwrap_or(Value::Null);
             }
             _ => {}
         }
@@ -293,6 +317,9 @@ impl Serialize for Cipher {
         response_map.insert("card".to_string(), card);
         response_map.insert("identity".to_string(), identity);
         response_map.insert("sshKey".to_string(), ssh_key);
+        response_map.insert("bankAccount".to_string(), bank_account);
+        response_map.insert("driversLicense".to_string(), drivers_license);
+        response_map.insert("passport".to_string(), passport);
         response_map.insert("folderId".to_string(), json!(self.folder_id));
         response_map.insert("favorite".to_string(), json!(self.favorite));
         response_map.insert("archivedDate".to_string(), json!(self.archived_at));
@@ -488,6 +515,9 @@ mod tests {
         assert_eq!(value.get("key"), Some(&json!("2.cipher-key")));
         assert_eq!(value.get("collectionIds"), Some(&json!([])));
         assert_eq!(value.get("fields"), Some(&json!([])));
+        assert_eq!(value.get("bankAccount"), Some(&Value::Null));
+        assert_eq!(value.get("driversLicense"), Some(&Value::Null));
+        assert_eq!(value.get("passport"), Some(&Value::Null));
         assert!(
             value.get("data").is_none(),
             "current cipherDetails responses must not expose the legacy data field"
@@ -618,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn cipher_validation_rejects_blank_and_unsupported_types() {
+    fn cipher_validation_rejects_blank_and_accepts_current_types() {
         let missing_login: CipherRequestFlat = serde_json::from_value(json!({
             "type": 1,
             "name": "2.name"
@@ -637,7 +667,7 @@ mod tests {
         .expect("deserialize future type request");
         assert_eq!(
             future_type.cipher.validate_for_personal_vault("user-1"),
-            Err("This cipher type is not supported by the configured server version")
+            Ok(())
         );
 
         let attachment_rotation: CipherRequestFlat = serde_json::from_value(json!({
@@ -885,17 +915,15 @@ impl CipherRequestData {
         {
             return Err("Invalid cipher attachment key rotation data");
         }
-        if self.bank_account.is_some() || self.drivers_license.is_some() || self.passport.is_some()
-        {
-            return Err("This cipher type is not supported by the configured server version");
-        }
-
         let type_data = match self.r#type {
             1 => self.login.as_ref(),
             2 => self.secure_note.as_ref(),
             3 => self.card.as_ref(),
             4 => self.identity.as_ref(),
             5 => self.ssh_key.as_ref(),
+            6 => self.bank_account.as_ref(),
+            7 => self.drivers_license.as_ref(),
+            8 => self.passport.as_ref(),
             _ => return Err("Invalid cipher type"),
         };
 

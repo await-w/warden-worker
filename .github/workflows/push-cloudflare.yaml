@@ -17,7 +17,7 @@ env:
     D1_BINDING: vaultsql
     R2_BUCKET_NAME: warden-send-files
     WORKER_NAME: warden-worker
-    RUST_TOOLCHAIN: 1.97.0
+    RUST_TOOLCHAIN: 1.97.1
     WRANGLER_VERSION: 4.111.0
     WORKER_BUILD_VERSION: 0.8.5
 

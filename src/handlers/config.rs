@@ -30,7 +30,7 @@ pub async fn config(
         .unwrap_or("https");
     let domain = format!("{proto}://{host}");
     Ok(Json(json!({
-        "version": "2025.12.0",
+        "version": "2026.6.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
@@ -38,6 +38,7 @@ pub async fn config(
         },
         "settings": {
             "disableUserRegistration": user_exists.is_some(),
+            "suppressOnboardingInterstitials": false,
         },
         "environment": {
           "vault": domain,
@@ -54,6 +55,7 @@ pub async fn config(
         "featureStates": {
             "pm-19148-innovation-archive": true
         },
+        "communication": null,
         "object": "config",
     })))
 }

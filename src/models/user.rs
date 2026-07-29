@@ -67,6 +67,17 @@ pub struct PreloginResponse {
     pub kdf_iterations: i32,
     pub kdf_memory: Option<i32>,
     pub kdf_parallelism: Option<i32>,
+    pub kdf_settings: PreloginKdfSettings,
+    pub salt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreloginKdfSettings {
+    pub iterations: i32,
+    pub kdf_type: i32,
+    pub memory: Option<i32>,
+    pub parallelism: Option<i32>,
 }
 
 // For /accounts/register request. Bitwarden 2026.5 moved the password
@@ -191,7 +202,7 @@ pub struct KeyData {
 
 #[cfg(test)]
 mod tests {
-    use super::RegisterRequest;
+    use super::{PreloginKdfSettings, PreloginResponse, RegisterRequest};
 
     #[test]
     fn register_request_accepts_legacy_format() {
@@ -243,5 +254,27 @@ mod tests {
         assert_eq!(payload.user_symmetric_key(), "wrapped-key");
         assert!(payload.current_format_is_valid("user@example.com"));
         assert!(!payload.current_format_is_valid("other@example.com"));
+    }
+
+    #[test]
+    fn prelogin_response_contains_current_kdf_shape() {
+        let value = serde_json::to_value(PreloginResponse {
+            kdf: 1,
+            kdf_iterations: 3,
+            kdf_memory: Some(64),
+            kdf_parallelism: Some(4),
+            kdf_settings: PreloginKdfSettings {
+                iterations: 3,
+                kdf_type: 1,
+                memory: Some(64),
+                parallelism: Some(4),
+            },
+            salt: None,
+        })
+        .expect("serialize prelogin response");
+
+        assert_eq!(value["kdfSettings"]["kdfType"], 1);
+        assert_eq!(value["kdfSettings"]["iterations"], 3);
+        assert_eq!(value["salt"], serde_json::Value::Null);
     }
 }

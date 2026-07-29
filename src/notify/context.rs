@@ -27,17 +27,10 @@ pub fn extract_request_meta(headers: &HeaderMap) -> RequestMeta {
             .map(|s| s.to_string())
     };
 
-    let ip = get("CF-Connecting-IP")
-        .or_else(|| {
-            get("X-Forwarded-For").and_then(|v| {
-                v.split(',')
-                    .next()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
-        })
-        .or_else(|| get("X-Real-IP"));
+    let ip = match crate::auth::client_ip_from_headers(headers).as_str() {
+        "0.0.0.0" => None,
+        ip => Some(ip.to_string()),
+    };
 
     let user_agent = get("User-Agent");
 

@@ -25,6 +25,7 @@ use crate::{
 };
 
 const LOGIN_RATE_LIMITER_BINDING: &str = "LOGIN_LIMITER";
+const UNAUTHENTICATED_RATE_LIMITER_BINDING: &str = "UNAUTHENTICATED_LIMITER";
 
 /// 后台更新设备信息
 /// 将设备表的创建和更新操作放入后台执行，减少登录响应延迟
@@ -551,28 +552,7 @@ fn set_cookie(
 }
 
 pub(crate) fn client_ip_from_headers(headers: &HeaderMap) -> String {
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("CF-Connecting-IP"))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return ip.to_string();
-    }
-
-    if let Some(ip) = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("X-Forwarded-For"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return ip.to_string();
-    }
-
-    "0.0.0.0".to_string()
+    crate::auth::client_ip_from_headers(headers)
 }
 
 pub(crate) async fn enforce_login_rate_limit_for(
@@ -591,6 +571,24 @@ pub(crate) async fn enforce_login_rate_limit_for(
     if !outcome.success {
         return Err(AppError::TooManyRequests(
             "Too many login attempts".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn enforce_unauthenticated_rate_limit(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let limiter = match state.env.rate_limiter(UNAUTHENTICATED_RATE_LIMITER_BINDING) {
+        Ok(limiter) => limiter,
+        Err(_) => return Ok(()),
+    };
+    let key = format!("unauthenticated:{}", client_ip_from_headers(headers));
+    let outcome = limiter.limit(key).await.map_err(|_| AppError::Internal)?;
+    if !outcome.success {
+        return Err(AppError::TooManyRequests(
+            "Too many unauthenticated requests".to_string(),
         ));
     }
     Ok(())
