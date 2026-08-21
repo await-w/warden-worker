@@ -14,6 +14,8 @@
 		// 模块级别覆盖示例: info,auth=debug,external=debug
 		// 可用模块: auth, db, external, notify
 		"LOG_LEVEL": "info",
+		// 是否抑制客户端登录后的欢迎页、扩展安装提示和高级功能引导
+		"CLIENT_SUPPRESS_ONBOARDING": "false",
 		// ===============================
 		// 通知系统配置
 		// ===============================

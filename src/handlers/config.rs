@@ -9,6 +9,21 @@ use std::sync::Arc;
 
 use crate::{db, error::AppError, router::AppState};
 
+fn parse_bool(input: &str, default: bool) -> bool {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn env_bool(env: &worker::Env, key: &str, default: bool) -> bool {
+    env.var(key)
+        .ok()
+        .map(|value| parse_bool(&value.to_string(), default))
+        .unwrap_or(default)
+}
+
 #[worker::send]
 pub async fn config(
     State(state): State<Arc<AppState>>,
@@ -29,6 +44,7 @@ pub async fn config(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("https");
     let domain = format!("{proto}://{host}");
+    let suppress_onboarding = env_bool(&state.env, "CLIENT_SUPPRESS_ONBOARDING", false);
     Ok(Json(json!({
         "version": "2026.6.0",
         "gitHash": option_env!("GIT_REV"),
@@ -38,7 +54,7 @@ pub async fn config(
         },
         "settings": {
             "disableUserRegistration": user_exists.is_some(),
-            "suppressOnboardingInterstitials": false,
+            "suppressOnboardingInterstitials": suppress_onboarding,
         },
         "environment": {
           "vault": domain,
@@ -111,4 +127,21 @@ pub async fn webauthn(State(_state): State<Arc<AppState>>) -> Json<Value> {
         "data": [],
         "continuationToken": null
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool;
+
+    #[test]
+    fn client_boolean_values_follow_worker_configuration_conventions() {
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_bool(enabled, false));
+        }
+        for disabled in ["0", "false", "FALSE", "no", "off"] {
+            assert!(!parse_bool(disabled, true));
+        }
+        assert!(parse_bool("invalid", true));
+        assert!(!parse_bool("invalid", false));
+    }
 }

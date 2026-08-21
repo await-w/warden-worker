@@ -117,6 +117,9 @@ TURNSTILE_SITE_KEY
 - **TELEGRAM_CHAT_ID**：可选，接收通知的 Chat ID。可以是个人用户 ID、群组 ID 或频道 ID。通过 [@userinfobot](https://t.me/userinfobot) 获取个人 ID。
 - **TURNSTILE_SECRET_KEY**：可选但建议开启，Cloudflare Turnstile 私钥；用于匿名访问 Send 时的人机验证。可以从 Cloudflare Dashboard -> 应用程序安全 -> Turnstile -> 密钥 中获取。
 - **TURNSTILE_SITE_KEY**：可选但建议开启，Cloudflare Turnstile 站点密钥；用于匿名访问 Send 时的人机验证。可以从 Cloudflare Dashboard -> 应用程序安全 -> Turnstile -> 站点密钥 中获取。
+
+普通环境变量 `CLIENT_SUPPRESS_ONBOARDING` 可控制客户端是否隐藏登录后的欢迎页、扩展安装提示、设置扩展跳转和高级功能引导，默认值为 `false`。
+
 **人机验证说明**：开启后，匿名用户访问 Send 时会要求完成人机验证，防止被刷D1和R2的额度。
 
 ### 可选：动态 vaultwarden.css（参考 Vaultwarden 方案）

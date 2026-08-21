@@ -1572,13 +1572,15 @@ pub async fn token(
             }
 
             let user_id = user.id.clone();
-            let user_email_for_notify = Some(user.email.clone());
+            let user_email = user.email.clone();
             let device_identifier = payload.device_identifier.clone();
             let device_name = payload.device_name.clone();
             let device_type = payload.device_type;
             log::info!(
                 target: targets::AUTH,
-                "token login device id={:?} type={:?} name={:?} 2fa_provider={:?} remember={:?}",
+                "User {} logged in successfully. IP: {}. device id={:?} type={:?} name={:?} 2fa_provider={:?} remember={:?}",
+                user_email,
+                client_ip_from_headers(&headers),
                 device_identifier,
                 device_type,
                 device_name,
@@ -1661,7 +1663,7 @@ pub async fn token(
                 NotifyEvent::Login,
                 NotifyContext {
                     user_id: Some(user_id),
-                    user_email: user_email_for_notify,
+                    user_email: Some(user_email),
                     device_identifier,
                     device_name,
                     device_type,

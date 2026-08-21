@@ -24,7 +24,7 @@
   - `cargo fmt --all -- --check`
   - `node --test tests/*.test.mjs`
 - 手动部署命令：`wrangler deploy`
-- 最后更新时间：2026-07-22
+- 最后更新时间：2026-08-21
 
 ## 项目概述
 
@@ -156,7 +156,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 ## 当前项目状态
 
 - 分支/提交：`main`，本次任务开始时 HEAD 为 `3017b480c8d3aa849fc64cd27356de4094780593`（“修复编译报错”），工作树干净。
-- Vaultwarden 最新三次提交审阅基线：`D:\gitrepo\vaultwarden` 的 `660faee68e3406d33244b67eadc18524c47674c2`（2026-07-21）。
+- Vaultwarden 最近七次提交审阅基线：`D:\gitrepo\vaultwarden` 的 `46d71107f5094460dd5ecbe1dbac6e6c71e5189a`（2026-08-20）。
 - Bitwarden Android 对照基线：`C:\Users\MINI\AppData\Local\Temp\bitwarden-android-2026.6.1-bwpm` 的 `2026.6.1` 客户端实现。
 - 2026-07-22 已实施审计确认的个人密码库兼容性修复；业务代码、schema、配置、测试和文档均有改动，静态 Web Vault 未改变。
 - 当前实现覆盖账户认证、密码库同步、Ciphers、Folders、附件、Send、导入、设备、2FA、WebAuthn、实时通知和动态 Vaultwarden CSS。
@@ -548,6 +548,37 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 - 无本次任务的阻塞遗留项；属性式 dialog 的实际 UI 行为仍可在下一次真实 Web Vault 客户端回归中一并确认。
 
+### 2026-08-21：审阅 Vaultwarden 最近七次提交并同步适用变更
+
+#### 用户需求
+
+分析 `D:\gitrepo\vaultwarden` 最近七次提交，将适用变更按本仓库的单用户 Cloudflare Worker 架构合入；Web Vault 前端升级由用户手动处理。
+
+#### 审阅结论
+
+- `2629bcbe` 的组织邀请 URL 修复不适用：本仓库不实现组织管理或 SMTP 邀请。
+- `74ceaf23` 的 Debian/xx-cargo 交叉链接修复不适用：本仓库没有 Dockerfile，使用 Wasm 构建链。
+- `55f883a5` 中可配置的 `suppressOnboardingInterstitials` 适用；Playwright 测试框架不在本仓库中。
+- `b30cc085` 中 CSS ETag 缓存和 `data-encoding` 依赖更新适用；组织 collection-admin、组织事件、管理员模板、Yubico/OpenDAL、Docker/GHA 变更不适用。该提交还将 Web Vault 从 `v2026.6.4` 升到 `v2026.7.0`，本仓库静态前端仍为 `2026.6.2`，留给用户手动升级。
+- `0cefa4cc` 的成功登录日志邮箱与 IP 信息适用。
+- `9e78911a` 的 sendmail 可执行权限检查不适用：本仓库不调用 sendmail。
+- `46d71107` 的组织策略 `revisionDate` 占位字段不适用：本仓库的策略接口固定返回空数组，不生成策略对象。
+
+#### 修改内容
+
+- `src/handlers/config.rs`、`wrangler.jsonc`、`README.md`：新增 `CLIENT_SUPPRESS_ONBOARDING` 普通环境变量，默认 `false`，并映射到 `/api/config`。
+- `src/handlers/css.rs`：动态 CSS 使用内容 SHA-256 ETag，支持 `If-None-Match` 强/弱/多值校验并返回 `304`，缓存策略改为 `public, no-cache`。
+- `src/handlers/identity.rs`：成功密码登录日志包含用户邮箱与客户端 IP。
+- `Cargo.toml`、`Cargo.lock`：`data-encoding` 从 `2.11.0` 升到 `2.11.1`。
+- 未修改 `static/web-vault/**`，未执行远程部署或 Cloudflare 资源变更。
+
+#### 验证情况
+
+- `cargo test`：63 passed、0 failed。
+- `node --test tests/*.test.mjs`：20 passed、0 failed。
+- `cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- `worker-build --release`：通过。
+
 ## 待处理事项
 
 - [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
@@ -559,6 +590,6 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 最近一次任务摘要
 
-- 任务：审阅 Vaultwarden 最近三次提交并同步当前仓库适用的修复。
-- 结论：三次提交中，Custom Role dialog 选择器与 Cipher 顶层旧 `data` 字段问题适用于本仓库并已修复；新版 `rust-musl` 的 Docker 编译变量问题不适用。
-- 验证结果：Rust 1.97 严格 Clippy、58 项 Rust 测试、fmt、20 项 Node 测试、release Wasm 构建和 diff check 全部通过。
+- 任务：审阅 Vaultwarden 最近七次提交并按单用户 Worker 架构同步适用变更。
+- 结论：已合入客户端引导开关、CSS ETag、成功登录日志和重合依赖更新；组织、SMTP、Docker、原生存储与上游管理界面变更不适用。Web Vault `v2026.7.0` 升级留给用户手动处理，当前静态前端仍为 `2026.6.2`。
+- 验证结果：严格 Clippy、63 项 Rust 测试、fmt、20 项 Node 测试、release Wasm 构建和 diff check 全部通过。

@@ -1,8 +1,9 @@
 use axum::{
     extract::State,
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::router::AppState;
@@ -203,8 +204,15 @@ fn add_hide_rule(css: &mut String, comment: &str, selectors: &str) {
     css.push_str(" {\n  display: none !important;\n}\n");
 }
 
+fn etag_matches(header_value: &str, etag: &str) -> bool {
+    header_value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/") == etag
+    })
+}
+
 #[worker::send]
-pub async fn vaultwarden_css(State(state): State<Arc<AppState>>) -> Response {
+pub async fn vaultwarden_css(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let env = &state.env;
 
     let signup_disabled = env_bool(env, "VW_CSS_SIGNUP_DISABLED", false);
@@ -334,15 +342,34 @@ pub async fn vaultwarden_css(State(state): State<Arc<AppState>>) -> Response {
         css.push('\n');
     }
 
-    let mut response = Response::new(axum::body::Body::from(css));
-    *response.status_mut() = StatusCode::OK;
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(css.as_bytes())));
+    let not_modified = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| etag_matches(value, &etag));
+
+    let mut response = if not_modified {
+        let mut response = Response::new(axum::body::Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response
+    } else {
+        let mut response = Response::new(axum::body::Body::from(css));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        );
+        response
+    };
+
     response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/css; charset=utf-8"),
+        header::ETAG,
+        HeaderValue::from_bytes(etag.as_bytes()).expect("SHA-256 ETag is always a valid header"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=300"),
+        HeaderValue::from_static("public, no-cache"),
     );
 
     response
@@ -350,7 +377,7 @@ pub async fn vaultwarden_css(State(state): State<Arc<AppState>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_BASE_CSS;
+    use super::{DEFAULT_BASE_CSS, etag_matches};
 
     #[test]
     fn custom_role_rules_match_element_and_attribute_dialogs() {
@@ -362,5 +389,15 @@ mod tests {
             ":is(bit-dialog, [bit-dialog]) div.tw-col-span-4:has(input[formcontrolname*=\"access\"], input[formcontrolname*=\"manage\"])",
         ));
         assert!(!DEFAULT_BASE_CSS.contains("\nbit-dialog div.tw-ml-4"));
+    }
+
+    #[test]
+    fn css_etag_accepts_strong_weak_multiple_and_wildcard_validators() {
+        let etag = "\"0123456789abcdef\"";
+        assert!(etag_matches(etag, etag));
+        assert!(etag_matches("W/\"0123456789abcdef\"", etag));
+        assert!(etag_matches("\"stale\", W/\"0123456789abcdef\"", etag));
+        assert!(etag_matches("*", etag));
+        assert!(!etag_matches("\"stale\"", etag));
     }
 }
