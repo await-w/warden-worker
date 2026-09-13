@@ -65,6 +65,22 @@ fn now_string() -> String {
     db::now_rfc3339_millis()
 }
 
+#[derive(Debug, PartialEq)]
+enum ArchiveUpdate {
+    Set(String),
+    Clear,
+    Preserve,
+}
+
+fn archive_update_for_full_cipher(value: Option<&str>) -> ArchiveUpdate {
+    match value {
+        None => ArchiveUpdate::Clear,
+        Some(value) => normalize_optional_rfc3339(Some(value))
+            .map(ArchiveUpdate::Set)
+            .unwrap_or(ArchiveUpdate::Preserve),
+    }
+}
+
 async fn finish_cipher_mutation(
     db: &D1Database,
     state: &Arc<AppState>,
@@ -391,11 +407,14 @@ pub async fn update_cipher(
     }
     validate_folder(&db, cipher_data_req.folder_id.as_deref(), &claims.sub).await?;
 
-    let requested_archived_at =
-        normalize_optional_rfc3339(cipher_data_req.archived_date.as_deref());
-    let archived_at = requested_archived_at
-        .clone()
-        .or_else(|| existing_cipher.archived_at.clone());
+    // A null archivedDate explicitly means "unarchive". An invalid non-null date
+    // is ignored, matching Vaultwarden's existing full-update behavior.
+    let archive_update = archive_update_for_full_cipher(cipher_data_req.archived_date.as_deref());
+    let archived_at = match &archive_update {
+        ArchiveUpdate::Set(value) => Some(value.clone()),
+        ArchiveUpdate::Clear => None,
+        ArchiveUpdate::Preserve => existing_cipher.archived_at.clone(),
+    };
 
     let cipher_data = CipherData::from_request(&cipher_data_req);
 
@@ -442,8 +461,14 @@ pub async fn update_cipher(
 
     update_attachment_keys(&db, &id, &claims.sub, cipher_data_req.attachments2.as_ref()).await?;
 
-    if let Some(archived_at) = &requested_archived_at {
-        archive::save(&db, &claims.sub, &id, archived_at).await?;
+    match archive_update {
+        ArchiveUpdate::Set(archived_at) => {
+            archive::save(&db, &claims.sub, &id, &archived_at).await?;
+        }
+        ArchiveUpdate::Clear => archive::delete(&db, &claims.sub, &id).await?,
+        ArchiveUpdate::Preserve => {
+            log::warn!("Ignoring invalid archivedDate while updating cipher {id}");
+        }
     }
 
     finish_cipher_mutation(
@@ -1327,4 +1352,22 @@ pub async fn put_cipher_partial(
     .await?;
 
     Ok(Json(cipher))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArchiveUpdate, archive_update_for_full_cipher};
+
+    #[test]
+    fn full_cipher_update_clears_archive_for_null_and_ignores_invalid_dates() {
+        assert_eq!(archive_update_for_full_cipher(None), ArchiveUpdate::Clear);
+        assert_eq!(
+            archive_update_for_full_cipher(Some("not-a-date")),
+            ArchiveUpdate::Preserve
+        );
+        assert!(matches!(
+            archive_update_for_full_cipher(Some("2026-09-09T12:34:56.000Z")),
+            ArchiveUpdate::Set(_)
+        ));
+    }
 }

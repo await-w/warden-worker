@@ -682,6 +682,16 @@ pub async fn delete_all_two_factors(db: &D1Database, user_id: &str) -> Result<()
     Ok(())
 }
 
+/// Revoke every remembered-device bypass after credentials or 2FA settings change.
+pub async fn clear_remember_tokens(db: &D1Database, user_id: &str) -> Result<(), AppError> {
+    db.prepare("UPDATE devices SET remember_token_hash = NULL WHERE user_id = ?1")
+        .bind(&[user_id.into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{generate_totp_secret_base32_20, match_totp_time_step};

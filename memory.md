@@ -579,6 +579,33 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
 - `worker-build --release`：通过。
 
+### 2026-09-13：审阅 Vaultwarden 最近 20 次提交并同步适用的服务端逻辑
+
+#### 用户需求
+
+检查 `D:\gitrepo\vaultwarden` 最近 20 次提交，将适用于本仓库的修改逻辑合入；不同步 Web Vault 或管理页前端资源。
+
+#### 审阅结论
+
+- 已合入：`eb212e23` 的 `archivedDate: null` 取消归档；`e992cbb4` 的注册令牌 JSON/纯文本内容协商；`f1c36b8c` 的 prelogin 与 AuthRequest 匿名限流；`f1ff6130` 的凭据/2FA 变更后撤销记住设备；`277e1536` 的 Email 2FA 凭据失败 IP/用户名/设备日志；`2ffad877` 的多客户端主密码管理功能标记。
+- 已存在：`fa2566d1` 的新版主密码修改请求已由本仓库 `29c2f87` 同步。
+- 不适用：组织/SSO/SMTP 管理恢复、MariaDB 迁移、Diesel 写入方式、原生 Reqwest/OpenDAL/S3 客户端、Docker 与原生 Rust 镜像/工具链、上游管理页静态资源，以及纯注释/无行为重构。
+
+#### 修改内容
+
+- `src/handlers/ciphers.rs`：完整 Cipher 更新收到 `archivedDate: null` 时删除 D1 archive 记录；合法日期保存，非法非空日期继续忽略并保留旧值。
+- `src/handlers/accounts.rs`、`devices.rs`：prelogin、AuthRequest 创建和匿名查询接入现有 `UNAUTHENTICATED_LIMITER`；注册令牌仅在 `Accept` 明确首选 `application/json` 时返回 JSON，其余返回纯文本。
+- `src/handlers/identity.rs`、`two_factor.rs`及相关 handler：2FA remember token 以 SHA-256 存入设备记录，登录时同时校验 JWT 和 D1 hash；主密码、邮箱、KDF、密钥轮换、初始密码设置、2FA 禁用或恢复均清空所有设备的记住令牌。
+- `src/handlers/two_factor.rs`：Email 2FA 错误凭据日志补全客户端 IP 及提交的邮箱或设备标识。
+- `src/handlers/config.rs`：启用 `pm-32413-multi-client-password-management`；未修改 `static/web-vault/**`。
+
+#### 本地验证
+
+- `cargo test --all-targets`：67 passed、0 failed（后续新增 archive 回归测试后为 68 项）。
+- `cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- `node --test tests/*.test.mjs`：20 passed、0 failed；沙箱内 Node test runner 因 Windows `spawn EPERM` 无法启动子进程，在获批的沙箱外重跑通过。
+- `worker-build --release`：通过。未执行远程部署，也未更新前端。
+
 ## 待处理事项
 
 - [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
@@ -590,6 +617,6 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 最近一次任务摘要
 
-- 任务：审阅 Vaultwarden 最近七次提交并按单用户 Worker 架构同步适用变更。
-- 结论：已合入客户端引导开关、CSS ETag、成功登录日志和重合依赖更新；组织、SMTP、Docker、原生存储与上游管理界面变更不适用。Web Vault `v2026.7.0` 升级留给用户手动处理，当前静态前端仍为 `2026.6.2`。
-- 验证结果：严格 Clippy、63 项 Rust 测试、fmt、20 项 Node 测试、release Wasm 构建和 diff check 全部通过。
+- 任务：审阅 Vaultwarden 最近 20 次提交，同步适用于单用户 Cloudflare Worker 架构的服务端逻辑，跳过前端。
+- 结论：已合入归档取消修复、注册令牌内容协商、匿名端点限流、2FA remember token 撤销与持久化校验、Email 2FA 失败日志和多客户端主密码管理功能标记；新版主密码请求此前已同步。
+- 验证：Rust 测试、严格 Clippy、fmt、Node 测试、release Wasm 构建和 diff check 通过；未修改 `static/web-vault/**`，未部署。

@@ -69,7 +69,8 @@ pub async fn config(
           "vapidPublicKey": null
         },
         "featureStates": {
-            "pm-19148-innovation-archive": true
+            "pm-19148-innovation-archive": true,
+            "pm-32413-multi-client-password-management": true
         },
         "communication": null,
         "object": "config",

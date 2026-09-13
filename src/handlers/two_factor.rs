@@ -327,6 +327,7 @@ pub async fn disable_authenticator_vw(
             two_factor::decrypt_secret_with_key(&state.two_factor_key, &claims.sub, &secret_enc)?;
         if secret_encoded.eq_ignore_ascii_case(payload.key.trim()) {
             two_factor::disable_authenticator(&db, &claims.sub).await?;
+            two_factor::clear_remember_tokens(&db, &claims.sub).await?;
         } else {
             return Err(AppError::BadRequest(
                 "TOTP key does not match recorded value".to_string(),
@@ -430,6 +431,7 @@ pub async fn authenticator_disable(
     }
 
     two_factor::disable_authenticator(&db, &claims.sub).await?;
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
 
     let meta = notify::extract_request_meta(&headers);
     notify::notify_background(
@@ -765,12 +767,18 @@ pub async fn send_email_login(
 
         let result: Option<serde_json::Value> = db
             .prepare("SELECT id FROM users WHERE email = ?1")
-            .bind(&[email.into()])?
+            .bind(&[email.clone().into()])?
             .first(None)
             .await
             .map_err(|_| AppError::Database)?;
 
         let Some(row) = result else {
+            log::warn!(
+                target: targets::AUTH,
+                "email 2fa login failed: invalid credentials. IP: {}. Username: {}.",
+                super::identity::client_ip_from_headers(&headers),
+                email
+            );
             return Err(AppError::Unauthorized(
                 "Username or password is incorrect".to_string(),
             ));
@@ -787,6 +795,12 @@ pub async fn send_email_login(
             .filter(|hash| !hash.is_empty())
         {
             if !password::verify_user_password(&db, &user_id, master_password_hash).await? {
+                log::warn!(
+                    target: targets::AUTH,
+                    "email 2fa login failed: invalid credentials. IP: {}. Username: {}.",
+                    super::identity::client_ip_from_headers(&headers),
+                    email
+                );
                 return Err(AppError::Unauthorized(
                     "Username or password is incorrect".to_string(),
                 ));
@@ -876,6 +890,12 @@ pub async fn send_email_login(
     };
 
     let Some(user_id) = user_id else {
+        log::warn!(
+            target: targets::AUTH,
+            "email 2fa login failed: invalid credentials. IP: {}. Device: {}.",
+            super::identity::client_ip_from_headers(&headers),
+            payload.device_identifier.as_deref().unwrap_or("unknown")
+        );
         return Err(AppError::Unauthorized(
             "Username or password is incorrect".to_string(),
         ));
@@ -957,6 +977,7 @@ pub async fn disable_email(
     payload.validate(&db, &claims.sub).await?;
 
     two_factor::delete_email_2fa(&db, &claims.sub).await?;
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
 
     log::info!(
         target: targets::AUTH,
@@ -1066,6 +1087,8 @@ pub async fn disable_twofactor(
             )));
         }
     }
+
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
 
     // 发送通知
     let provider_name = match type_ {
@@ -1220,6 +1243,7 @@ pub async fn recover(
     }
 
     two_factor::delete_all_two_factors(&db, &user_id).await?;
+    two_factor::clear_remember_tokens(&db, &user_id).await?;
     two_factor::clear_recovery_code(&db, &user_id).await?;
 
     log::info!(

@@ -1,5 +1,9 @@
-use axum::http::{HeaderMap, StatusCode};
-use axum::{Json, extract::State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::{
+    Json,
+    extract::State,
+    response::{IntoResponse, Response},
+};
 use chrono::Utc;
 use rand::{Rng, distributions::Alphanumeric};
 use serde::Deserialize;
@@ -511,8 +515,11 @@ pub async fn revision_date(
 #[worker::send]
 pub async fn prelogin(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<PreloginResponse>, AppError> {
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
+
     let email = crate::auth::normalize_email(
         payload["email"]
             .as_str()
@@ -850,6 +857,8 @@ pub async fn change_master_password(
     .await
     .map_err(|_| AppError::Database)?;
 
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
+
     crate::notifications::publish_user_update_background(
         &state.ctx,
         state.env.clone(),
@@ -962,6 +971,8 @@ pub async fn change_email(
             AppError::Database
         }
     })?;
+
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
 
     crate::notifications::publish_user_update_background(
         &state.ctx,
@@ -1085,6 +1096,8 @@ pub async fn post_kdf(
     .run()
     .await
     .map_err(|_| AppError::Database)?;
+
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
 
     crate::notifications::publish_user_update_background(
         &state.ctx,
@@ -1345,6 +1358,8 @@ pub async fn rotate_user_account_keys(
     .await
     .map_err(|_| AppError::Database)?;
 
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
+
     crate::notifications::publish_user_update_background(
         &state.ctx,
         state.env.clone(),
@@ -1555,7 +1570,7 @@ pub async fn send_verification_email(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(payload): Json<SendVerificationEmailRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     use crate::models::user::RegisterVerifyClaims;
     use chrono::{Duration, Utc};
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1587,9 +1602,51 @@ pub async fn send_verification_email(
     )
     .map_err(|_| AppError::Internal)?;
 
-    // Return token as JSON to skip email verification
-    // This makes the client go directly to password entry instead of "check your email" screen
-    Ok(Json(json!(token)))
+    // Newer iOS clients expect the direct registration token as plain text, while
+    // clients that explicitly request JSON still expect a JSON string.
+    if accepts_json(&headers) {
+        Ok(Json(json!(token)).into_response())
+    } else {
+        Ok(token.into_response())
+    }
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    let mut preferred: Option<(&str, f32, u8)> = None;
+    for item in accept.split(',') {
+        let mut parts = item.split(';');
+        let media_type = parts.next().unwrap_or_default().trim();
+        let quality = parts
+            .find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                name.eq_ignore_ascii_case("q")
+                    .then(|| value.trim().parse::<f32>().ok())
+                    .flatten()
+            })
+            .unwrap_or(1.0);
+        if quality <= 0.0 {
+            continue;
+        }
+        let specificity = match media_type {
+            "*/*" => 0,
+            value if value.ends_with("/*") => 1,
+            _ => 2,
+        };
+        if preferred.is_none_or(|(_, best_quality, best_specificity)| {
+            quality > best_quality || (quality == best_quality && specificity > best_specificity)
+        }) {
+            preferred = Some((media_type, quality, specificity));
+        }
+    }
+
+    preferred.is_some_and(|(media_type, _, _)| media_type.eq_ignore_ascii_case("application/json"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2141,6 +2198,8 @@ pub async fn post_set_password(
     .await
     .map_err(|_| AppError::Database)?;
 
+    two_factor::clear_remember_tokens(&db, &claims.sub).await?;
+
     Ok(Json(json!({
         "object": "set-password",
         "captchaBypassToken": ""
@@ -2150,6 +2209,25 @@ pub async fn post_set_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accept_headers(value: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(header::ACCEPT, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn registration_token_uses_json_only_when_preferred_explicitly() {
+        assert!(!accepts_json(&accept_headers(None)));
+        assert!(!accepts_json(&accept_headers(Some("*/*"))));
+        assert!(!accepts_json(&accept_headers(Some(
+            "application/json;q=0.5, text/plain;q=1"
+        ))));
+        assert!(accepts_json(&accept_headers(Some("application/json"))));
+        assert!(accepts_json(&accept_headers(Some("*/*, application/json"))));
+    }
 
     #[test]
     fn clean_password_hint_none() {

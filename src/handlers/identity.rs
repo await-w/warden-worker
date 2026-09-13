@@ -512,14 +512,68 @@ async fn verify_remember_token_async(
     device_uuid: &str,
     user_uuid: &str,
     state: &Arc<AppState>,
+    db: &worker::D1Database,
 ) -> Result<bool, AppError> {
     let jwt_keys = state.jwt_keys.clone();
-    Ok(verify_remember_token(
-        token,
-        device_uuid,
-        user_uuid,
-        &jwt_keys.access_secret,
+    if !verify_remember_token(token, device_uuid, user_uuid, &jwt_keys.access_secret) {
+        return Ok(false);
+    }
+
+    ensure_devices_table(db).await?;
+    let stored_hash: Option<String> = db
+        .prepare(
+            "SELECT remember_token_hash FROM devices
+             WHERE user_id = ?1 AND device_identifier = ?2 LIMIT 1",
+        )
+        .bind(&[user_uuid.into(), device_uuid.into()])?
+        .first(Some("remember_token_hash"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    let Some(stored_hash) = stored_hash else {
+        return Ok(false);
+    };
+    let supplied_hash = sha256_hex(token);
+    Ok(constant_time_eq(
+        stored_hash.as_bytes(),
+        supplied_hash.as_bytes(),
     ))
+}
+
+async fn persist_remember_token(
+    db: &worker::D1Database,
+    user_uuid: &str,
+    device_uuid: &str,
+    device_name: Option<&str>,
+    device_type: Option<i32>,
+    token: &str,
+) -> Result<(), AppError> {
+    ensure_devices_table(db).await?;
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO devices (
+            id, user_id, device_identifier, device_name, device_type,
+            remember_token_hash, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(user_id, device_identifier) DO UPDATE SET
+           updated_at = excluded.updated_at,
+           device_name = COALESCE(excluded.device_name, devices.device_name),
+           device_type = COALESCE(excluded.device_type, devices.device_type),
+           remember_token_hash = excluded.remember_token_hash",
+    )
+    .bind(&[
+        Uuid::new_v4().to_string().into(),
+        user_uuid.into(),
+        device_uuid.into(),
+        js_opt_string(device_name.map(str::to_string)),
+        js_opt_i64(device_type.map(i64::from)),
+        sha256_hex(token).into(),
+        now.clone().into(),
+        now.into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
 }
 
 fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1217,6 +1271,7 @@ pub async fn token(
                         device_identifier,
                         &user.id,
                         &state,
+                        &db,
                     )
                     .await?;
                     if !valid {
@@ -1263,6 +1318,7 @@ pub async fn token(
                         device_identifier,
                         &user.id,
                         &state,
+                        &db,
                     )
                     .await?;
                     if !valid {
@@ -1493,6 +1549,7 @@ pub async fn token(
                     );
 
                     two_factor::delete_all_two_factors(&db, &user.id).await?;
+                    two_factor::clear_remember_tokens(&db, &user.id).await?;
                     two_factor::clear_recovery_code(&db, &user.id).await?;
 
                     // 发送恢复通知
@@ -1591,6 +1648,21 @@ pub async fn token(
             let mut response =
                 generate_tokens_and_response(user, &state, device_identifier.clone(), None).await?;
             let remember_token_to_set = remember_token_to_return.clone();
+
+            if let (Some(token), Some(device_identifier)) = (
+                remember_token_to_set.as_deref(),
+                device_identifier.as_deref(),
+            ) {
+                persist_remember_token(
+                    &db,
+                    &user_id,
+                    device_identifier,
+                    device_name.as_deref(),
+                    device_type,
+                    token,
+                )
+                .await?;
+            }
 
             // 后台异步更新设备信息，减少登录响应延迟
             if let Some(device_identifier) = device_identifier.clone() {

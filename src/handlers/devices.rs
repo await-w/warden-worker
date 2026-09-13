@@ -600,6 +600,8 @@ pub async fn post_auth_request(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AuthRequestRequest>,
 ) -> Result<Json<Value>, AppError> {
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
+
     let db = db::get_db(&state.env)?;
     ensure_device_management_tables(&db).await?;
     purge_expired_auth_requests(&db).await?;
@@ -936,6 +938,8 @@ pub async fn get_auth_request_response(
     Path(auth_request_id): Path<String>,
     Query(query): Query<AuthRequestResponseQuery>,
 ) -> Result<Response, AppError> {
+    super::identity::enforce_unauthenticated_rate_limit(&state, &headers).await?;
+
     let db = db::get_db(&state.env)?;
     ensure_auth_requests_table(&db).await?;
     purge_expired_auth_requests(&db).await?;
