@@ -178,6 +178,10 @@ pub fn api_router_with_keys(
         .route("/api/accounts/email", post(accounts::change_email))
         .route("/api/accounts/kdf", post(accounts::post_kdf))
         .route(
+            "/api/accounts/key-management/user-key-id",
+            post(accounts::post_user_key_id),
+        )
+        .route(
             "/api/accounts/key-management/rotate-user-account-keys",
             post(accounts::rotate_user_account_keys),
         )

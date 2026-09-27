@@ -353,6 +353,7 @@ fn profile_json(user: User, two_factor_enabled: bool) -> Value {
         "privateKey": user.private_key,
         "securityStamp": user.security_stamp,
         "organizations": [],
+        "organizationsNew": [],
         "providers": [],
         "providerOrganizations": [],
         "forcePasswordReset": false,
@@ -685,6 +686,7 @@ pub async fn register(
         master_password_hash: server_password.hash,
         master_password_hint,
         key: user_symmetric_key,
+        key_id: None,
         private_key: payload.user_asymmetric_keys.encrypted_private_key,
         public_key: payload.user_asymmetric_keys.public_key,
         kdf_type,
@@ -1122,6 +1124,41 @@ pub async fn post_kdf(
     );
 
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserKeyIdRequest {
+    pub user_key_id: String,
+}
+
+const SET_USER_KEY_ID_SQL: &str =
+    "UPDATE users SET key_id = ?1, updated_at = ?2 WHERE id = ?3 AND key_id IS NULL";
+
+#[worker::send]
+pub async fn post_user_key_id(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<UserKeyIdRequest>,
+) -> Result<StatusCode, AppError> {
+    let db = db::get_db(&state.env)?;
+    claims.verify_security_stamp(&db).await?;
+    // The conditional write also prevents concurrent initializations from
+    // replacing a key ID that another client has already set.
+    let result = db
+        .prepare(SET_USER_KEY_ID_SQL)
+        .bind(&[
+            payload.user_key_id.into(),
+            db::now_rfc3339_millis().into(),
+            claims.sub.into(),
+        ])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    if result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) != 1 {
+        return Err(AppError::UnprocessableEntity("Unexpected data".to_string()));
+    }
+    Ok(StatusCode::OK)
 }
 
 async fn owned_ids(
@@ -2413,6 +2450,7 @@ mod tests {
                 master_password_hash: "hash".to_string(),
                 master_password_hint: None,
                 key: "key".to_string(),
+                key_id: None,
                 private_key: "private".to_string(),
                 public_key: "public".to_string(),
                 kdf_type: 0,
@@ -2433,6 +2471,7 @@ mod tests {
         );
         assert_eq!(profile["_status"], 0);
         assert_eq!(profile["providers"], json!([]));
+        assert_eq!(profile["organizationsNew"], json!([]));
         assert_eq!(profile["providerOrganizations"], json!([]));
         assert_eq!(profile["forcePasswordReset"], false);
         assert_eq!(profile["usesKeyConnector"], false);

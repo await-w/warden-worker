@@ -287,6 +287,7 @@ Wrangler 使用 D1 的 `d1_migrations` 表记录已执行的文件，因此后�
 - `PUT /api/accounts/password` - 修改主密码
 - `PUT /api/accounts/email` - 修改邮箱
 - `POST /api/accounts/kdf` - 更新 KDF 设置
+- `POST /api/accounts/key-management/user-key-id` - 初始化用户密钥 ID（仅允许一次）
 
 ### 设备管理
 - `GET /api/devices` - 获取设备列表

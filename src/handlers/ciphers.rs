@@ -236,6 +236,18 @@ async fn create_cipher_inner(
 ) -> Result<Cipher, AppError> {
     let db = db::get_db(&state.env)?;
     claims.verify_security_stamp(&db).await?;
+    let user_key_id: Option<String> = if cipher_data_req.encrypted_by_key_id.is_some() {
+        db.prepare("SELECT key_id FROM users WHERE id = ?1")
+            .bind(&[claims.sub.clone().into()])?
+            .first(Some("key_id"))
+            .await
+            .map_err(|_| AppError::Database)?
+    } else {
+        None
+    };
+    cipher_data_req
+        .validate_encryption_context(&claims.sub, user_key_id.as_deref())
+        .map_err(|message| AppError::UnprocessableEntity(message.to_string()))?;
     archive::ensure_table(&db).await?;
     cipher_data_req
         .validate_for_personal_vault(&claims.sub)

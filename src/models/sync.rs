@@ -6,6 +6,7 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase")]
 pub struct UserDecryption {
     pub master_password_unlock: Value,
+    pub user_key_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,6 +30,7 @@ pub struct Profile {
     pub key: String,
     pub culture: String,
     pub organizations: Vec<Value>,
+    pub organizations_new: Vec<Value>,
     pub providers: Vec<Value>,
     pub provider_organizations: Vec<Value>,
     pub account_keys: Value,
@@ -41,9 +43,34 @@ pub struct SyncResponse {
     pub folders: Vec<FolderResponse>,
     pub collections: Vec<Value>,
     pub policies: Vec<Value>,
+    pub policies_new: Vec<Value>,
     pub ciphers: Vec<Cipher>,
     pub sends: Vec<Value>,
     pub domains: Value,
     pub user_decryption: UserDecryption,
     pub object: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserDecryption;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn sync_user_key_id_is_null_until_initialized() {
+        for key_id in [None, Some("key-1".to_string())] {
+            let expected = json!(key_id);
+            let response = serde_json::to_value(UserDecryption {
+                master_password_unlock: json!({"masterKeyWrappedUserKey": "encrypted-key"}),
+                user_key_id: key_id,
+            })
+            .unwrap();
+            assert_eq!(response.get("userKeyId"), Some(&expected));
+            assert_eq!(
+                response["masterPasswordUnlock"]["masterKeyWrappedUserKey"],
+                "encrypted-key"
+            );
+            assert_eq!(response.get("user_key_id"), None::<&Value>);
+        }
+    }
 }

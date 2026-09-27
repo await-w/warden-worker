@@ -11,6 +11,8 @@ pub struct User {
     pub master_password_hash: String,
     pub master_password_hint: Option<String>,
     pub key: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
     pub private_key: String,
     pub public_key: String,
     pub kdf_type: i32,

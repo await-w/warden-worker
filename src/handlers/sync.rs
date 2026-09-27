@@ -188,12 +188,14 @@ pub async fn sync(
         private_key: user.private_key,
         culture: "en-US".to_string(),
         organizations: Vec::new(),
+        organizations_new: Vec::new(),
         providers: Vec::new(),
         provider_organizations: Vec::new(),
         account_keys,
     };
 
     let user_decryption = UserDecryption {
+        user_key_id: user.key_id,
         master_password_unlock: serde_json::json!({
             "kdf": {
                 "kdfType": user.kdf_type,
@@ -218,6 +220,7 @@ pub async fn sync(
         folders,
         collections: Vec::new(),
         policies: Vec::new(),
+        policies_new: Vec::new(),
         ciphers,
         sends,
         domains,

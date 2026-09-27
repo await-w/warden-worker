@@ -461,10 +461,84 @@ fn normalize_secure_note(secure_note: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cipher, CipherDBModel, CipherData, CipherRequestFlat, CreateCipherRequest,
-        client_revision_is_stale, normalize_optional_rfc3339,
+        Cipher, CipherDBModel, CipherData, CipherRequestData, CipherRequestFlat,
+        CreateCipherRequest, client_revision_is_stale, normalize_optional_rfc3339,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn cipher_creation_validates_encryption_context_and_allows_legacy_clients() {
+        let mut request: CipherRequestData = serde_json::from_value(json!({
+            "type": 1,
+            "name": "encrypted-name",
+            "login": {"username": "encrypted-username"}
+        }))
+        .unwrap();
+        assert!(request.validate_encryption_context("user-1", None).is_ok());
+        assert!(
+            request
+                .validate_encryption_context("user-1", Some("key-1"))
+                .is_ok()
+        );
+
+        request.encrypted_for = Some("user-1".to_string());
+        request.encrypted_by_key_id = Some("key-1".to_string());
+        assert!(request.validate_encryption_context("user-1", None).is_ok());
+        assert!(
+            request
+                .validate_encryption_context("user-1", Some("key-1"))
+                .is_ok()
+        );
+        assert_eq!(
+            request.validate_encryption_context("user-1", Some("key-2")),
+            Err("Invalid key cipher")
+        );
+        request.encrypted_for = Some("user-2".to_string());
+        assert_eq!(
+            request.validate_encryption_context("user-1", Some("key-1")),
+            Err("Invalid user cipher")
+        );
+    }
+
+    #[test]
+    fn new_item_types_preserve_encrypted_data_through_storage_and_api_serialization() {
+        for (cipher_type, field) in [(6, "bankAccount"), (7, "driversLicense"), (8, "passport")] {
+            let type_data = json!({"number": "2.encrypted-number", "name": "2.encrypted-name"});
+            let request: CipherRequestData = serde_json::from_value(json!({
+                "type": cipher_type,
+                "name": "2.item-name",
+                field: type_data,
+                "encryptedFor": "user-1",
+                "encryptedByKeyId": "key-1"
+            }))
+            .unwrap();
+            request.validate_for_personal_vault("user-1").unwrap();
+            let stored_data = serde_json::to_string(&CipherData::from_request(&request)).unwrap();
+            let cipher: Cipher = CipherDBModel {
+                id: "cipher-1".to_string(),
+                user_id: "user-1".to_string(),
+                organization_id: None,
+                r#type: cipher_type,
+                data: stored_data,
+                key: None,
+                favorite: 0,
+                folder_id: None,
+                deleted_at: None,
+                archived_at: None,
+                created_at: "2026-09-27T00:00:00.000Z".to_string(),
+                updated_at: "2026-09-27T00:00:00.000Z".to_string(),
+            }
+            .into();
+            let response = serde_json::to_value(cipher).unwrap();
+            assert_eq!(response["type"], cipher_type);
+            assert_eq!(response[field], type_data);
+            for other_field in ["bankAccount", "driversLicense", "passport"] {
+                if other_field != field {
+                    assert_eq!(response[other_field], Value::Null);
+                }
+            }
+        }
+    }
 
     #[test]
     fn cipher_serialization_matches_current_details_shape() {
@@ -894,9 +968,34 @@ pub struct CipherRequestData {
     pub archived_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_by_key_id: Option<String>,
 }
 
 impl CipherRequestData {
+    pub fn validate_encryption_context(
+        &self,
+        user_id: &str,
+        user_key_id: Option<&str>,
+    ) -> Result<(), &'static str> {
+        // Older clients omit these fields. Validate each supplied context
+        // without requiring metadata that those clients cannot send.
+        if self
+            .encrypted_for
+            .as_deref()
+            .is_some_and(|encrypted_for| encrypted_for != user_id)
+        {
+            return Err("Invalid user cipher");
+        }
+        if let (Some(cipher_key_id), Some(user_key_id)) =
+            (self.encrypted_by_key_id.as_deref(), user_key_id)
+            && cipher_key_id != user_key_id
+        {
+            return Err("Invalid key cipher");
+        }
+        Ok(())
+    }
+
     pub fn validate_for_personal_vault(&self, user_id: &str) -> Result<(), &'static str> {
         if self.organization_id.is_some() {
             return Err("Organization ciphers are not supported by this personal vault");

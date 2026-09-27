@@ -15,7 +15,7 @@
 - 主要技术栈：Rust 2024、WebAssembly、worker-rs、Axum、JavaScript、Cloudflare Workers、D1、R2、Durable Objects
 - 数据与鉴权：SQLite/D1、JWT、PBKDF2-HMAC-SHA256、Argon2id 兼容、TOTP、WebAuthn
 - 构建工具：Cargo、`worker-build`、Node.js、Wrangler
-- CI 固定版本：Rust `1.97.0`、Wrangler `4.111.0`、`worker-build` `0.8.5`
+- CI 固定版本：Rust `1.97.1`、Wrangler `4.111.0`、`worker-build` `0.8.5`
 - Worker 兼容日期：`2026-02-28`
 - 构建命令：`node ./scripts/patch-webvault-turnstile.mjs && worker-build --release`
 - 测试命令：
@@ -24,7 +24,7 @@
   - `cargo fmt --all -- --check`
   - `node --test tests/*.test.mjs`
 - 手动部署命令：`wrangler deploy`
-- 最后更新时间：2026-08-21
+- 最后更新时间：2026-09-27
 
 ## 项目概述
 
@@ -54,6 +54,10 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
   - 验证 Workflow 的触发条件、权限、并发、固定工具链、数据库执行顺序与 DO 生命周期合约。
 - `tests/heavy_do_routing.test.mjs`
   - 验证高 CPU/密码相关路径被分流到固定的 `personal-vault` HeavyDo。
+- `tests/user_key_id_migration.test.mjs`
+  - 验证用户密钥 ID 迁移保留旧数据、支持新库，以及密钥 ID 只能初始化一次。
+- `vaultwarden-sync-2026-09-27.md`
+  - 记录 Vaultwarden 最近 11 次提交的适用性、移植行为和验证结果。
 - `static/web-vault/`
   - Wrangler Assets 发布的 Web Vault 构建产物；当前版本为 `2026.6.2`。
 - `build/`、`target/`
@@ -99,7 +103,7 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `sql/schema.sql`
   - 2026-07-22 统一后的完整数据库基线；已合并此前全部迁移的最终状态。包含 `DROP TABLE` 并清除 `d1_migrations`，对已有数据库执行会清空数据和迁移记录。
 - `sql/migrations/`
-  - 统一基线之后的 Wrangler 原生 D1 增量迁移目录；当前只有维护规则说明，未来按顺序新增 `.sql`，已应用文件不可修改、改名、重排或删除。
+  - 统一基线之后的 Wrangler 原生 D1 增量迁移目录；当前 `0001_add_user_key_id.sql` 新增 users.key_id；已应用文件不可修改、改名、重排或删除。
 
 ## 架构与关键流程
 
@@ -155,20 +159,23 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 当前项目状态
 
-- 分支/提交：`main`，本次任务开始时 HEAD 为 `3017b480c8d3aa849fc64cd27356de4094780593`（“修复编译报错”），工作树干净。
-- Vaultwarden 最近七次提交审阅基线：`D:\gitrepo\vaultwarden` 的 `46d71107f5094460dd5ecbe1dbac6e6c71e5189a`（2026-08-20）。
+- 分支/提交：`main`，2026-09-27 任务开始时 HEAD 为 `e260874a7b9037f67bbfed61d5f2aae52efe0fed`（“sync”），工作树干净。
+- Vaultwarden 最近 11 次提交审阅基线：`D:\gitrepo\vaultwarden` 的 `061694d0cb3bbf5d4c7e920c892824f0020cff83`（2026-09-25）；逐提交结论见 `vaultwarden-sync-2026-09-27.md`。
 - Bitwarden Android 对照基线：`C:\Users\MINI\AppData\Local\Temp\bitwarden-android-2026.6.1-bwpm` 的 `2026.6.1` 客户端实现。
 - 2026-07-22 已实施审计确认的个人密码库兼容性修复；业务代码、schema、配置、测试和文档均有改动，静态 Web Vault 未改变。
 - 当前实现覆盖账户认证、密码库同步、Ciphers、Folders、附件、Send、导入、设备、2FA、WebAuthn、实时通知和动态 Vaultwarden CSS。
 - 最近主要变化：
   - 将 worker-rs/worker-build 升级到 `0.8.5`、Wrangler 升级到 `4.111.0`，并刷新低风险直接依赖和完整锁文件。
-  - GitHub Actions 的 Rust 工具链固定为已验证的 `1.97.0`，避免移动的 `stable` 引入未验证 lint 后使部署突然失败。
+  - GitHub Actions 的 Rust 工具链当前固定为 `1.97.1`；本机验证仍使用 `1.96.0`。
   - 本机全局 Wrangler CLI 已从 `4.104.0` 升级到 `4.111.0`，与 GitHub Actions 固定版本一致。
   - 动态 Vaultwarden CSS 的 Custom Role 规则同时兼容 `<bit-dialog>` 与 `[bit-dialog]` 两种新版 Web Vault DOM 形态。
   - Cipher `cipherDetails` 响应已移除上游废弃的顶层 `data` 兼容字段，类型数据继续由 `login`、`secureNote`、`card`、`identity`、`sshKey` 等标准字段返回。
   - 增加附件 API 与附件元数据迁移。
   - 加强新版 Bitwarden 客户端的 Cipher key、请求字段、序列化、revision 与通知兼容。
   - 历史 SQL 已收敛到 `sql/schema.sql` 基线；后续顺序迁移统一由 `sql/migrations/` 和 Wrangler `d1_migrations` 追踪。
+  - 用户密钥 ID 通过认证的 `/api/accounts/key-management/user-key-id` 初始化一次，同步在 `userDecryption.userKeyId` 返回；两个 Cipher 创建入口校验请求中提供的用户和密钥 ID，旧客户端省略元数据仍兼容。
+  - `/api/config` 新增 Basic Auth 自动填充、卡片扫描、新密码项类型标记；同步/Profile 新增 `organizationsNew` 与 `policiesNew` 兼容空数组。
+  - `jsonwebtoken` 与 `uuid` 分别升级到 `11.1.0` 和 `1.26.1`，锁文件定向同步上游共同依赖。
 - 2026-07-22 已修复邮箱规范化、Token form 别名与 refresh 设备继承、profile/密码策略/config/密码提示响应、Email 2FA 鉴权与版本分支、TOTP 重放、设备 404/clear-token、健康检查、通知 keepalive 和文件流式 multipart 等已确认偏差。
 - Bitwarden/Vaultwarden API 错误体字段现为 `validationErrors`、`errorModel`、`exceptionMessage` 等 camelCase；OAuth `error_description` 保持规范名称。
 - 组织管理、SSO 与 Push 仍按项目边界不实现；组织字段保持兼容空值，Push 的设备 token 端点仅保持兼容语义。
@@ -606,6 +613,32 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 - `node --test tests/*.test.mjs`：20 passed、0 failed；沙箱内 Node test runner 因 Windows `spawn EPERM` 无法启动子进程，在获批的沙箱外重跑通过。
 - `worker-build --release`：通过。未执行远程部署，也未更新前端。
 
+### 2026-09-27：审阅 Vaultwarden 最近 11 次提交并同步后端
+
+#### 用户需求与审阅范围
+
+分析 `D:\gitrepo\vaultwarden` 最近 11 次提交，将适用变更合入本仓库；前端由用户自行更新。
+上游范围为 `eb212e23..061694d0`，逐提交分析见 `vaultwarden-sync-2026-09-27.md`。
+
+#### 修改内容
+
+- 新增 users.key_id 可空列的 D1 增量迁移、用户模型字段和初始化接口；单条条件更新保证重复或并发请求不能覆盖已有 key ID。
+- `userDecryption.userKeyId` 返回已保存 ID，初始化前返回 null；同步与账户 Profile 保留原字段并增加组织/策略新字段的兼容空数组。
+- 两种 Cipher 创建请求解析 `encryptedByKeyId` 并校验加密用户与密钥 ID，失败返回上游的 422 消息；旧客户端省略字段仍可创建。
+- 启用 `enable-basic-auth-response`、`pm-34171-card-scanner`、`pm-32009-new-item-types`；类型 6/7/8 此前已支持，本次补充持久化与序列化验证。
+- 定向升级共同 Rust 依赖，跳过没有对应能力的组织权限/邀请/横幅策略、原生 Docker/ARM 构建与上游专有依赖。
+- 未修改任何前端文件，未执行远程部署或远程数据库操作。
+
+#### 本地验证
+
+- `cargo test --all-targets --locked`：71 passed、0 failed。
+- `node --test tests/*.test.mjs`：22 passed、0 failed，包含新旧库迁移和一次性初始化验证。
+- `cargo clippy --all-targets --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- Wrangler 在独立临时目录使用 `--local` 应用 schema 和增量迁移：通过。
+- `worker-build --release`：通过，使用本机 Rust `1.96.0` 与 worker-build `0.8.5`。
+- 本地 Wrangler/Workerd HTTP：配置/同步/Profile 字段、401 鉴权、并发仅一次初始化、重复初始化 422、两个创建入口的用户/密钥不匹配 422、旧客户端元数据省略，以及类型 6/7/8 的创建/读取/编辑/同步全部通过。
+- `static/**` 和上游仓库工作树未改动；未执行远程部署或真实客户端端到端测试。
+
 ## 待处理事项
 
 - [x] 修复 `prelogin` 邮箱规范化、Email 2FA 未认证触发、密码提示账号枚举和附件/Send 全量内存缓冲。
@@ -617,6 +650,6 @@ Warden Worker 将个人密码库服务部署到 Cloudflare 边缘环境，提供
 
 ## 最近一次任务摘要
 
-- 任务：审阅 Vaultwarden 最近 20 次提交，同步适用于单用户 Cloudflare Worker 架构的服务端逻辑，跳过前端。
-- 结论：已合入归档取消修复、注册令牌内容协商、匿名端点限流、2FA remember token 撤销与持久化校验、Email 2FA 失败日志和多客户端主密码管理功能标记；新版主密码请求此前已同步。
-- 验证：Rust 测试、严格 Clippy、fmt、Node 测试、release Wasm 构建和 diff check 通过；未修改 `static/web-vault/**`，未部署。
+- 任务：审阅 Vaultwarden 最近 11 次提交，同步适用于单用户 Cloudflare Worker 架构的后端变更，跳过前端。
+- 结论：已合入用户密钥 ID 初始化/同步/创建校验、组织与策略新兼容字段、三项客户端标记和共同 Rust 依赖升级；组织和原生构建专用变化不适用。
+- 验证：71 项 Rust 测试、22 项 Node 测试、严格 Clippy、fmt、diff check、release Wasm 构建、本地 D1 迁移与 HTTP 检查通过。未修改前端，未部署。
